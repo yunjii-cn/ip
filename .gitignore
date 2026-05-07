@@ -1,0 +1,43 @@
+# 便携浏览器和代理内核（体积大，不纳入Git）
+Chrome*/
+Quick*/
+
+# 备份文件
+BAK/
+
+# EXE文件（体积大，不纳入Git，用户通过构建脚本生成）
+*.exe
+
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller构建临时文件
+build/
+dist/
+*.spec
+
+# 运行时配置（用户本地生成）
+launcher_settings.json
+
+# 根目录散落文件
+app_icon.ico
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# 虚拟环境
+.venv/
+venv/
+
+# 日志
+*.log
