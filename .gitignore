@@ -6,19 +6,23 @@ Quick*/
 BAK/
 
 # EXE文件（体积大，不纳入Git，用户通过构建脚本生成）
+# 但ver/目录下的EXE是稳定版本，需要上传
 *.exe
+!ver/*.exe
 
 # Python缓存
 __pycache__/
 *.pyc
 *.pyo
 
-# PyInstaller构建临时文件
+# 构建目录（包含按版本组织的构建脚本和PyInstaller临时文件，不上传远程仓库）
 build/
+
+# PyInstaller其他临时文件
 dist/
 *.spec
 
-# 运行时配置（用户本地生成）
+# 运行时配置（用户本地生成，存放在app/子目录下）
 launcher_settings.json
 
 # 根目录散落文件
