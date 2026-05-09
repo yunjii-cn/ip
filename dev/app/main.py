@@ -2007,21 +2007,6 @@ class MainWindow(QMainWindow):
             "请手动操作:\n1. 下载最新版 Clash/Quick 内核\n2. 替换 Quick\\quick.exe 文件\n3. 重启本启动器")
 
     def closeEvent(self, event):
-        if is_proxy_running():
-            reply = QMessageBox.question(self, "退出确认",
-                "代理服务正在运行中。\n停止服务并退出？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel)
-            if reply == QMessageBox.StandardButton.Cancel:
-                event.ignore()
-                return
-            elif reply == QMessageBox.StandardButton.Yes:
-                if self.settings.get("global_proxy", False):
-                    set_system_proxy(False)
-                stop_quick()
-            else:
-                self.hide()
-                event.ignore()
-                return
         self._stop_auto_line_timer()
         self.monitor.stop()
         self.monitor.wait()
