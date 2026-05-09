@@ -15,11 +15,12 @@ import urllib.request
 import subprocess
 import glob
 import ctypes
+import queue
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QTabWidget, QFrame, QRadioButton, QButtonGroup,
+    QLabel, QPushButton, QStackedWidget, QFrame, QRadioButton, QButtonGroup,
     QFileDialog, QMessageBox, QListWidget,
     QListWidgetItem, QTextEdit, QComboBox, QSpinBox
 )
@@ -33,12 +34,11 @@ APP_NAME = f"云集智能网联代理专家 v{VERSION}"
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = 7890
 PROXY_URL = f"{PROXY_HOST}:{PROXY_PORT}"
-NODE_TEST_TIMEOUT = 8
+NODE_TEST_TIMEOUT = 3
 NODE_TEST_URL = "https://www.gstatic.com/generate_204"
 NODE_TEST_URLS = [
     ("Google", "https://www.gstatic.com/generate_204"),
     ("Cloudflare", "https://cp.cloudflare.com/"),
-    ("GitHub", "https://github.com/favicon.ico"),
 ]
 
 CONFIG_URLS = [
@@ -50,14 +50,6 @@ CONFIG_URLS = [
      "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/3/config.yaml"),
     ("线路4", "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/4/config.yaml",
      "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/4/config.yaml"),
-    ("线路5", "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/5/config.yaml",
-     "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/5/config.yaml"),
-    ("线路6", "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/6/config.yaml",
-     "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/6/config.yaml"),
-    ("线路7", "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/7/config.yaml",
-     "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/7/config.yaml"),
-    ("线路8", "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/8/config.yaml",
-     "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/8/config.yaml"),
 ]
 
 COLOR_RED = "#C62828"
@@ -116,9 +108,9 @@ QFrame#expand-header:hover {{ background-color: #222222; }}
 QFrame#expand-body {{ background-color: {COLOR_CARD}; border: 1px solid {COLOR_BORDER}; border-top: none; border-radius: 0 0 6px 6px; }}
 
 QTabWidget::pane {{ border: 1px solid {COLOR_BORDER}; background-color: {COLOR_BG}; border-radius: 4px; }}
-QTabBar::tab {{ background-color: {COLOR_CARD}; color: {COLOR_DIM}; padding: 8px 20px; border: 1px solid {COLOR_BORDER}; border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px; font-size: 9pt; }}
-QTabBar::tab:selected {{ background-color: {COLOR_BG}; color: {COLOR_RED_LIGHT}; border-bottom: 2px solid {COLOR_RED_LIGHT}; }}
-QTabBar::tab:hover {{ color: {COLOR_TEXT}; }}
+QPushButton#nav-btn {{ background-color: {COLOR_CARD}; color: {COLOR_DIM}; border: 1px solid {COLOR_BORDER}; border-radius: 6px; padding: 10px 0px; font-size: 11pt; font-weight: bold; }}
+QPushButton#nav-btn:hover {{ background-color: #222222; color: {COLOR_TEXT}; }}
+QPushButton#nav-btn:checked {{ background-color: {COLOR_RED}; color: #FFFFFF; border: 1px solid {COLOR_RED}; }}
 
 QRadioButton {{ color: {COLOR_TEXT}; spacing: 8px; font-size: 10pt; }}
 QRadioButton::indicator {{ width: 16px; height: 16px; }}
@@ -711,6 +703,7 @@ class ProxyMonitor(QThread):
 class ServiceWorker(QThread):
     finished = pyqtSignal(bool, str)
     progress = pyqtSignal(str)
+    line_tested = pyqtSignal(str, float, bool)
 
     def __init__(self, action, **kwargs):
         super().__init__()
@@ -769,11 +762,13 @@ class ServiceWorker(QThread):
         if not downloaded:
             self.finished.emit(False, "无法下载配置")
             return
-        results = []
-        for name, data in downloaded:
-            self.progress.emit(f"正在测试 {name}...")
+
+        result_queue = queue.Queue()
+        total = len(downloaded)
+
+        def test_single_line(name, data):
             latencies = []
-            for test_name, test_url in NODE_TEST_URLS:
+            for _, test_url in NODE_TEST_URLS:
                 try:
                     start = time.time()
                     ctx = ssl.create_default_context()
@@ -787,10 +782,37 @@ class ServiceWorker(QThread):
             if latencies:
                 avg = sum(latencies) / len(latencies)
                 best = min(latencies)
-                worst = max(latencies)
-                results.append((name, avg, best, worst, len(latencies), data))
+                result_queue.put((name, avg, best, len(latencies), data))
             else:
-                results.append((name, float('inf'), float('inf'), float('inf'), 0, data))
+                result_queue.put((name, -1.0, -1.0, 0, data))
+
+        self.progress.emit(f"正在并行检测 {total} 条线路...")
+
+        line_threads = []
+        for name, data in downloaded:
+            t = threading.Thread(target=test_single_line, args=(name, data))
+            t.start()
+            line_threads.append(t)
+
+        results = []
+        received = 0
+        while received < total:
+            try:
+                name, avg, best, count, data = result_queue.get(timeout=NODE_TEST_TIMEOUT + 5)
+                received += 1
+                is_ok = avg >= 0
+                self.line_tested.emit(name, avg, is_ok)
+                self.progress.emit(f"正在检测线路 {received}/{total}...")
+                if is_ok:
+                    results.append((name, avg, best, count, data))
+                else:
+                    results.append((name, -1.0, -1.0, 0, data))
+            except queue.Empty:
+                break
+
+        for t in line_threads:
+            t.join(timeout=1)
+
         self.kwargs["results"] = results
         self.finished.emit(True, "检测完成")
 
@@ -889,6 +911,8 @@ class MainWindow(QMainWindow):
         if self.settings.get("auto_start", True) and self.quick_dir:
             QTimer.singleShot(500, self._on_start)
 
+        QTimer.singleShot(1000, self._startup_download_config)
+
     def _resolve_quick_dir(self):
         builtin = os.path.join(get_app_dir(), "Quick")
         if os.path.isdir(builtin) and os.path.isfile(os.path.join(builtin, "quick.exe")):
@@ -922,49 +946,85 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        layout.addWidget(self._build_status_card())
-        layout.addWidget(self._build_tabs(), stretch=1)
         layout.addWidget(self._build_bottom_bar())
+        layout.addWidget(self._build_tabs(), stretch=1)
 
-    def _build_status_card(self):
+    def _build_bottom_bar(self):
         frame = QFrame()
         frame.setObjectName("card")
-        margin = QHBoxLayout(frame)
-        margin.setContentsMargins(16, 10, 16, 10)
+        h = QHBoxLayout(frame)
+        h.setContentsMargins(16, 10, 16, 10)
+        h.setSpacing(12)
 
         self.status_dot = QLabel("●")
         self.status_dot.setStyleSheet("font-size: 18px; color: #FF6B80;")
-        margin.addWidget(self.status_dot)
-        margin.addSpacing(8)
+        h.addWidget(self.status_dot)
+        h.addSpacing(4)
 
         info = QVBoxLayout()
         info.setSpacing(1)
         self.status_label = QLabel("代理未启动")
         self.status_label.setObjectName("status-off")
         info.addWidget(self.status_label)
-        self.detail_label = QLabel("点击「启动服务」开始代理")
+        self.detail_label = QLabel("开启代理服务")
         self.detail_label.setObjectName("dim")
+        self.detail_label.setStyleSheet("font-size: 8pt;")
         info.addWidget(self.detail_label)
-        margin.addLayout(info, stretch=1)
+        h.addLayout(info, stretch=1)
 
         self.latency_label = QLabel("")
         self.latency_label.setObjectName("latency")
-        margin.addWidget(self.latency_label)
+        h.addWidget(self.latency_label)
+
+        self.switch_proxy = ToggleSwitch("代理服务", default=False)
+        self.switch_proxy.setFixedWidth(160)
+        self.switch_proxy.toggled.connect(self._on_proxy_switch_toggled)
+        h.addWidget(self.switch_proxy)
 
         return frame
 
     def _build_tabs(self):
-        tabs = QTabWidget()
-        tabs.setDocumentMode(True)
-        tabs.setStyleSheet(STYLESHEET)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        tabs.addTab(self._build_line_tab(), "  线路检测  ")
-        tabs.addTab(self._build_proxy_tab(), "  代理设置  ")
-        tabs.addTab(self._build_browser_tab(), "  浏览器设置  ")
-        tabs.addTab(self._build_log_tab(), "  运行日志  ")
-        tabs.addTab(self._build_update_tab(), "  版本更新  ")
+        nav_bar = QHBoxLayout()
+        nav_bar.setContentsMargins(8, 8, 8, 4)
+        nav_bar.setSpacing(6)
 
-        return tabs
+        self.nav_buttons = []
+        nav_items = [
+            ("🔍 线路检测", 0),
+            ("⚙️ 代理设置", 1),
+            ("📋 运行日志", 2),
+            ("🔄 版本更新", 3),
+        ]
+        for text, idx in nav_items:
+            btn = QPushButton(text)
+            btn.setObjectName("nav-btn")
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda checked, i=idx: self._on_nav_clicked(i))
+            nav_bar.addWidget(btn, stretch=1)
+            self.nav_buttons.append(btn)
+        self.nav_buttons[0].setChecked(True)
+
+        layout.addLayout(nav_bar)
+
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._build_line_tab())
+        self.stack.addWidget(self._build_proxy_tab())
+        self.stack.addWidget(self._build_log_tab())
+        self.stack.addWidget(self._build_update_tab())
+        layout.addWidget(self.stack, stretch=1)
+
+        return container
+
+    def _on_nav_clicked(self, idx):
+        for i, btn in enumerate(self.nav_buttons):
+            btn.setChecked(i == idx)
+        self.stack.setCurrentIndex(idx)
 
     def _build_line_tab(self):
         page = QWidget()
@@ -1053,6 +1113,86 @@ class MainWindow(QMainWindow):
         al.addLayout(interval_row)
 
         layout.addWidget(auto_card)
+
+        browser_card = QFrame()
+        browser_card.setObjectName("card")
+        bl = QVBoxLayout(browser_card)
+        bl.setSpacing(8)
+
+        browser_title = QLabel("浏览器")
+        browser_title.setObjectName("accent")
+        browser_title.setStyleSheet("font-size: 11pt; font-weight: bold;")
+        bl.addWidget(browser_title)
+
+        auto_browser_row = QFrame()
+        auto_browser_row.setObjectName("switch-row")
+        abr = QHBoxLayout(auto_browser_row)
+        abr.setContentsMargins(12, 6, 12, 6)
+        auto_browser_info = QVBoxLayout()
+        auto_browser_info.setSpacing(0)
+        auto_browser_lbl = QLabel("🌐 启动后自动打开浏览器")
+        auto_browser_lbl.setStyleSheet("font-size: 10pt; font-weight: bold;")
+        auto_browser_info.addWidget(auto_browser_lbl)
+        abr.addLayout(auto_browser_info, stretch=1)
+        self.switch_auto_browser = ToggleSwitch("", default=self.settings.get("auto_open_browser", True))
+        self.switch_auto_browser.setFixedWidth(80)
+        self.switch_auto_browser.toggled.connect(self._on_auto_open_browser_toggled)
+        abr.addWidget(self.switch_auto_browser)
+        bl.addWidget(auto_browser_row)
+
+        select_row = QHBoxLayout()
+        select_row.addWidget(QLabel("浏览器:"))
+        self.browser_type_group = QButtonGroup(self)
+        system_rb = QRadioButton("系统")
+        system_rb.setProperty("browser_type", "system")
+        system_rb.setChecked(self.settings.get("browser_type", "system") == "system")
+        self.browser_type_group.addButton(system_rb)
+        select_row.addWidget(system_rb)
+        custom_rb = QRadioButton("自定义")
+        custom_rb.setProperty("browser_type", "custom")
+        custom_rb.setChecked(self.settings.get("browser_type", "system") == "custom")
+        self.browser_type_group.addButton(custom_rb)
+        select_row.addWidget(custom_rb)
+        self.browser_combo = QComboBox()
+        self.browser_combo.setMinimumWidth(200)
+        self._populate_browsers()
+        self.browser_combo.currentIndexChanged.connect(self._on_system_browser_changed)
+        select_row.addWidget(self.browser_combo, stretch=1)
+        browse_btn = QPushButton("...")
+        browse_btn.setObjectName("small-blue")
+        browse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        browse_btn.setFixedWidth(36)
+        browse_btn.clicked.connect(self._on_browse_browser)
+        select_row.addWidget(browse_btn)
+        self.browser_type_group.buttonClicked.connect(self._on_browser_type_changed)
+        bl.addLayout(select_row)
+
+        self.custom_browser_input = QLabel(self.settings.get("browser_path", "未选择"))
+        self.custom_browser_input.setObjectName("dim")
+        self.custom_browser_input.setStyleSheet("font-size: 8pt;")
+        self.custom_browser_input.setVisible(self.settings.get("browser_type", "system") == "custom")
+        bl.addWidget(self.custom_browser_input)
+
+        self.selected_browser_label = QLabel("")
+        self.selected_browser_label.setObjectName("dim")
+        self.selected_browser_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_RED_LIGHT};")
+        self.selected_browser_label.setWordWrap(True)
+        bl.addWidget(self.selected_browser_label)
+        self._update_selected_browser_label()
+
+        open_row = QHBoxLayout()
+        self.btn_open_browser = QPushButton("🌐 打开浏览器")
+        self.btn_open_browser.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_open_browser.setStyleSheet(
+            f"background-color: {COLOR_RED}; color: #FFFFFF; padding: 8px 20px; "
+            f"font-size: 10pt; font-weight: bold; border-radius: 4px;"
+        )
+        self.btn_open_browser.clicked.connect(self._on_open_browser)
+        open_row.addWidget(self.btn_open_browser)
+        open_row.addStretch()
+        bl.addLayout(open_row)
+
+        layout.addWidget(browser_card)
 
         self.line_progress = QLabel("")
         self.line_progress.setObjectName("dim")
@@ -1232,108 +1372,6 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return page
 
-    def _build_browser_tab(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
-
-        auto_browser_card = QFrame()
-        auto_browser_card.setObjectName("card")
-        abl = QVBoxLayout(auto_browser_card)
-        abl.setSpacing(8)
-
-        auto_browser_title = QLabel("自动打开浏览器")
-        auto_browser_title.setObjectName("accent")
-        auto_browser_title.setStyleSheet("font-size: 11pt; font-weight: bold;")
-        abl.addWidget(auto_browser_title)
-
-        auto_browser_row = QFrame()
-        auto_browser_row.setObjectName("switch-row")
-        abr = QHBoxLayout(auto_browser_row)
-        abr.setContentsMargins(12, 6, 12, 6)
-        auto_browser_info = QVBoxLayout()
-        auto_browser_info.setSpacing(0)
-        auto_browser_lbl = QLabel("启动服务后自动打开浏览器")
-        auto_browser_lbl.setStyleSheet("font-size: 10pt; font-weight: bold;")
-        auto_browser_info.addWidget(auto_browser_lbl)
-        abr.addLayout(auto_browser_info, stretch=1)
-        self.switch_auto_browser = ToggleSwitch("", default=self.settings.get("auto_open_browser", True))
-        self.switch_auto_browser.setFixedWidth(80)
-        self.switch_auto_browser.toggled.connect(self._on_auto_open_browser_toggled)
-        abr.addWidget(self.switch_auto_browser)
-        abl.addWidget(auto_browser_row)
-
-        layout.addWidget(auto_browser_card)
-
-        select_card = QFrame()
-        select_card.setObjectName("card")
-        scl = QVBoxLayout(select_card)
-        scl.setSpacing(8)
-
-        select_title = QLabel("选择浏览器")
-        select_title.setObjectName("accent")
-        select_title.setStyleSheet("font-size: 11pt; font-weight: bold;")
-        scl.addWidget(select_title)
-
-        self.browser_type_group = QButtonGroup(self)
-        system_rb = QRadioButton("💻 系统浏览器")
-        system_rb.setProperty("browser_type", "system")
-        system_rb.setChecked(self.settings.get("browser_type", "system") == "system")
-        self.browser_type_group.addButton(system_rb)
-        scl.addWidget(system_rb)
-
-        sys_row = QHBoxLayout()
-        sys_row.addWidget(QLabel("系统浏览器:"))
-        self.browser_combo = QComboBox()
-        self.browser_combo.setMinimumWidth(300)
-        self._populate_browsers()
-        self.browser_combo.currentIndexChanged.connect(self._on_system_browser_changed)
-        sys_row.addWidget(self.browser_combo, stretch=1)
-        scl.addLayout(sys_row)
-
-        custom_rb = QRadioButton("📁 自定义路径")
-        custom_rb.setProperty("browser_type", "custom")
-        custom_rb.setChecked(self.settings.get("browser_type", "system") == "custom")
-        self.browser_type_group.addButton(custom_rb)
-        scl.addWidget(custom_rb)
-
-        custom_row = QHBoxLayout()
-        custom_row.addWidget(QLabel("自定义路径:"))
-        self.custom_browser_input = QLabel(self.settings.get("browser_path", "未选择"))
-        self.custom_browser_input.setObjectName("dim")
-        custom_row.addWidget(self.custom_browser_input, stretch=1)
-        browse_btn = QPushButton("浏览...")
-        browse_btn.setObjectName("small-blue")
-        browse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        browse_btn.clicked.connect(self._on_browse_browser)
-        custom_row.addWidget(browse_btn)
-        scl.addLayout(custom_row)
-
-        self.browser_type_group.buttonClicked.connect(self._on_browser_type_changed)
-
-        self.selected_browser_label = QLabel("")
-        self.selected_browser_label.setObjectName("dim")
-        self.selected_browser_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_RED_LIGHT};")
-        self.selected_browser_label.setWordWrap(True)
-        scl.addWidget(self.selected_browser_label)
-        self._update_selected_browser_label()
-
-        layout.addWidget(select_card)
-
-        self.btn_open_browser = QPushButton("🌐 打开浏览器")
-        self.btn_open_browser.setObjectName("small-green")
-        self.btn_open_browser.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_open_browser.setStyleSheet(
-            f"background-color: {COLOR_RED}; color: #FFFFFF; padding: 12px 24px; "
-            f"font-size: 11pt; font-weight: bold; border-radius: 6px;"
-        )
-        self.btn_open_browser.clicked.connect(self._on_open_browser)
-        layout.addWidget(self.btn_open_browser)
-
-        layout.addStretch()
-        return page
-
     def _build_log_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1451,29 +1489,6 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return page
 
-    def _build_bottom_bar(self):
-        frame = QFrame()
-        frame.setObjectName("bottom-bar")
-        frame.setFixedHeight(60)
-        h = QHBoxLayout(frame)
-        h.setContentsMargins(16, 8, 16, 8)
-        h.setSpacing(12)
-
-        self.btn_start = QPushButton("▶ 启动服务")
-        self.btn_start.setObjectName("start")
-        self.btn_start.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_start.clicked.connect(self._on_start)
-        h.addWidget(self.btn_start, stretch=1)
-
-        self.btn_stop = QPushButton("■ 停止服务")
-        self.btn_stop.setObjectName("stop")
-        self.btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_stop.clicked.connect(self._on_stop)
-        self.btn_stop.setEnabled(False)
-        h.addWidget(self.btn_stop, stretch=1)
-
-        return frame
-
     def _populate_browsers(self):
         self.browser_combo.clear()
         browsers = find_system_browsers()
@@ -1510,16 +1525,16 @@ class MainWindow(QMainWindow):
             self.status_label.setText("代理运行中")
             self.status_label.setObjectName("status-on")
             self.detail_label.setText(f"本地代理: {PROXY_URL} | 当前线路: {self.current_line or '未知'}")
-            self.btn_start.setEnabled(False)
-            self.btn_stop.setEnabled(True)
+            if not self.switch_proxy.isChecked():
+                self.switch_proxy.setChecked(True)
         else:
             self.status_dot.setStyleSheet("font-size: 18px; color: #FF6B80;")
             self.status_label.setText("代理未启动")
             self.status_label.setObjectName("status-off")
-            self.detail_label.setText("点击「启动服务」开始代理")
+            self.detail_label.setText("开启代理服务")
             self.latency_label.setText("")
-            self.btn_start.setEnabled(bool(self.quick_dir))
-            self.btn_stop.setEnabled(False)
+            if self.switch_proxy.isChecked():
+                self.switch_proxy.setChecked(False)
         self.status_label.setStyleSheet(self.status_label.styleSheet())
 
     def _update_active_line(self):
@@ -1610,24 +1625,29 @@ class MainWindow(QMainWindow):
         else:
             self.auto_line_status.setText("检测失败，等待下次")
 
+    def _on_proxy_switch_toggled(self, checked):
+        if checked:
+            self._on_start()
+        else:
+            self._on_stop()
+
     def _on_start(self):
         if not self.quick_dir:
+            self.switch_proxy.setChecked(False)
             QMessageBox.critical(self, "错误",
                 "未找到代理内核！\n\n"
                 f"基础目录: {get_base_dir()}\n\n"
                 "请确保 app/Quick/ 目录中包含 quick.exe。")
             return
-        self.btn_start.setEnabled(False)
-        self.btn_start.setText("⏳ 启动中...")
+        self.switch_proxy.setEnabled(False)
+        self.detail_label.setText("正在启动代理服务...")
         self.worker = ServiceWorker("start", quick_dir=self.quick_dir)
         self.worker.progress.connect(lambda t: self.detail_label.setText(t))
         self.worker.finished.connect(self._on_start_finished)
         self.worker.start()
 
     def _on_start_finished(self, ok, msg):
-        self.btn_start.setText("▶ 启动服务")
-        self.btn_start.setEnabled(not ok)
-        self.btn_stop.setEnabled(ok)
+        self.switch_proxy.setEnabled(True)
         if ok:
             self.detail_label.setText(msg)
             connected, latency = verify_proxy_connection()
@@ -1644,14 +1664,13 @@ class MainWindow(QMainWindow):
             if self.settings.get("auto_line_switch", False):
                 self._start_auto_line_timer()
         else:
+            self.switch_proxy.setChecked(False)
             QMessageBox.critical(self, "错误", msg)
 
     def _on_stop(self):
         if self.settings.get("global_proxy", False):
             set_system_proxy(False)
             self._update_sys_proxy_label()
-        elif self.settings.get("browser_proxy_mode", "all") == "specified":
-            pass
         stop_quick()
         self.current_line = ""
         self._update_active_line()
@@ -1754,35 +1773,78 @@ class MainWindow(QMainWindow):
             return
         self.btn_test.setEnabled(False)
         self.btn_test.setText("检测中...")
+        for name, info in self.line_rows.items():
+            info["status"].setText("检测中...")
+            info["status"].setStyleSheet(f"color: {COLOR_ORANGE}; font-size: 9pt;")
+            info["use_btn"].setEnabled(False)
         self.worker = ServiceWorker("test_lines", quick_dir=self.quick_dir)
         self.worker.progress.connect(lambda t: self.line_progress.setText(t))
+        self.worker.line_tested.connect(self._on_line_tested)
         self.worker.finished.connect(self._on_test_finished)
         self.worker.start()
+
+    def _on_line_tested(self, name, avg, is_ok):
+        if name not in self.line_rows:
+            return
+        info = self.line_rows[name]
+        if is_ok:
+            info["status"].setText(f"平均{avg:.2f}s")
+            info["status"].setStyleSheet(f"color: {COLOR_GREEN}; font-size: 9pt;")
+            info["use_btn"].setEnabled(True)
+        else:
+            info["status"].setText("超时")
+            info["status"].setStyleSheet(f"color: #FF6B80; font-size: 9pt;")
+            info["use_btn"].setEnabled(False)
 
     def _on_test_finished(self, ok, msg):
         self.btn_test.setEnabled(True)
         self.btn_test.setText("🔍 检测所有线路")
-        if ok and self.worker and "results" in self.worker.kwargs:
-            for name, row_data in self.line_rows.items():
-                row_data["row"].setVisible(False)
-            for name, avg, best, worst, count, data in self.worker.kwargs["results"]:
+        try:
+            if not ok:
+                self.line_progress.setText(msg if msg else "检测失败")
+                self.line_progress.setStyleSheet("color: #FF6B80;")
+                return
+
+            worker = self.worker
+            if not worker or "results" not in worker.kwargs:
+                self.line_progress.setText("检测结果异常")
+                self.line_progress.setStyleSheet("color: #FF6B80;")
+                return
+
+            results = list(worker.kwargs["results"])
+            auto_switch = self.switch_auto_line.isChecked()
+
+            for name, avg, best, count, data in results:
                 self.line_results[name] = data
                 if name not in self.line_rows:
                     continue
-                self.line_rows[name]["row"].setVisible(True)
-                if avg < float('inf'):
-                    self._set_line_status(name, f"平均{avg:.2f}s | 最快{best:.2f}s | 最慢{worst:.2f}s | {count}/{len(NODE_TEST_URLS)}节点", COLOR_GREEN)
+                info = self.line_rows[name]
+                if avg >= 0:
+                    info["status"].setText(f"平均{avg:.2f}s | 最快{best:.2f}s | {count}/{len(NODE_TEST_URLS)}节点")
+                    info["status"].setStyleSheet(f"color: {COLOR_GREEN}; font-size: 9pt;")
+                    info["use_btn"].setEnabled(True)
                 else:
-                    self._set_line_status(name, "超时", "#FF6B80")
-            fastest = min(self.worker.kwargs["results"], key=lambda x: x[1])
-            if fastest[1] < float('inf') and fastest[0] in self.line_rows:
-                self._set_line_status(fastest[0], f"最快 ✓ (平均{fastest[1]:.2f}s)", "#FF7814")
-                if self.switch_auto_line.isChecked():
+                    info["status"].setText("超时")
+                    info["status"].setStyleSheet(f"color: #FF6B80; font-size: 9pt;")
+                    info["use_btn"].setEnabled(False)
+
+            valid = [r for r in results if r[1] >= 0]
+            if valid:
+                fastest = min(valid, key=lambda x: x[1])
+                if fastest[0] in self.line_rows:
+                    self.line_rows[fastest[0]]["status"].setText(f"最快 ✓ (平均{fastest[1]:.2f}s)")
+                    self.line_rows[fastest[0]]["status"].setStyleSheet(f"color: {COLOR_ORANGE}; font-weight: bold; font-size: 9pt;")
+                self.line_progress.setText(f"检测完成 - {len(valid)}条可用线路")
+                self.line_progress.setStyleSheet(f"color: {COLOR_GREEN};")
+                if auto_switch and fastest[0] in self.line_rows:
                     self._on_use_line(fastest[0])
-            self.line_progress.setText(f"检测完成 - {len([r for r in self.worker.kwargs['results'] if r[1] < float('inf')])}条可用线路")
-            self.line_progress.setStyleSheet(f"color: {COLOR_GREEN};")
-        else:
-            self.line_progress.setText(msg)
+            else:
+                self.line_progress.setText("检测完成 - 无可用线路")
+                self.line_progress.setStyleSheet("color: #FF6B80;")
+        except Exception as e:
+            import traceback
+            log.error(f"检测结果显示异常: {e}\n{traceback.format_exc()}")
+            self.line_progress.setText(f"检测出错: {e}")
             self.line_progress.setStyleSheet("color: #FF6B80;")
 
     def _on_use_line(self, name):
@@ -1860,6 +1922,21 @@ class MainWindow(QMainWindow):
                 log.info(f"日志已导出到: {path}")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"导出日志失败: {e}")
+
+    def _startup_download_config(self):
+        if not self.quick_dir:
+            return
+        def do_download():
+            try:
+                downloaded = download_all_configs()
+                if downloaded:
+                    name, data = downloaded[0]
+                    save_config(self.quick_dir, data)
+                    log.info(f"启动时已下载最新配置: {name}")
+            except Exception as e:
+                log.warning(f"启动时下载配置失败: {e}")
+        import threading
+        threading.Thread(target=do_download, daemon=True).start()
 
     def _on_check_update(self):
         self.btn_check_update.setEnabled(False)
@@ -1952,12 +2029,6 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    try:
-        import pyi_splash
-        pyi_splash.close()
-    except Exception:
-        pass
-
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     window = MainWindow()
