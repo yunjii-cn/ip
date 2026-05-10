@@ -21,11 +21,12 @@ from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QStackedWidget, QFrame,
-    QFileDialog, QMessageBox, QListWidget,
-    QListWidgetItem, QTextEdit, QComboBox, QSpinBox, QSizePolicy
+    QMessageBox, QListWidget,
+    QListWidgetItem, QTextEdit, QComboBox, QSpinBox, QSizePolicy,
+    QSplashScreen
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QPoint, QPropertyAnimation, QEasingCurve, pyqtProperty
-from PyQt6.QtGui import QPixmap, QIcon, QFont, QColor, QPainter, QPen, QFontMetrics
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QPoint, QPropertyAnimation, QEasingCurve, pyqtProperty, QRectF
+from PyQt6.QtGui import QPixmap, QIcon, QFont, QColor, QPainter, QPen, QFontMetrics, QPalette, QLinearGradient
 
 VERSION = datetime.now().strftime("%Y.%m.%d.%H%M")
 VERSION_CHECK_URL = "https://gitee.com/yunjii/ip/raw/master/ver/version.json"
@@ -270,7 +271,7 @@ class CheckBox(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         box_size = 16
-        box_x = 0
+        box_x = 4
         box_y = (self.height() - box_size) // 2
 
         if self._checked:
@@ -303,7 +304,7 @@ class CheckBox(QWidget):
     def minimumSizeHint(self):
         fm = QFontMetrics(QFont("Microsoft YaHei UI", 10))
         text_w = fm.horizontalAdvance(self._label) if self._label else 0
-        return QSize(16 + 8 + text_w + 8, 28)
+        return QSize(4 + 16 + 8 + text_w + 8, 28)
 
 
 class RadioButton(QWidget):
@@ -340,7 +341,7 @@ class RadioButton(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         circle_size = 16
-        circle_x = 0
+        circle_x = 4
         circle_y = (self.height() - circle_size) // 2
         center_x = circle_x + circle_size // 2
         center_y = circle_y + circle_size // 2
@@ -369,7 +370,7 @@ class RadioButton(QWidget):
     def minimumSizeHint(self):
         fm = QFontMetrics(QFont("Microsoft YaHei UI", 10))
         text_w = fm.horizontalAdvance(self._label) if self._label else 0
-        return QSize(16 + 8 + text_w + 8, 28)
+        return QSize(4 + 16 + 8 + text_w + 8, 28)
 
 
 class QTextEditLogHandler(logging.Handler):
@@ -604,7 +605,7 @@ def find_system_browsers():
 def is_proxy_running():
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(2)
+        sock.settimeout(0.5)
         result = sock.connect_ex((PROXY_HOST, PROXY_PORT))
         sock.close()
         return result == 0
@@ -1015,12 +1016,104 @@ class ServiceWorker(QThread):
             self.finished.emit(False, "无法下载配置")
 
 
-class MainWindow(QMainWindow):
+class SplashScreen(QSplashScreen):
     def __init__(self):
+        pixmap = QPixmap(480, 300)
+        pixmap.fill(QColor(COLOR_BG))
+        super().__init__(pixmap)
+        self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint)
+        self._progress = 0.0
+        self._message = "正在初始化..."
+        self._icon_pixmap = None
+        try:
+            if hasattr(sys, '_MEIPASS'):
+                base = sys._MEIPASS
+            else:
+                base = os.path.dirname(os.path.abspath(__file__))
+            for name in ('icon.png', 'icon.ico'):
+                p = os.path.join(base, name)
+                if os.path.exists(p):
+                    self._icon_pixmap = QPixmap(p)
+                    if not self._icon_pixmap.isNull():
+                        break
+                    self._icon_pixmap = None
+        except Exception:
+            pass
+
+    def _get_progress(self):
+        return self._progress
+
+    def _set_progress(self, val):
+        self._progress = val
+        self.repaint()
+
+    progress = pyqtProperty(float, _get_progress, _set_progress)
+
+    def set_progress(self, value, message=""):
+        if message:
+            self._message = message
+        anim = QPropertyAnimation(self, b"progress")
+        anim.setDuration(150)
+        anim.setStartValue(self._progress)
+        anim.setEndValue(value)
+        anim.start()
+        self._anim = anim
+        if message:
+            self._message = message
+            self.repaint()
+
+    def drawContents(self, painter):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        painter.fillRect(0, 0, w, h, QColor(COLOR_BG))
+
+        if self._icon_pixmap:
+            icon_size = 64
+            scaled = self._icon_pixmap.scaled(icon_size, icon_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            painter.drawPixmap((w - scaled.width()) // 2, 40, scaled)
+
+        painter.setPen(QColor(COLOR_TEXT))
+        painter.setFont(QFont("Microsoft YaHei", 18, QFont.Weight.Bold))
+        title = "云集智能网联代理专家"
+        fm = painter.fontMetrics()
+        painter.drawText((w - fm.horizontalAdvance(title)) // 2, 150, title)
+
+        bar_x, bar_y, bar_w, bar_h = 60, 200, w - 120, 6
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(COLOR_BORDER))
+        painter.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 3, 3)
+
+        fill_w = bar_w * min(self._progress, 1.0)
+        if fill_w > 0:
+            grad = QLinearGradient(bar_x, bar_y, bar_x + fill_w, bar_y)
+            grad.setColorAt(0, QColor(COLOR_RED))
+            grad.setColorAt(1, QColor(COLOR_RED_LIGHT))
+            painter.setBrush(grad)
+            painter.drawRoundedRect(QRectF(bar_x, bar_y, fill_w, bar_h), 3, 3)
+
+        painter.setPen(QColor(COLOR_DIM))
+        painter.setFont(QFont("Microsoft YaHei", 9))
+        fm2 = painter.fontMetrics()
+        painter.drawText((w - fm2.horizontalAdvance(self._message)) // 2, 230, self._message)
+
+        pct = f"{int(min(self._progress, 1.0) * 100)}%"
+        painter.setPen(QColor(COLOR_RED_LIGHT))
+        painter.setFont(QFont("Microsoft YaHei", 8))
+        fm3 = painter.fontMetrics()
+        painter.drawText((w - fm3.horizontalAdvance(pct)) // 2, 255, pct)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, splash=None):
         super().__init__()
+        self._splash = splash
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(560, 780)
         self.setStyleSheet(STYLESHEET)
+        self.setAutoFillBackground(True)
+
+        if self._splash:
+            self._splash.set_progress(0.2, "正在加载配置...")
 
         self.settings = load_settings()
         self.quick_dir = self._resolve_quick_dir()
@@ -1033,9 +1126,16 @@ class MainWindow(QMainWindow):
         log.info(f"基础目录: {get_base_dir()}")
         log.info(f"Quick目录: {self.quick_dir}")
 
+        if self._splash:
+            self._splash.set_progress(0.4, "正在构建界面...")
+
         self._set_icon()
         self._build_ui()
-        self._update_status(is_proxy_running())
+
+        if self._splash:
+            self._splash.set_progress(0.8, "正在初始化...")
+
+        QTimer.singleShot(0, lambda: self._update_status(is_proxy_running()))
         self._update_kernel_status()
         self._update_active_line()
 
@@ -1047,6 +1147,10 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(500, self._on_start)
 
         QTimer.singleShot(1000, self._startup_download_config)
+
+        if self._splash:
+            self._splash.set_progress(1.0, "加载完成！")
+            QTimer.singleShot(200, self._finish_splash)
 
     def _resolve_quick_dir(self):
         builtin = os.path.join(get_app_dir(), "Quick")
@@ -1994,6 +2098,7 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def _on_add_app(self):
+        from PyQt6.QtWidgets import QFileDialog
         path, _ = QFileDialog.getOpenFileName(self, "选择程序", "", "可执行文件 (*.exe);;所有文件 (*.*)")
         if path:
             self._add_app_item(path)
@@ -2010,6 +2115,7 @@ class MainWindow(QMainWindow):
                 self.custom_restart_hint.setVisible(True)
 
     def _on_browse_browser(self):
+        from PyQt6.QtWidgets import QFileDialog
         path, _ = QFileDialog.getOpenFileName(self, "选择浏览器", "", "可执行文件 (*.exe);;所有文件 (*.*)")
         if path:
             self.settings["browser_path"] = path
@@ -2057,6 +2163,7 @@ class MainWindow(QMainWindow):
             self.selected_browser_label.setStyleSheet("font-size: 8pt; color: #FF6B80;")
 
     def _on_export_log(self):
+        from PyQt6.QtWidgets import QFileDialog
         path, _ = QFileDialog.getSaveFileName(self, "导出日志", f"yunji_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt", "文本文件 (*.txt)")
         if path:
             try:
@@ -2155,12 +2262,40 @@ class MainWindow(QMainWindow):
         self.monitor.wait()
         event.accept()
 
+    def _finish_splash(self):
+        if self._splash and self._splash.isVisible():
+            self.show()
+            self._splash.finish(self)
+            self._splash = None
 
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    window = MainWindow()
-    window.show()
+
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor(COLOR_BG))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor(COLOR_TEXT))
+    palette.setColor(QPalette.ColorRole.Base, QColor(COLOR_CARD))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(COLOR_BORDER))
+    palette.setColor(QPalette.ColorRole.Text, QColor(COLOR_TEXT))
+    palette.setColor(QPalette.ColorRole.Button, QColor(COLOR_CARD))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor(COLOR_TEXT))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(COLOR_RED))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
+    app.setPalette(palette)
+
+    splash = SplashScreen()
+    screen = app.primaryScreen().geometry()
+    splash.move((screen.width() - splash.width()) // 2,
+                (screen.height() - splash.height()) // 2)
+    splash.show()
+    splash.repaint()
+    app.processEvents()
+
+    splash.set_progress(0.1, "正在创建主窗口...")
+    app.processEvents()
+
+    window = MainWindow(splash=splash)
     sys.exit(app.exec())
 
 

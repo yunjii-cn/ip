@@ -17,7 +17,6 @@ def _ensure_single_instance():
         return
     try:
         import ctypes
-        from ctypes import wintypes
 
         kernel32 = ctypes.windll.kernel32
 
@@ -26,48 +25,59 @@ def _ensure_single_instance():
         already_exists = kernel32.GetLastError() == 183
 
         if not already_exists:
-            my_pid = os.getpid()
-            lock_path = os.path.join(os.path.dirname(sys.executable), ".yunji.lock")
-            try:
-                with open(lock_path, 'w') as f:
-                    f.write(str(my_pid))
-            except Exception:
-                pass
             return
 
         kernel32.CloseHandle(mutex)
 
-        lock_path = os.path.join(os.path.dirname(sys.executable), ".yunji.lock")
-        old_pid = 0
-        try:
-            if os.path.isfile(lock_path):
-                with open(lock_path, 'r') as f:
-                    old_pid = int(f.read().strip())
-        except Exception:
-            pass
-
-        if old_pid and old_pid != os.getpid():
-            PROCESS_TERMINATE = 0x0001
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = kernel32.OpenProcess(
-                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-                False, old_pid
-            )
-            if handle:
-                buf = ctypes.create_unicode_buffer(260)
-                kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(ctypes.c_ulong(260)))
-                old_exe = os.path.normcase(buf.value)
-                my_exe = os.path.normcase(os.path.abspath(sys.executable))
-                if old_exe == my_exe:
-                    kernel32.TerminateProcess(handle, 0)
-                kernel32.CloseHandle(handle)
-
         my_pid = os.getpid()
-        try:
-            with open(lock_path, 'w') as f:
-                f.write(str(my_pid))
-        except Exception:
-            pass
+        my_exe = os.path.normcase(os.path.abspath(sys.executable))
+
+        TH32CS_SNAPPROCESS = 0x00000002
+        INVALID_HANDLE = ctypes.c_void_p(-1).value
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", ctypes.c_ulong),
+                ("cntUsage", ctypes.c_ulong),
+                ("th32ProcessID", ctypes.c_ulong),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", ctypes.c_ulong),
+                ("cntThreads", ctypes.c_ulong),
+                ("th32ParentProcessID", ctypes.c_ulong),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", ctypes.c_ulong),
+                ("szExeFile", ctypes.c_wchar * 260),
+            ]
+
+        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snapshot == INVALID_HANDLE:
+            return
+
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+
+        PROCESS_TERMINATE = 0x0001
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+        if kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            while True:
+                pid = entry.th32ProcessID
+                if pid != my_pid:
+                    handle = kernel32.OpenProcess(
+                        PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                        False, pid
+                    )
+                    if handle:
+                        buf = ctypes.create_unicode_buffer(260)
+                        size = ctypes.c_ulong(260)
+                        if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                            if os.path.normcase(buf.value) == my_exe:
+                                kernel32.TerminateProcess(handle, 0)
+                        kernel32.CloseHandle(handle)
+                if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                    break
+
+        kernel32.CloseHandle(snapshot)
     except Exception:
         pass
 
