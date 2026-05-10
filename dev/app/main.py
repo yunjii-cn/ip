@@ -20,12 +20,12 @@ from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QStackedWidget, QFrame, QRadioButton, QButtonGroup,
+    QLabel, QPushButton, QStackedWidget, QFrame,
     QFileDialog, QMessageBox, QListWidget,
-    QListWidgetItem, QTextEdit, QComboBox, QSpinBox
+    QListWidgetItem, QTextEdit, QComboBox, QSpinBox, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QPoint, QPropertyAnimation, QEasingCurve, pyqtProperty
-from PyQt6.QtGui import QPixmap, QIcon, QFont, QColor, QPainter
+from PyQt6.QtGui import QPixmap, QIcon, QFont, QColor, QPainter, QPen, QFontMetrics
 
 VERSION = datetime.now().strftime("%Y.%m.%d.%H%M")
 VERSION_CHECK_URL = "https://gitee.com/yunjii/ip/raw/master/ver/version.json"
@@ -112,10 +112,10 @@ QPushButton#nav-btn {{ background-color: {COLOR_CARD}; color: {COLOR_DIM}; borde
 QPushButton#nav-btn:hover {{ background-color: #222222; color: {COLOR_TEXT}; }}
 QPushButton#nav-btn:checked {{ background-color: {COLOR_RED}; color: #FFFFFF; border: 1px solid {COLOR_RED}; }}
 
+QCheckBox {{ color: {COLOR_TEXT}; spacing: 8px; font-size: 10pt; }}
+QCheckBox::indicator {{ width: 16px; height: 16px; }}
 QRadioButton {{ color: {COLOR_TEXT}; spacing: 8px; font-size: 10pt; }}
-QRadioButton::indicator {{ width: 16px; height: 16px; }}
-QRadioButton::indicator:unchecked {{ border: 2px solid #555555; border-radius: 8px; background-color: {COLOR_CARD}; }}
-QRadioButton::indicator:checked {{ border: 2px solid {COLOR_RED_LIGHT}; border-radius: 8px; background-color: {COLOR_RED_LIGHT}; }}
+QRadioButton::indicator {{ width: 0px; height: 0px; }}
 
 QListWidget {{ background-color: {COLOR_CARD}; border: 1px solid {COLOR_BORDER}; border-radius: 4px; color: {COLOR_TEXT}; outline: none; }}
 QListWidget::item {{ padding: 6px; border-bottom: 1px solid {COLOR_BORDER}; }}
@@ -238,6 +238,140 @@ class ToggleSwitch(QWidget):
         self.update()
 
 
+class CheckBox(QWidget):
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, label="", parent=None, default=False):
+        super().__init__(parent)
+        self._checked = default
+        self._label = label
+        self.setFixedHeight(28)
+        self.setMinimumWidth(self.minimumSizeHint().width())
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def isChecked(self):
+        return self._checked
+
+    def setChecked(self, checked):
+        if self._checked != checked:
+            self._checked = checked
+            self.toggled.emit(checked)
+            self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._checked = not self._checked
+            self.toggled.emit(self._checked)
+            self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        box_size = 16
+        box_x = 0
+        box_y = (self.height() - box_size) // 2
+
+        if self._checked:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(COLOR_RED_LIGHT))
+            painter.drawRoundedRect(box_x, box_y, box_size, box_size, 3, 3)
+            pen = QPen(QColor("#FFFFFF"), 2.5)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.drawLine(box_x + 3, box_y + box_size // 2, box_x + box_size // 2 - 1, box_y + box_size - 4)
+            painter.drawLine(box_x + box_size // 2 - 1, box_y + box_size - 4, box_x + box_size - 3, box_y + 3)
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(COLOR_CARD))
+            painter.drawRoundedRect(box_x, box_y, box_size, box_size, 3, 3)
+            painter.setPen(QPen(QColor("#555555"), 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(box_x, box_y, box_size, box_size, 3, 3)
+
+        if self._label:
+            painter.setPen(QColor(COLOR_TEXT))
+            painter.setFont(QFont("Microsoft YaHei UI", 10))
+            text_x = box_x + box_size + 8
+            painter.drawText(text_x, 0, self.width() - text_x, self.height(),
+                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self._label)
+
+        painter.end()
+
+    def minimumSizeHint(self):
+        fm = QFontMetrics(QFont("Microsoft YaHei UI", 10))
+        text_w = fm.horizontalAdvance(self._label) if self._label else 0
+        return QSize(16 + 8 + text_w + 8, 28)
+
+
+class RadioButton(QWidget):
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, label="", parent=None, default=False):
+        super().__init__(parent)
+        self._checked = default
+        self._label = label
+        self._block_signal = False
+        self.setFixedHeight(28)
+        self.setMinimumWidth(self.minimumSizeHint().width())
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def isChecked(self):
+        return self._checked
+
+    def setChecked(self, checked):
+        if self._checked != checked:
+            self._checked = checked
+            if not self._block_signal:
+                self.toggled.emit(checked)
+            self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._checked = True
+            self.toggled.emit(True)
+            self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        circle_size = 16
+        circle_x = 0
+        circle_y = (self.height() - circle_size) // 2
+        center_x = circle_x + circle_size // 2
+        center_y = circle_y + circle_size // 2
+
+        if self._checked:
+            painter.setPen(QPen(QColor(COLOR_RED_LIGHT), 2))
+            painter.setBrush(QColor(COLOR_CARD))
+            painter.drawEllipse(QPoint(center_x, center_y), circle_size // 2, circle_size // 2)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(COLOR_RED_LIGHT))
+            painter.drawEllipse(QPoint(center_x, center_y), 4, 4)
+        else:
+            painter.setPen(QPen(QColor("#555555"), 2))
+            painter.setBrush(QColor(COLOR_CARD))
+            painter.drawEllipse(QPoint(center_x, center_y), circle_size // 2, circle_size // 2)
+
+        if self._label:
+            painter.setPen(QColor(COLOR_TEXT))
+            painter.setFont(QFont("Microsoft YaHei UI", 10))
+            text_x = circle_x + circle_size + 8
+            painter.drawText(text_x, 0, self.width() - text_x, self.height(),
+                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self._label)
+
+        painter.end()
+
+    def minimumSizeHint(self):
+        fm = QFontMetrics(QFont("Microsoft YaHei UI", 10))
+        text_w = fm.horizontalAdvance(self._label) if self._label else 0
+        return QSize(16 + 8 + text_w + 8, 28)
+
+
 class QTextEditLogHandler(logging.Handler):
     def __init__(self, callback):
         super().__init__()
@@ -252,9 +386,10 @@ log = logging.getLogger("yunji")
 log.setLevel(logging.DEBUG)
 _formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s', datefmt='%H:%M:%S')
 
-_console_handler = logging.StreamHandler()
-_console_handler.setFormatter(_formatter)
-log.addHandler(_console_handler)
+if not getattr(sys, 'frozen', False):
+    _console_handler = logging.StreamHandler()
+    _console_handler.setFormatter(_formatter)
+    log.addHandler(_console_handler)
 
 
 def get_base_dir():
@@ -1142,17 +1277,15 @@ class MainWindow(QMainWindow):
 
         select_row = QHBoxLayout()
         select_row.addWidget(QLabel("浏览器:"))
-        self.browser_type_group = QButtonGroup(self)
-        system_rb = QRadioButton("系统")
-        system_rb.setProperty("browser_type", "system")
-        system_rb.setChecked(self.settings.get("browser_type", "system") == "system")
-        self.browser_type_group.addButton(system_rb)
-        select_row.addWidget(system_rb)
-        custom_rb = QRadioButton("自定义")
-        custom_rb.setProperty("browser_type", "custom")
-        custom_rb.setChecked(self.settings.get("browser_type", "system") == "custom")
-        self.browser_type_group.addButton(custom_rb)
-        select_row.addWidget(custom_rb)
+        self.browser_type_group = []
+        self.system_rb = RadioButton("系统", default=self.settings.get("browser_type", "system") == "system")
+        self.browser_type_group.append(self.system_rb)
+        select_row.addWidget(self.system_rb)
+        self.custom_rb = RadioButton("自定义", default=self.settings.get("browser_type", "system") == "custom")
+        self.browser_type_group.append(self.custom_rb)
+        select_row.addWidget(self.custom_rb)
+        self.system_rb.toggled.connect(lambda checked: self._on_custom_radio_toggled("system", checked))
+        self.custom_rb.toggled.connect(lambda checked: self._on_custom_radio_toggled("custom", checked))
         self.browser_combo = QComboBox()
         self.browser_combo.setMinimumWidth(200)
         self._populate_browsers()
@@ -1164,7 +1297,6 @@ class MainWindow(QMainWindow):
         browse_btn.setFixedWidth(36)
         browse_btn.clicked.connect(self._on_browse_browser)
         select_row.addWidget(browse_btn)
-        self.browser_type_group.buttonClicked.connect(self._on_browser_type_changed)
         bl.addLayout(select_row)
 
         self.custom_browser_input = QLabel(self.settings.get("browser_path", "未选择"))
@@ -1242,19 +1374,16 @@ class MainWindow(QMainWindow):
         bmr = QHBoxLayout(browser_mode_row)
         bmr.setContentsMargins(12, 6, 12, 6)
         bmr.addWidget(QLabel("代理范围:"))
-        self.browser_proxy_group = QButtonGroup(self)
-        all_browser_rb = QRadioButton("全部浏览器")
-        all_browser_rb.setProperty("browser_proxy_mode", "all")
-        all_browser_rb.setChecked(self.settings.get("browser_proxy_mode", "all") == "all")
-        self.browser_proxy_group.addButton(all_browser_rb)
-        bmr.addWidget(all_browser_rb)
-        spec_browser_rb = QRadioButton("指定浏览器")
-        spec_browser_rb.setProperty("browser_proxy_mode", "specified")
-        spec_browser_rb.setChecked(self.settings.get("browser_proxy_mode", "all") == "specified")
-        self.browser_proxy_group.addButton(spec_browser_rb)
-        bmr.addWidget(spec_browser_rb)
+        self.browser_proxy_group = []
+        self.all_browser_rb = RadioButton("全部浏览器", default=self.settings.get("browser_proxy_mode", "all") == "all")
+        self.browser_proxy_group.append(self.all_browser_rb)
+        bmr.addWidget(self.all_browser_rb)
+        self.spec_browser_rb = RadioButton("指定浏览器", default=self.settings.get("browser_proxy_mode", "all") == "specified")
+        self.browser_proxy_group.append(self.spec_browser_rb)
+        bmr.addWidget(self.spec_browser_rb)
         bmr.addStretch()
-        self.browser_proxy_group.buttonClicked.connect(self._on_browser_proxy_mode_changed)
+        self.all_browser_rb.toggled.connect(lambda checked: self._on_proxy_mode_radio_toggled("all", checked))
+        self.spec_browser_rb.toggled.connect(lambda checked: self._on_proxy_mode_radio_toggled("specified", checked))
         pl.addWidget(browser_mode_row)
 
         self.specified_browser_hint = QLabel("")
@@ -1565,10 +1694,8 @@ class MainWindow(QMainWindow):
 
     def _get_browser_path(self):
         browser_type = "system"
-        for rb in self.browser_type_group.buttons():
-            if rb.isChecked():
-                browser_type = rb.property("browser_type") or "system"
-                break
+        if self.custom_rb.isChecked():
+            browser_type = "custom"
 
         self.settings["browser_type"] = browser_type
         save_settings(self.settings)
@@ -1687,8 +1814,14 @@ class MainWindow(QMainWindow):
             return
         start_browser(browser_path)
 
-    def _on_browser_proxy_mode_changed(self, btn):
-        mode = btn.property("browser_proxy_mode")
+    def _on_proxy_mode_radio_toggled(self, mode, checked):
+        if not checked:
+            return
+        for rb in self.browser_proxy_group:
+            if rb is not self.sender():
+                rb._block_signal = True
+                rb.setChecked(False)
+                rb._block_signal = False
         self.settings["browser_proxy_mode"] = mode
         save_settings(self.settings)
         self._update_browser_proxy_hint()
@@ -1886,12 +2019,22 @@ class MainWindow(QMainWindow):
             self._update_browser_proxy_hint()
             log.info(f"已设置自定义浏览器: {path}")
 
-    def _on_browser_type_changed(self, btn):
-        browser_type = btn.property("browser_type") or "system"
+    def _on_custom_radio_toggled(self, browser_type, checked):
+        if not checked:
+            return
+        if browser_type == "system":
+            self.custom_rb._block_signal = True
+            self.custom_rb.setChecked(False)
+            self.custom_rb._block_signal = False
+        else:
+            self.system_rb._block_signal = True
+            self.system_rb.setChecked(False)
+            self.system_rb._block_signal = False
         self.settings["browser_type"] = browser_type
         save_settings(self.settings)
         self._update_selected_browser_label()
         self._update_browser_proxy_hint()
+        self.custom_browser_input.setVisible(browser_type == "custom")
         log.info(f"浏览器类型切换为: {browser_type}")
 
     def _on_system_browser_changed(self, idx):
