@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QPoint, QPropertyAnimation, QEasingCurve, pyqtProperty, QRectF
 from PyQt6.QtGui import QPixmap, QIcon, QFont, QColor, QPainter, QPen, QFontMetrics, QPalette, QLinearGradient
 
-VERSION = datetime.now().strftime("%Y.%m.%d.%H%M")
+VERSION = "2026.05.18.0339"
 VERSION_CHECK_URL = "https://gitee.com/yunjii/ip/raw/master/ver/version.json"
 VERSION_DOWNLOAD_URL = "https://gitee.com/yunjii/ip/raw/master/ver/"
 APP_NAME = f"云集智能网联代理专家 v{VERSION}"
@@ -634,7 +634,8 @@ def verify_proxy_connection(timeout=10):
         resp = opener.open(req, timeout=timeout)
         elapsed = time.time() - start
         return resp.status == 204, elapsed
-    except Exception:
+    except Exception as e:
+        log.warning(f"代理连接验证失败: {e}")
         return False, None
 
 
@@ -704,6 +705,11 @@ def start_quick(quick_dir):
     if not os.path.isfile(quick_exe):
         log.error(f"quick.exe 不存在: {quick_exe}")
         return False
+    config_path = os.path.join(quick_dir, "config.yaml")
+    if not os.path.isfile(config_path):
+        log.error(f"config.yaml 不存在: {config_path}")
+        return False
+    log.info(f"配置文件大小: {os.path.getsize(config_path)} bytes")
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     si.wShowWindow = 0
@@ -795,7 +801,11 @@ def load_settings():
         "quick_dir_path": "",
         "auto_line_switch": False,
         "auto_line_interval": 30,
+        "realtime_detect": False,
+        "timeout_auto_switch": False,
         "browser_proxy_mode": "all",
+        "current_line": "",
+        "proxy_enabled": False,
     }
     if os.path.isfile(path):
         try:
@@ -840,6 +850,7 @@ class ServiceWorker(QThread):
     finished = pyqtSignal(bool, str)
     progress = pyqtSignal(str)
     line_tested = pyqtSignal(str, float, bool)
+    line_selected = pyqtSignal(str)
 
     def __init__(self, action, **kwargs):
         super().__init__()
@@ -862,34 +873,36 @@ class ServiceWorker(QThread):
         log.info("开始启动代理服务")
         downloaded = download_all_configs()
         if downloaded:
-            self.progress.emit("正在测试线路延迟...")
-            fastest_name, fastest_data, fastest_time = None, None, float('inf')
-            for name, data in downloaded:
-                elapsed = test_direct_latency()
-                if elapsed < fastest_time:
-                    fastest_time = elapsed
-                    fastest_name = name
-                    fastest_data = data
-            if fastest_data:
-                save_config(quick_dir, fastest_data)
-                self.progress.emit(f"已选择: {fastest_name}")
-                log.info(f"最快线路: {fastest_name} ({fastest_time:.1f}s)")
-            else:
-                if not os.path.isfile(os.path.join(quick_dir, "config.yaml")):
-                    self.finished.emit(False, "无可用配置")
-                    return
+            saved_line = self.kwargs.get("current_line")
+            selected = None
+            if saved_line:
+                for name, data in downloaded:
+                    if name == saved_line:
+                        selected = (name, data)
+                        break
+            if not selected:
+                selected = downloaded[0]
+            save_config(quick_dir, selected[1])
+            self.line_selected.emit(selected[0])
+            self.progress.emit(f"已选择: {selected[0]}")
+            log.info(f"启动线路: {selected[0]}, 配置大小: {len(selected[1])} bytes")
         else:
             if not os.path.isfile(os.path.join(quick_dir, "config.yaml")):
                 self.finished.emit(False, "无可用配置")
                 return
+            log.warning("未下载到新配置，使用本地已有配置")
         self.progress.emit("正在启动代理内核...")
         start_quick(quick_dir)
         if not wait_for_proxy(timeout=15):
             self.finished.emit(False, "代理内核启动失败")
             return
+        log.info("代理内核已启动，正在验证连接...")
         connected, latency = verify_proxy_connection(timeout=10)
         lat_str = f"{latency:.1f}s" if latency else "未知"
-        log.info(f"代理已启动, 延迟: {lat_str}")
+        if connected:
+            log.info(f"代理连接验证成功, 延迟: {lat_str}")
+        else:
+            log.warning(f"代理连接验证失败 (内核已启动但无法通过代理访问外网)")
         self.finished.emit(True, f"代理已启动 (延迟: {lat_str})")
 
     def _do_test_lines(self):
@@ -899,55 +912,82 @@ class ServiceWorker(QThread):
             self.finished.emit(False, "无法下载配置")
             return
 
-        result_queue = queue.Queue()
+        quick_dir = self.kwargs.get("quick_dir")
+        if not quick_dir:
+            self.finished.emit(False, "未找到内核目录")
+            return
+
+        original_config = None
+        config_path = os.path.join(quick_dir, "config.yaml")
+        if os.path.isfile(config_path):
+            with open(config_path, 'rb') as f:
+                original_config = f.read()
+
+        results = []
         total = len(downloaded)
 
-        def test_single_line(name, data):
+        for i, (name, data) in enumerate(downloaded):
+            self.progress.emit(f"正在检测线路 {i+1}/{total}: {name}...")
+            save_config(quick_dir, data)
+
+            if is_proxy_running():
+                stop_quick()
+                time.sleep(1)
+
+            start_quick(quick_dir)
+            if not wait_for_proxy(timeout=8):
+                results.append((name, -1.0, -1.0, 0, data))
+                self.line_tested.emit(name, -1.0, False)
+                continue
+
             latencies = []
             for _, test_url in NODE_TEST_URLS:
                 try:
-                    start = time.time()
-                    ctx = ssl.create_default_context()
-                    ctx.check_hostname = False
-                    ctx.verify_mode = ssl.CERT_NONE
+                    proxy_handler = urllib.request.ProxyHandler({
+                        'http': f'http://{PROXY_URL}',
+                        'https': f'http://{PROXY_URL}',
+                    })
+                    opener = urllib.request.build_opener(proxy_handler)
                     req = urllib.request.Request(test_url, headers={"User-Agent": "Mozilla/5.0"})
-                    urllib.request.urlopen(req, timeout=NODE_TEST_TIMEOUT, context=ctx)
-                    latencies.append(time.time() - start)
+                    start = time.time()
+                    resp = opener.open(req, timeout=NODE_TEST_TIMEOUT)
+                    elapsed = time.time() - start
+                    if resp.status in (200, 204):
+                        latencies.append(elapsed)
                 except Exception:
                     pass
+
             if latencies:
                 avg = sum(latencies) / len(latencies)
                 best = min(latencies)
-                result_queue.put((name, avg, best, len(latencies), data))
+                results.append((name, avg, best, len(latencies), data))
+                self.line_tested.emit(name, avg, True)
             else:
-                result_queue.put((name, -1.0, -1.0, 0, data))
+                results.append((name, -1.0, -1.0, 0, data))
+                self.line_tested.emit(name, -1.0, False)
 
-        self.progress.emit(f"正在并行检测 {total} 条线路...")
-
-        line_threads = []
-        for name, data in downloaded:
-            t = threading.Thread(target=test_single_line, args=(name, data))
-            t.start()
-            line_threads.append(t)
-
-        results = []
-        received = 0
-        while received < total:
-            try:
-                name, avg, best, count, data = result_queue.get(timeout=NODE_TEST_TIMEOUT + 5)
-                received += 1
-                is_ok = avg >= 0
-                self.line_tested.emit(name, avg, is_ok)
-                self.progress.emit(f"正在检测线路 {received}/{total}...")
-                if is_ok:
-                    results.append((name, avg, best, count, data))
-                else:
-                    results.append((name, -1.0, -1.0, 0, data))
-            except queue.Empty:
-                break
-
-        for t in line_threads:
-            t.join(timeout=1)
+        proxy_enabled = self.kwargs.get("proxy_enabled", False)
+        current_line = self.kwargs.get("current_line", "")
+        if proxy_enabled:
+            restore_data = original_config
+            if current_line:
+                for n, d in downloaded:
+                    if n == current_line:
+                        restore_data = d
+                        break
+            if restore_data:
+                with open(config_path, 'wb') as f:
+                    f.write(restore_data)
+            if is_proxy_running():
+                stop_quick()
+                time.sleep(1)
+            start_quick(quick_dir)
+            wait_for_proxy(timeout=8)
+        else:
+            stop_quick()
+            if original_config:
+                with open(config_path, 'wb') as f:
+                    f.write(original_config)
 
         self.kwargs["results"] = results
         self.finished.emit(True, "检测完成")
@@ -958,18 +998,69 @@ class ServiceWorker(QThread):
         if not downloaded:
             self.finished.emit(False, "无法下载配置")
             return
+        quick_dir = self.kwargs.get("quick_dir")
+        if not quick_dir:
+            self.finished.emit(False, "未找到内核目录")
+            return
+
+        original_config = None
+        config_path = os.path.join(quick_dir, "config.yaml")
+        if os.path.isfile(config_path):
+            with open(config_path, 'rb') as f:
+                original_config = f.read()
+
         fastest_name, fastest_data, fastest_time = None, None, float('inf')
         for name, data in downloaded:
             self.progress.emit(f"正在测试 {name}...")
-            elapsed = test_direct_latency()
-            if elapsed < fastest_time:
-                fastest_time = elapsed
-                fastest_name = name
-                fastest_data = data
-        if fastest_data:
-            quick_dir = self.kwargs.get("quick_dir")
-            if quick_dir:
+            save_config(quick_dir, data)
+
+            if is_proxy_running():
+                stop_quick()
+                time.sleep(1)
+
+            start_quick(quick_dir)
+            if not wait_for_proxy(timeout=8):
+                continue
+
+            try:
+                proxy_handler = urllib.request.ProxyHandler({
+                    'http': f'http://{PROXY_URL}',
+                    'https': f'http://{PROXY_URL}',
+                })
+                opener = urllib.request.build_opener(proxy_handler)
+                req = urllib.request.Request(NODE_TEST_URL, headers={"User-Agent": "Mozilla/5.0"})
+                start = time.time()
+                resp = opener.open(req, timeout=NODE_TEST_TIMEOUT)
+                elapsed = time.time() - start
+                if resp.status in (200, 204) and elapsed < fastest_time:
+                    fastest_time = elapsed
+                    fastest_name = name
+                    fastest_data = data
+            except Exception:
+                pass
+
+        proxy_enabled = self.kwargs.get("proxy_enabled", False)
+        if proxy_enabled:
+            if fastest_data:
                 save_config(quick_dir, fastest_data)
+            elif original_config:
+                with open(config_path, 'wb') as f:
+                    f.write(original_config)
+            if is_proxy_running():
+                stop_quick()
+                time.sleep(1)
+            start_quick(quick_dir)
+            wait_for_proxy(timeout=8)
+        else:
+            stop_quick()
+            if fastest_data:
+                save_config(quick_dir, fastest_data)
+            elif original_config:
+                with open(config_path, 'wb') as f:
+                    f.write(original_config)
+
+        if fastest_data:
+            self.line_selected.emit(fastest_name)
             self.finished.emit(True, f"已选择最快线路: {fastest_name}")
         else:
             self.finished.emit(False, "无可用线路")
@@ -978,6 +1069,7 @@ class ServiceWorker(QThread):
         name = self.kwargs.get("name")
         data = self.kwargs.get("data")
         quick_dir = self.kwargs.get("quick_dir")
+        proxy_enabled = self.kwargs.get("proxy_enabled", False)
         if data and quick_dir:
             save_config(quick_dir, data)
             if is_proxy_running():
@@ -989,6 +1081,13 @@ class ServiceWorker(QThread):
                     self.finished.emit(True, f"已切换到 {name}")
                 else:
                     self.finished.emit(False, "切换失败")
+            elif proxy_enabled:
+                self.progress.emit(f"正在连接 {name}...")
+                start_quick(quick_dir)
+                if wait_for_proxy(timeout=15):
+                    self.finished.emit(True, f"已连接 {name}")
+                else:
+                    self.finished.emit(False, "连接失败")
             else:
                 self.finished.emit(True, f"已选择 {name}，请启动服务")
         else:
@@ -998,20 +1097,26 @@ class ServiceWorker(QThread):
         self.progress.emit("正在下载最新配置...")
         downloaded = download_all_configs()
         if downloaded:
-            fastest_name, fastest_data, fastest_time = None, None, float('inf')
-            for name, data in downloaded:
-                elapsed = test_direct_latency()
-                if elapsed < fastest_time:
-                    fastest_time = elapsed
-                    fastest_name = name
-                    fastest_data = data
-            if fastest_data:
-                quick_dir = self.kwargs.get("quick_dir")
-                if quick_dir:
-                    save_config(quick_dir, fastest_data)
-                self.finished.emit(True, f"配置更新成功: {fastest_name}")
+            quick_dir = self.kwargs.get("quick_dir")
+            if quick_dir:
+                saved_line = self.kwargs.get("current_line")
+                selected = None
+                if saved_line:
+                    for name, data in downloaded:
+                        if name == saved_line:
+                            selected = (name, data)
+                            break
+                if not selected:
+                    selected = downloaded[0]
+                save_config(quick_dir, selected[1])
+                if is_proxy_running():
+                    stop_quick()
+                    time.sleep(1)
+                    start_quick(quick_dir)
+                    wait_for_proxy(timeout=8)
+                self.finished.emit(True, f"配置更新成功: {selected[0]}")
             else:
-                self.finished.emit(False, "所有线路不可用")
+                self.finished.emit(False, "未找到内核目录")
         else:
             self.finished.emit(False, "无法下载配置")
 
@@ -1117,7 +1222,7 @@ class MainWindow(QMainWindow):
 
         self.settings = load_settings()
         self.quick_dir = self._resolve_quick_dir()
-        self.current_line = ""
+        self.current_line = self.settings.get("current_line", "")
         self.line_results = {}
         self.worker = None
         self._auto_line_timer = None
@@ -1139,11 +1244,16 @@ class MainWindow(QMainWindow):
         self._update_kernel_status()
         self._update_active_line()
 
+        self.switch_proxy.blockSignals(True)
+        self.switch_proxy.setChecked(self.settings.get("proxy_enabled", False))
+        self.switch_proxy.blockSignals(False)
+
         self.monitor = ProxyMonitor()
         self.monitor.status_changed.connect(self._update_status)
+        self.monitor.status_changed.connect(lambda _: self._update_active_line())
         self.monitor.start()
 
-        if self.settings.get("auto_start", True) and self.quick_dir:
+        if self.settings.get("proxy_enabled", False) and self.settings.get("auto_start", True) and self.quick_dir:
             QTimer.singleShot(500, self._on_start)
 
         QTimer.singleShot(1000, self._startup_download_config)
@@ -1185,42 +1295,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        layout.addWidget(self._build_bottom_bar())
         layout.addWidget(self._build_tabs(), stretch=1)
-
-    def _build_bottom_bar(self):
-        frame = QFrame()
-        frame.setObjectName("card")
-        h = QHBoxLayout(frame)
-        h.setContentsMargins(16, 10, 16, 10)
-        h.setSpacing(12)
-
-        self.status_dot = QLabel("●")
-        self.status_dot.setStyleSheet("font-size: 18px; color: #FF6B80;")
-        h.addWidget(self.status_dot)
-        h.addSpacing(4)
-
-        info = QVBoxLayout()
-        info.setSpacing(1)
-        self.status_label = QLabel("代理未启动")
-        self.status_label.setObjectName("status-off")
-        info.addWidget(self.status_label)
-        self.detail_label = QLabel("开启代理服务")
-        self.detail_label.setObjectName("dim")
-        self.detail_label.setStyleSheet("font-size: 8pt;")
-        info.addWidget(self.detail_label)
-        h.addLayout(info, stretch=1)
-
-        self.latency_label = QLabel("")
-        self.latency_label.setObjectName("latency")
-        h.addWidget(self.latency_label)
-
-        self.switch_proxy = ToggleSwitch("代理服务", default=False)
-        self.switch_proxy.setFixedWidth(160)
-        self.switch_proxy.toggled.connect(self._on_proxy_switch_toggled)
-        h.addWidget(self.switch_proxy)
-
-        return frame
 
     def _build_tabs(self):
         container = QWidget()
@@ -1234,7 +1309,7 @@ class MainWindow(QMainWindow):
 
         self.nav_buttons = []
         nav_items = [
-            ("🔍 线路检测", 0),
+            ("🚀 运行服务", 0),
             ("⚙️ 代理设置", 1),
             ("📋 运行日志", 2),
             ("🔄 版本更新", 3),
@@ -1252,7 +1327,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(nav_bar)
 
         self.stack = QStackedWidget()
-        self.stack.addWidget(self._build_line_tab())
+        self.stack.addWidget(self._build_service_tab())
         self.stack.addWidget(self._build_proxy_tab())
         self.stack.addWidget(self._build_log_tab())
         self.stack.addWidget(self._build_update_tab())
@@ -1265,30 +1340,95 @@ class MainWindow(QMainWindow):
             btn.setChecked(i == idx)
         self.stack.setCurrentIndex(idx)
 
-    def _build_line_tab(self):
+    def _build_service_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
 
-        btn_row = QHBoxLayout()
-        self.btn_test = QPushButton("🔍 检测所有线路")
-        self.btn_test.setObjectName("small-blue")
+        status_card = QFrame()
+        status_card.setObjectName("card")
+        sc = QVBoxLayout(status_card)
+        sc.setContentsMargins(20, 16, 20, 16)
+        sc.setSpacing(12)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(16)
+
+        self.svc_status_dot = QLabel("●")
+        self.svc_status_dot.setStyleSheet(f"font-size: 28px; color: #FF6B80;")
+        self.svc_status_dot.setFixedWidth(32)
+        top_row.addWidget(self.svc_status_dot, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        status_col = QVBoxLayout()
+        status_col.setSpacing(2)
+        self.svc_status_label = QLabel("代理未启动")
+        self.svc_status_label.setStyleSheet(f"font-size: 15pt; font-weight: bold; color: {COLOR_TEXT};")
+        status_col.addWidget(self.svc_status_label)
+        self.svc_detail_label = QLabel("开启代理服务以访问外网")
+        self.svc_detail_label.setObjectName("dim")
+        self.svc_detail_label.setStyleSheet("font-size: 9pt;")
+        status_col.addWidget(self.svc_detail_label)
+        top_row.addLayout(status_col, stretch=1)
+
+        self.btn_test = QPushButton("🔍 检测线路")
         self.btn_test.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_test.setFixedSize(120, 44)
+        self.btn_test.setStyleSheet(
+            f"QPushButton {{ background-color: {COLOR_RED}; color: #FFFFFF; "
+            f"font-size: 10pt; font-weight: bold; border-radius: 8px; border: none; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_RED_LIGHT}; }}"
+            f"QPushButton:disabled {{ background-color: #333; color: #666; }}"
+        )
         self.btn_test.clicked.connect(self._on_test_lines)
-        btn_row.addWidget(self.btn_test)
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
+        top_row.addWidget(self.btn_test, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        self.switch_proxy = ToggleSwitch("代理服务", default=False)
+        self.switch_proxy.setFixedWidth(160)
+        self.switch_proxy.toggled.connect(self._on_proxy_switch_toggled)
+        top_row.addWidget(self.switch_proxy, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        sc.addLayout(top_row)
+
+        info_row = QHBoxLayout()
+        info_row.setSpacing(24)
+        self.svc_latency_label = QLabel("")
+        self.svc_latency_label.setObjectName("latency")
+        self.svc_latency_label.setStyleSheet("font-size: 10pt;")
+        info_row.addWidget(self.svc_latency_label)
+        self.svc_line_label = QLabel("")
+        self.svc_line_label.setObjectName("dim")
+        self.svc_line_label.setStyleSheet("font-size: 9pt;")
+        info_row.addWidget(self.svc_line_label)
+        info_row.addStretch()
+        sc.addLayout(info_row)
+
+        layout.addWidget(status_card)
+
+        line_card = QFrame()
+        line_card.setObjectName("card")
+        lc = QVBoxLayout(line_card)
+        lc.setContentsMargins(20, 14, 20, 14)
+        lc.setSpacing(6)
+
+        line_header = QHBoxLayout()
+        line_title = QLabel("线路列表")
+        line_title.setStyleSheet(f"font-size: 11pt; font-weight: bold; color: {COLOR_TEXT};")
+        line_header.addWidget(line_title)
+        line_header.addStretch()
+        lc.addLayout(line_header)
 
         self.line_rows = {}
         for name, _, _ in CONFIG_URLS:
             row = QFrame()
             row.setObjectName("line-row")
             rh = QHBoxLayout(row)
-            rh.setContentsMargins(12, 8, 12, 8)
+            rh.setContentsMargins(14, 10, 14, 10)
+            rh.setSpacing(12)
             name_lbl = QLabel(name)
             name_lbl.setObjectName("suggestion")
             name_lbl.setFixedWidth(50)
+            name_lbl.setStyleSheet("font-size: 10pt; font-weight: bold;")
             rh.addWidget(name_lbl)
             status_lbl = QLabel("未检测")
             status_lbl.setObjectName("dim")
@@ -1298,42 +1438,66 @@ class MainWindow(QMainWindow):
             use_btn = QPushButton("使用")
             use_btn.setObjectName("small-blue")
             use_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            use_btn.setFixedWidth(70)
             use_btn.clicked.connect(lambda checked, n=name: self._on_use_line(n))
             rh.addWidget(use_btn)
-            layout.addWidget(row)
+            lc.addWidget(row)
             self.line_rows[name] = {"status": status_lbl, "use_btn": use_btn, "data": None, "row": row}
 
-        auto_card = QFrame()
-        auto_card.setObjectName("card")
-        al = QVBoxLayout(auto_card)
-        al.setSpacing(8)
+        layout.addWidget(line_card)
 
-        auto_title = QLabel("自动切换")
-        auto_title.setObjectName("accent")
-        auto_title.setStyleSheet("font-size: 11pt; font-weight: bold;")
-        al.addWidget(auto_title)
+        smart_card = QFrame()
+        smart_card.setObjectName("card")
+        sm = QVBoxLayout(smart_card)
+        sm.setContentsMargins(20, 14, 20, 14)
+        sm.setSpacing(8)
 
-        auto_switch_row = QFrame()
-        auto_switch_row.setObjectName("switch-row")
-        asr = QHBoxLayout(auto_switch_row)
-        asr.setContentsMargins(12, 6, 12, 6)
-        auto_info = QVBoxLayout()
-        auto_info.setSpacing(0)
-        auto_lbl = QLabel("🔄 自动切换最快线路")
-        auto_lbl.setStyleSheet("font-size: 10pt; font-weight: bold;")
-        auto_info.addWidget(auto_lbl)
-        auto_desc = QLabel("检测后自动激活最快线路，并按间隔定时切换")
-        auto_desc.setObjectName("dim")
-        auto_desc.setStyleSheet("font-size: 8pt;")
-        auto_info.addWidget(auto_desc)
-        asr.addLayout(auto_info, stretch=1)
+        smart_title = QLabel("智能线路")
+        smart_title.setStyleSheet(f"font-size: 11pt; font-weight: bold; color: {COLOR_TEXT};")
+        sm.addWidget(smart_title)
+
+        realtime_row = QFrame()
+        realtime_row.setObjectName("switch-row")
+        rr = QHBoxLayout(realtime_row)
+        rr.setContentsMargins(14, 8, 14, 8)
+        realtime_info = QVBoxLayout()
+        realtime_info.setSpacing(1)
+        realtime_lbl = QLabel("📡 实时检测")
+        realtime_lbl.setStyleSheet("font-size: 10pt; font-weight: bold;")
+        realtime_info.addWidget(realtime_lbl)
+        realtime_desc = QLabel("持续监测连通性，断线自动重连")
+        realtime_desc.setObjectName("dim")
+        realtime_desc.setStyleSheet("font-size: 8pt;")
+        realtime_info.addWidget(realtime_desc)
+        rr.addLayout(realtime_info, stretch=1)
+        self.switch_realtime_detect = ToggleSwitch("", default=self.settings.get("realtime_detect", False))
+        self.switch_realtime_detect.setFixedWidth(80)
+        self.switch_realtime_detect.toggled.connect(self._on_realtime_detect_toggled)
+        rr.addWidget(self.switch_realtime_detect, alignment=Qt.AlignmentFlag.AlignVCenter)
+        sm.addWidget(realtime_row)
+
+        timeout_row = QFrame()
+        timeout_row.setObjectName("switch-row")
+        tr = QHBoxLayout(timeout_row)
+        tr.setContentsMargins(14, 8, 14, 8)
+        timeout_info = QVBoxLayout()
+        timeout_info.setSpacing(1)
+        timeout_lbl = QLabel("⚡ 超时切换最快线路")
+        timeout_lbl.setStyleSheet("font-size: 10pt; font-weight: bold;")
+        timeout_info.addWidget(timeout_lbl)
+        timeout_desc = QLabel("按间隔定时检测，自动切换到最快线路")
+        timeout_desc.setObjectName("dim")
+        timeout_desc.setStyleSheet("font-size: 8pt;")
+        timeout_info.addWidget(timeout_desc)
+        tr.addLayout(timeout_info, stretch=1)
         self.switch_auto_line = ToggleSwitch("", default=self.settings.get("auto_line_switch", False))
         self.switch_auto_line.setFixedWidth(80)
         self.switch_auto_line.toggled.connect(self._on_auto_line_switch_toggled)
-        asr.addWidget(self.switch_auto_line)
-        al.addWidget(auto_switch_row)
+        tr.addWidget(self.switch_auto_line, alignment=Qt.AlignmentFlag.AlignVCenter)
+        sm.addWidget(timeout_row)
 
         interval_row = QHBoxLayout()
+        interval_row.setSpacing(8)
         interval_lbl = QLabel("检测间隔:")
         interval_lbl.setObjectName("dim")
         interval_lbl.setStyleSheet("font-size: 9pt;")
@@ -1349,37 +1513,35 @@ class MainWindow(QMainWindow):
         self.auto_line_status.setObjectName("dim")
         self.auto_line_status.setStyleSheet("font-size: 8pt;")
         interval_row.addWidget(self.auto_line_status)
-        al.addLayout(interval_row)
+        sm.addLayout(interval_row)
 
-        layout.addWidget(auto_card)
+        layout.addWidget(smart_card)
 
         browser_card = QFrame()
         browser_card.setObjectName("card")
-        bl = QVBoxLayout(browser_card)
-        bl.setSpacing(8)
+        bc = QVBoxLayout(browser_card)
+        bc.setContentsMargins(20, 14, 20, 14)
+        bc.setSpacing(8)
 
         browser_title = QLabel("浏览器")
-        browser_title.setObjectName("accent")
-        browser_title.setStyleSheet("font-size: 11pt; font-weight: bold;")
-        bl.addWidget(browser_title)
+        browser_title.setStyleSheet(f"font-size: 11pt; font-weight: bold; color: {COLOR_TEXT};")
+        bc.addWidget(browser_title)
 
         auto_browser_row = QFrame()
         auto_browser_row.setObjectName("switch-row")
         abr = QHBoxLayout(auto_browser_row)
-        abr.setContentsMargins(12, 6, 12, 6)
-        auto_browser_info = QVBoxLayout()
-        auto_browser_info.setSpacing(0)
-        auto_browser_lbl = QLabel("🌐 启动后自动打开浏览器")
+        abr.setContentsMargins(14, 8, 14, 8)
+        auto_browser_lbl = QLabel("🌐 检测线路后打开浏览器")
         auto_browser_lbl.setStyleSheet("font-size: 10pt; font-weight: bold;")
-        auto_browser_info.addWidget(auto_browser_lbl)
-        abr.addLayout(auto_browser_info, stretch=1)
+        abr.addWidget(auto_browser_lbl, stretch=1)
         self.switch_auto_browser = ToggleSwitch("", default=self.settings.get("auto_open_browser", True))
         self.switch_auto_browser.setFixedWidth(80)
         self.switch_auto_browser.toggled.connect(self._on_auto_open_browser_toggled)
-        abr.addWidget(self.switch_auto_browser)
-        bl.addWidget(auto_browser_row)
+        abr.addWidget(self.switch_auto_browser, alignment=Qt.AlignmentFlag.AlignVCenter)
+        bc.addWidget(auto_browser_row)
 
         select_row = QHBoxLayout()
+        select_row.setSpacing(8)
         select_row.addWidget(QLabel("浏览器:"))
         self.browser_type_group = []
         self.system_rb = RadioButton("系统", default=self.settings.get("browser_type", "system") == "system")
@@ -1401,32 +1563,30 @@ class MainWindow(QMainWindow):
         browse_btn.setFixedWidth(36)
         browse_btn.clicked.connect(self._on_browse_browser)
         select_row.addWidget(browse_btn)
-        bl.addLayout(select_row)
+        bc.addLayout(select_row)
 
         self.custom_browser_input = QLabel(self.settings.get("browser_path", "未选择"))
         self.custom_browser_input.setObjectName("dim")
         self.custom_browser_input.setStyleSheet("font-size: 8pt;")
         self.custom_browser_input.setVisible(self.settings.get("browser_type", "system") == "custom")
-        bl.addWidget(self.custom_browser_input)
+        bc.addWidget(self.custom_browser_input)
 
         self.selected_browser_label = QLabel("")
         self.selected_browser_label.setObjectName("dim")
         self.selected_browser_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_RED_LIGHT};")
         self.selected_browser_label.setWordWrap(True)
-        bl.addWidget(self.selected_browser_label)
+        bc.addWidget(self.selected_browser_label)
         self._update_selected_browser_label()
 
-        open_row = QHBoxLayout()
         self.btn_open_browser = QPushButton("🌐 打开浏览器")
         self.btn_open_browser.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_open_browser.setStyleSheet(
-            f"background-color: {COLOR_RED}; color: #FFFFFF; padding: 8px 20px; "
-            f"font-size: 10pt; font-weight: bold; border-radius: 4px;"
+            f"QPushButton {{ background-color: {COLOR_RED}; color: #FFFFFF; padding: 10px 24px; "
+            f"font-size: 10pt; font-weight: bold; border-radius: 6px; border: none; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_RED_LIGHT}; }}"
         )
         self.btn_open_browser.clicked.connect(self._on_open_browser)
-        open_row.addWidget(self.btn_open_browser)
-        open_row.addStretch()
-        bl.addLayout(open_row)
+        bc.addWidget(self.btn_open_browser, alignment=Qt.AlignmentFlag.AlignLeft)
 
         layout.addWidget(browser_card)
 
@@ -1754,32 +1914,61 @@ class MainWindow(QMainWindow):
 
     def _update_status(self, running):
         if running:
-            self.status_dot.setStyleSheet(f"font-size: 18px; color: {COLOR_GREEN};")
-            self.status_label.setText("代理运行中")
-            self.status_label.setObjectName("status-on")
-            self.detail_label.setText(f"本地代理: {PROXY_URL} | 当前线路: {self.current_line or '未知'}")
-            if not self.switch_proxy.isChecked():
-                self.switch_proxy.setChecked(True)
+            self.svc_status_dot.setStyleSheet(f"font-size: 28px; color: {COLOR_GREEN};")
+            self.svc_status_label.setText("代理运行中")
+            self.svc_status_label.setStyleSheet(f"font-size: 15pt; font-weight: bold; color: {COLOR_GREEN};")
+            self.svc_detail_label.setText(f"本地代理: {PROXY_URL}")
+            self.svc_line_label.setText(f"当前线路: {self.current_line or '未知'}")
         else:
-            self.status_dot.setStyleSheet("font-size: 18px; color: #FF6B80;")
-            self.status_label.setText("代理未启动")
-            self.status_label.setObjectName("status-off")
-            self.detail_label.setText("开启代理服务")
-            self.latency_label.setText("")
+            self.svc_status_dot.setStyleSheet(f"font-size: 28px; color: #FF6B80;")
             if self.switch_proxy.isChecked():
-                self.switch_proxy.setChecked(False)
-        self.status_label.setStyleSheet(self.status_label.styleSheet())
+                self.svc_status_label.setText("代理未连接")
+                self.svc_status_label.setStyleSheet(f"font-size: 15pt; font-weight: bold; color: {COLOR_ORANGE};")
+                self.svc_detail_label.setText("代理服务已开启但未连接")
+                self.svc_line_label.setText("点击线路的'重连'按钮重新连接")
+            else:
+                self.svc_status_label.setText("代理未启动")
+                self.svc_status_label.setStyleSheet(f"font-size: 15pt; font-weight: bold; color: {COLOR_TEXT};")
+                self.svc_detail_label.setText("开启代理服务以访问外网")
+                self.svc_line_label.setText("")
+            self.svc_latency_label.setText("")
 
     def _update_active_line(self):
         for name, info in self.line_rows.items():
             row = info["row"]
-            if name == self.current_line:
+            btn = info["use_btn"]
+            if name == self.current_line and is_proxy_running():
                 row.setObjectName("line-active")
                 row.setStyleSheet(row.styleSheet())
                 info["status"].setStyleSheet(f"color: {COLOR_RED_LIGHT}; font-weight: bold;")
+                btn.setText("运行中")
+                btn.setObjectName("small-red")
+                btn.setStyleSheet(
+                    f"background-color: {COLOR_RED}; color: #FFFFFF; padding: 4px 12px; "
+                    f"font-size: 9pt; font-weight: bold; border-radius: 4px; border: none;"
+                )
+                btn.setEnabled(False)
+                btn.setCursor(Qt.CursorShape.ArrowCursor)
+            elif name == self.current_line:
+                row.setObjectName("line-active")
+                row.setStyleSheet(row.styleSheet())
+                info["status"].setStyleSheet(f"color: {COLOR_ORANGE}; font-weight: bold;")
+                btn.setText("重连")
+                btn.setObjectName("small-orange")
+                btn.setStyleSheet(
+                    f"background-color: {COLOR_ORANGE}; color: #FFFFFF; padding: 4px 12px; "
+                    f"font-size: 9pt; font-weight: bold; border-radius: 4px; border: none;"
+                )
+                btn.setEnabled(True)
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
             else:
                 row.setObjectName("line-row")
                 row.setStyleSheet(row.styleSheet())
+                btn.setText("使用")
+                btn.setObjectName("small-blue")
+                btn.setStyleSheet("")
+                btn.setEnabled(True)
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def _update_sys_proxy_label(self):
         enabled, server = get_system_proxy()
@@ -1801,8 +1990,7 @@ class MainWindow(QMainWindow):
         if self.custom_rb.isChecked():
             browser_type = "custom"
 
-        self.settings["browser_type"] = browser_type
-        save_settings(self.settings)
+        self._save_setting("browser_type", browser_type)
 
         path = None
         if browser_type == "system":
@@ -1835,9 +2023,15 @@ class MainWindow(QMainWindow):
     def _auto_line_check(self):
         if not self.quick_dir or not is_proxy_running():
             return
+        if self.worker and self.worker.isRunning():
+            return
+        self._cleanup_worker()
         log.info("自动线路检测: 开始检测...")
         self.auto_line_status.setText("正在检测线路...")
-        self.worker = ServiceWorker("auto_select", quick_dir=self.quick_dir)
+        self.worker = ServiceWorker("auto_select", quick_dir=self.quick_dir,
+                                    proxy_enabled=self.settings.get("proxy_enabled", False),
+                                    current_line=self.current_line)
+        self.worker.line_selected.connect(self._on_line_selected)
         self.worker.finished.connect(self._on_auto_line_check_finished)
         self.worker.start()
 
@@ -1847,9 +2041,12 @@ class MainWindow(QMainWindow):
             if line_name and line_name != self.current_line:
                 log.info(f"自动切换线路: {self.current_line} → {line_name}")
                 self.current_line = line_name
+                self._save_setting("current_line", line_name)
                 self._update_active_line()
                 if is_proxy_running() and line_name in self.line_results and self.line_results[line_name]:
-                    self.worker = ServiceWorker("use_line", name=line_name, data=self.line_results[line_name], quick_dir=self.quick_dir)
+                    self.worker = ServiceWorker("use_line", name=line_name, data=self.line_results[line_name],
+                                                quick_dir=self.quick_dir,
+                                                proxy_enabled=self.settings.get("proxy_enabled", False))
                     self.worker.start()
             interval = self.settings.get("auto_line_interval", 30)
             self.auto_line_status.setText(f"下次检测: {interval}分钟后")
@@ -1857,6 +2054,7 @@ class MainWindow(QMainWindow):
             self.auto_line_status.setText("检测失败，等待下次")
 
     def _on_proxy_switch_toggled(self, checked):
+        self._save_setting("proxy_enabled", checked)
         if checked:
             self._on_start()
         else:
@@ -1864,49 +2062,64 @@ class MainWindow(QMainWindow):
 
     def _on_start(self):
         if not self.quick_dir:
-            self.switch_proxy.setChecked(False)
             QMessageBox.critical(self, "错误",
                 "未找到代理内核！\n\n"
                 f"基础目录: {get_base_dir()}\n\n"
                 "请确保 app/Quick/ 目录中包含 quick.exe。")
             return
+        if self.worker and self.worker.isRunning():
+            return
+        self._cleanup_worker()
         self.switch_proxy.setEnabled(False)
-        self.detail_label.setText("正在启动代理服务...")
-        self.worker = ServiceWorker("start", quick_dir=self.quick_dir)
-        self.worker.progress.connect(lambda t: self.detail_label.setText(t))
+        self.svc_detail_label.setText("正在启动代理服务...")
+        self.worker = ServiceWorker("start", quick_dir=self.quick_dir, current_line=self.current_line)
+        self.worker.line_selected.connect(self._on_line_selected)
+        self.worker.progress.connect(lambda t: self.svc_detail_label.setText(t))
         self.worker.finished.connect(self._on_start_finished)
         self.worker.start()
 
     def _on_start_finished(self, ok, msg):
         self.switch_proxy.setEnabled(True)
         if ok:
-            self.detail_label.setText(msg)
-            connected, latency = verify_proxy_connection()
-            if connected and latency:
-                self.latency_label.setText(f"{latency:.2f}s")
+            self.svc_detail_label.setText(msg)
+            try:
+                connected, latency = verify_proxy_connection(timeout=5)
+                if connected and latency:
+                    self.svc_latency_label.setText(f"{latency:.2f}s")
+            except Exception as e:
+                log.warning(f"验证代理连接异常: {e}")
             browser_proxy_mode = self.settings.get("browser_proxy_mode", "all")
             if self.settings.get("global_proxy", False) and browser_proxy_mode == "all":
                 set_system_proxy(True)
                 self._update_sys_proxy_label()
-            if self.switch_auto_browser.isChecked():
-                self._on_open_browser()
             self.global_restart_hint.setVisible(False)
             self.custom_restart_hint.setVisible(False)
             if self.settings.get("auto_line_switch", False):
                 self._start_auto_line_timer()
+            if self.settings.get("realtime_detect", False):
+                self._start_realtime_monitor()
+            self._update_active_line()
         else:
-            self.switch_proxy.setChecked(False)
-            QMessageBox.critical(self, "错误", msg)
+            self.svc_detail_label.setText(msg)
+            self._update_active_line()
 
     def _on_stop(self):
         if self.settings.get("global_proxy", False):
             set_system_proxy(False)
             self._update_sys_proxy_label()
         stop_quick()
-        self.current_line = ""
-        self._update_active_line()
-        self.detail_label.setText("服务已停止")
         self._stop_auto_line_timer()
+        self.svc_detail_label.setText("服务已停止")
+
+    def _on_line_selected(self, name):
+        if name and name != self.current_line:
+            self.current_line = name
+            self._save_setting("current_line", name)
+            self._update_active_line()
+
+    def _save_setting(self, key, value):
+        self.settings[key] = value
+        save_settings(self.settings)
 
     def _on_open_browser(self):
         if not is_proxy_running():
@@ -1926,20 +2139,20 @@ class MainWindow(QMainWindow):
                 rb._block_signal = True
                 rb.setChecked(False)
                 rb._block_signal = False
-        self.settings["browser_proxy_mode"] = mode
-        save_settings(self.settings)
+        self._save_setting("browser_proxy_mode", mode)
         self._update_browser_proxy_hint()
         if is_proxy_running():
             set_system_proxy(self.settings.get("global_proxy", False))
 
     def _update_browser_proxy_hint(self):
         mode = self.settings.get("browser_proxy_mode", "all")
+        browser_path = self._get_browser_path()
+        browser_name = os.path.basename(browser_path) if browser_path else "未选择"
         if mode == "all":
             self.specified_browser_hint.setText("所有浏览器都将通过代理访问网络")
             self.browser_proxy_desc.setText("浏览器通过本地代理访问")
         else:
-            browser_name = self._get_current_browser_name()
-            self.specified_browser_hint.setText(f"仅代理: {browser_name}")
+            self.specified_browser_hint.setText(f"当前指定浏览器: {browser_name}" + (f" ({browser_path})" if browser_path else ""))
             self.browser_proxy_desc.setText("仅指定浏览器通过代理访问")
 
     def _get_current_browser_name(self):
@@ -1956,8 +2169,7 @@ class MainWindow(QMainWindow):
             return "系统浏览器"
 
     def _on_global_proxy_toggled(self, checked):
-        self.settings["global_proxy"] = checked
-        save_settings(self.settings)
+        self._save_setting("global_proxy", checked)
         if is_proxy_running() and self.settings.get("browser_proxy_mode", "all") == "all":
             set_system_proxy(checked)
             self._update_sys_proxy_label()
@@ -1968,8 +2180,7 @@ class MainWindow(QMainWindow):
         log.info(f"全局系统代理: {'开启' if checked else '关闭'}")
 
     def _on_custom_apps_toggled(self, checked):
-        self.settings["custom_apps_enabled"] = checked
-        save_settings(self.settings)
+        self._save_setting("custom_apps_enabled", checked)
         if is_proxy_running():
             self.custom_restart_hint.setText("⚠ 修改需重启服务后生效，当前仍使用原设置")
             self.custom_restart_hint.setVisible(True)
@@ -1979,18 +2190,53 @@ class MainWindow(QMainWindow):
         log.info(f"指定程序代理: {'开启' if checked else '关闭'}")
 
     def _on_auto_open_browser_toggled(self, checked):
-        self.settings["auto_open_browser"] = checked
-        save_settings(self.settings)
-        log.info(f"自动打开浏览器: {'开启' if checked else '关闭'}")
+        self._save_setting("auto_open_browser", checked)
+        log.info(f"检测线路后打开浏览器: {'开启' if checked else '关闭'}")
+
+    def _on_realtime_detect_toggled(self, checked):
+        self._save_setting("realtime_detect", checked)
+        if checked and is_proxy_running():
+            self._start_realtime_monitor()
+        else:
+            self._stop_realtime_monitor()
+        log.info(f"实时检测: {'开启' if checked else '关闭'}")
+
+    def _start_realtime_monitor(self):
+        if hasattr(self, '_realtime_timer') and self._realtime_timer:
+            self._realtime_timer.stop()
+        self._realtime_timer = QTimer(self)
+        self._realtime_timer.timeout.connect(self._realtime_check)
+        self._realtime_timer.start(10000)
+
+    def _stop_realtime_monitor(self):
+        if hasattr(self, '_realtime_timer') and self._realtime_timer:
+            self._realtime_timer.stop()
+            self._realtime_timer = None
+
+    def _realtime_check(self):
+        if not is_proxy_running() and self.settings.get("proxy_enabled", False):
+            if self.worker and self.worker.isRunning():
+                return
+            log.warning("实时检测: 代理断开，尝试重连")
+            self._cleanup_worker()
+            if self.current_line and self.current_line in self.line_results and self.line_results[self.current_line]:
+                self.worker = ServiceWorker("use_line", name=self.current_line,
+                                            data=self.line_results[self.current_line],
+                                            quick_dir=self.quick_dir,
+                                            proxy_enabled=True)
+                self.worker.line_selected.connect(self._on_line_selected)
+                self.worker.progress.connect(lambda t: self.svc_detail_label.setText(t))
+                self.worker.finished.connect(self._on_use_line_finished)
+                self.worker.start()
+            elif self.quick_dir:
+                self._on_start()
 
     def _on_auto_start_toggled(self, checked):
-        self.settings["auto_start"] = checked
-        save_settings(self.settings)
+        self._save_setting("auto_start", checked)
         log.info(f"启动时自动开启服务: {'开启' if checked else '关闭'}")
 
     def _on_auto_line_switch_toggled(self, checked):
-        self.settings["auto_line_switch"] = checked
-        save_settings(self.settings)
+        self._save_setting("auto_line_switch", checked)
         if checked and is_proxy_running():
             self._start_auto_line_timer()
         else:
@@ -1998,8 +2244,7 @@ class MainWindow(QMainWindow):
         log.info(f"自动线路切换: {'开启' if checked else '关闭'}")
 
     def _on_interval_changed(self, value):
-        self.settings["auto_line_interval"] = value
-        save_settings(self.settings)
+        self._save_setting("auto_line_interval", value)
         if self.settings.get("auto_line_switch", False) and is_proxy_running():
             self._start_auto_line_timer()
         log.info(f"自动检测间隔: {value}分钟")
@@ -2008,13 +2253,18 @@ class MainWindow(QMainWindow):
         if not self.quick_dir:
             QMessageBox.warning(self, "提示", "请先设置代理内核目录")
             return
+        if self.worker and self.worker.isRunning():
+            return
+        self._cleanup_worker()
         self.btn_test.setEnabled(False)
         self.btn_test.setText("检测中...")
         for name, info in self.line_rows.items():
             info["status"].setText("检测中...")
             info["status"].setStyleSheet(f"color: {COLOR_ORANGE}; font-size: 9pt;")
             info["use_btn"].setEnabled(False)
-        self.worker = ServiceWorker("test_lines", quick_dir=self.quick_dir)
+        self.worker = ServiceWorker("test_lines", quick_dir=self.quick_dir,
+                                    proxy_enabled=self.settings.get("proxy_enabled", False),
+                                    current_line=self.current_line)
         self.worker.progress.connect(lambda t: self.line_progress.setText(t))
         self.worker.line_tested.connect(self._on_line_tested)
         self.worker.finished.connect(self._on_test_finished)
@@ -2035,7 +2285,7 @@ class MainWindow(QMainWindow):
 
     def _on_test_finished(self, ok, msg):
         self.btn_test.setEnabled(True)
-        self.btn_test.setText("🔍 检测所有线路")
+        self.btn_test.setText("🔍 检测线路")
         try:
             if not ok:
                 self.line_progress.setText(msg if msg else "检测失败")
@@ -2074,6 +2324,7 @@ class MainWindow(QMainWindow):
                 self.line_progress.setText(f"检测完成 - {len(valid)}条可用线路")
                 self.line_progress.setStyleSheet(f"color: {COLOR_GREEN};")
                 if auto_switch and fastest[0] in self.line_rows:
+                    self._pending_browser_open = self.switch_auto_browser.isChecked()
                     self._on_use_line(fastest[0])
             else:
                 self.line_progress.setText("检测完成 - 无可用线路")
@@ -2085,17 +2336,59 @@ class MainWindow(QMainWindow):
             self.line_progress.setStyleSheet("color: #FF6B80;")
 
     def _on_use_line(self, name):
-        if name not in self.line_results or self.line_results[name] is None:
-            QMessageBox.information(self, "提示", "请先检测线路")
-            return
         if not self.quick_dir:
             return
-        self.current_line = name
+        if self.worker and self.worker.isRunning():
+            return
+        self._cleanup_worker()
+        is_reconnect = (name == self.current_line)
+        if not is_reconnect:
+            if name not in self.line_results or self.line_results[name] is None:
+                QMessageBox.information(self, "提示", "请先检测线路")
+                return
+            self.current_line = name
+            self._save_setting("current_line", name)
         self._update_active_line()
-        self.worker = ServiceWorker("use_line", name=name, data=self.line_results[name], quick_dir=self.quick_dir)
-        self.worker.progress.connect(lambda t: self.detail_label.setText(t))
-        self.worker.finished.connect(lambda ok, msg: self.detail_label.setText(msg) if ok else QMessageBox.warning(self, "提示", msg))
+        data = self.line_results.get(name)
+        if data:
+            self.worker = ServiceWorker("use_line", name=name, data=data, quick_dir=self.quick_dir,
+                                        proxy_enabled=self.settings.get("proxy_enabled", False))
+        else:
+            self.worker = ServiceWorker("start", quick_dir=self.quick_dir, current_line=name)
+        self.worker.line_selected.connect(self._on_line_selected)
+        self.worker.progress.connect(lambda t: self.svc_detail_label.setText(t))
+        self.worker.finished.connect(self._on_use_line_finished)
         self.worker.start()
+
+    def _on_use_line_finished(self, ok, msg):
+        self._update_active_line()
+        if ok:
+            self.svc_detail_label.setText(msg)
+            try:
+                connected, latency = verify_proxy_connection(timeout=5)
+                if connected and latency:
+                    self.svc_latency_label.setText(f"{latency:.2f}s")
+            except Exception as e:
+                log.warning(f"验证代理连接异常: {e}")
+            if getattr(self, '_pending_browser_open', False):
+                self._pending_browser_open = False
+                QTimer.singleShot(500, self._on_open_browser)
+        else:
+            QMessageBox.warning(self, "提示", msg)
+
+    def _cleanup_worker(self):
+        if hasattr(self, 'worker') and self.worker:
+            try:
+                self.worker.finished.disconnect()
+                self.worker.progress.disconnect()
+                self.worker.line_tested.disconnect()
+                self.worker.line_selected.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            if self.worker.isRunning():
+                self.worker.quit()
+                self.worker.wait(3000)
+            self.worker = None
 
     def _on_add_app(self):
         from PyQt6.QtWidgets import QFileDialog
@@ -2118,9 +2411,8 @@ class MainWindow(QMainWindow):
         from PyQt6.QtWidgets import QFileDialog
         path, _ = QFileDialog.getOpenFileName(self, "选择浏览器", "", "可执行文件 (*.exe);;所有文件 (*.*)")
         if path:
-            self.settings["browser_path"] = path
+            self._save_setting("browser_path", path)
             self.custom_browser_input.setText(path)
-            save_settings(self.settings)
             self._update_selected_browser_label()
             self._update_browser_proxy_hint()
             log.info(f"已设置自定义浏览器: {path}")
@@ -2136,8 +2428,7 @@ class MainWindow(QMainWindow):
             self.system_rb._block_signal = True
             self.system_rb.setChecked(False)
             self.system_rb._block_signal = False
-        self.settings["browser_type"] = browser_type
-        save_settings(self.settings)
+        self._save_setting("browser_type", browser_type)
         self._update_selected_browser_label()
         self._update_browser_proxy_hint()
         self.custom_browser_input.setVisible(browser_type == "custom")
@@ -2146,9 +2437,9 @@ class MainWindow(QMainWindow):
     def _on_system_browser_changed(self, idx):
         if idx >= 0:
             path = self.browser_combo.itemData(idx)
-            self.settings["system_browser_path"] = path
-            save_settings(self.settings)
+            self._save_setting("system_browser_path", path)
             self._update_selected_browser_label()
+            self._update_browser_proxy_hint()
 
     def _update_selected_browser_label(self):
         path = self._get_browser_path()
@@ -2176,13 +2467,26 @@ class MainWindow(QMainWindow):
     def _startup_download_config(self):
         if not self.quick_dir:
             return
+        current_line = self.current_line
+        quick_dir = self.quick_dir
+        proxy_enabled = self.settings.get("proxy_enabled", False)
         def do_download():
             try:
+                if proxy_enabled or is_proxy_running():
+                    log.info("代理服务已启用或运行中，跳过启动时配置覆盖")
+                    return
                 downloaded = download_all_configs()
                 if downloaded:
-                    name, data = downloaded[0]
-                    save_config(self.quick_dir, data)
-                    log.info(f"启动时已下载最新配置: {name}")
+                    selected = None
+                    if current_line:
+                        for n, d in downloaded:
+                            if n == current_line:
+                                selected = (n, d)
+                                break
+                    if not selected:
+                        selected = downloaded[0]
+                    save_config(quick_dir, selected[1])
+                    log.info(f"启动时已下载最新配置: {selected[0]}")
             except Exception as e:
                 log.warning(f"启动时下载配置失败: {e}")
         import threading
@@ -2244,7 +2548,7 @@ class MainWindow(QMainWindow):
     def _on_update_config(self):
         if not self.quick_dir:
             return
-        self.worker = ServiceWorker("update_config", quick_dir=self.quick_dir)
+        self.worker = ServiceWorker("update_config", quick_dir=self.quick_dir, current_line=self.current_line)
         self.worker.progress.connect(lambda t: self.update_status.setText(t))
         self.worker.finished.connect(lambda ok, msg: (
             self.update_status.setText(msg),
@@ -2258,6 +2562,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._stop_auto_line_timer()
+        self._stop_realtime_monitor()
         self.monitor.stop()
         self.monitor.wait()
         event.accept()
@@ -2268,7 +2573,21 @@ class MainWindow(QMainWindow):
             self._splash.finish(self)
             self._splash = None
 
+def _global_exception_handler(exc_type, exc_value, exc_tb):
+    import traceback
+    tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    log.critical(f"未捕获异常:\n{tb_text}")
+    try:
+        from PyQt6.QtWidgets import QMessageBox
+        app = QApplication.instance()
+        if app:
+            QMessageBox.critical(None, "程序异常", f"发生未预期的错误:\n\n{exc_value}\n\n详细信息已记录到日志。")
+    except Exception:
+        pass
+
+
 def main():
+    sys.excepthook = _global_exception_handler
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
