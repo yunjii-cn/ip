@@ -38,16 +38,23 @@ MIHOMO_REPO = "MetaCubeX/mihomo"
 
 
 def _load_repo_token(filename):
-    token_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
-    if os.path.isfile(token_path):
-        try:
-            with open(token_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        return line
-        except Exception:
-            pass
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(sys.executable)
+        meipass_dir = sys._MEIPASS
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        meipass_dir = base_dir
+    for search_dir in [base_dir, meipass_dir]:
+        token_path = os.path.join(search_dir, filename)
+        if os.path.isfile(token_path):
+            try:
+                with open(token_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            return line
+            except Exception:
+                pass
     return ""
 
 
@@ -4241,12 +4248,25 @@ class MainWindow(QMainWindow):
 
             def try_github():
                 try:
-                    github_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/ver/version.json"
-                    req = urllib.request.Request(github_url, headers={"User-Agent": "Mozilla/5.0"})
+                    github_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/ver/version.json?ref=main"
+                    gh_headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/vnd.github.v3+json"}
+                    if GITHUB_TOKEN:
+                        gh_headers["Authorization"] = f"token {GITHUB_TOKEN}"
+                    req = urllib.request.Request(github_url, headers=gh_headers)
                     with urllib.request.urlopen(req, timeout=6, context=ctx) as resp:
-                        result[1] = (json.loads(resp.read().decode()), "github")
+                        raw = resp.read().decode()
+                    api_data = json.loads(raw)
+                    import base64
+                    content_b64 = api_data.get("content", "")
+                    result[1] = (json.loads(base64.b64decode(content_b64).decode("utf-8")), "github")
                 except Exception:
-                    result[1] = (None, None)
+                    try:
+                        github_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/ver/version.json"
+                        req = urllib.request.Request(github_url, headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(req, timeout=6, context=ctx) as resp:
+                            result[1] = (json.loads(resp.read().decode()), "github")
+                    except Exception:
+                        result[1] = (None, None)
 
             t1 = threading.Thread(target=try_gitee, daemon=True)
             t2 = threading.Thread(target=try_github, daemon=True)
