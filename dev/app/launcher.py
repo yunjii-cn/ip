@@ -22,11 +22,9 @@ def _kill_old_instances():
 
     my_exe = os.path.normcase(os.path.abspath(sys.executable))
     my_name = os.path.basename(my_exe)
+    my_pid = ctypes.windll.kernel32.GetCurrentProcessId()
 
-    dash_v = my_name.find('-v')
-    if dash_v <= 0:
-        return
-    base_name = my_name[:dash_v].lower()
+    base_prefix = "云集智能网联代理专家"
 
     kernel32 = ctypes.windll.kernel32
 
@@ -54,14 +52,13 @@ def _kill_old_instances():
     entry = PROCESSENTRY32W()
     entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
 
-    my_pid = kernel32.GetCurrentProcessId()
     pids_to_kill = []
 
     if kernel32.Process32FirstW(snap, ctypes.byref(entry)):
         while True:
             pid = entry.th32ProcessID
             exe_name = entry.szExeFile.lower()
-            if pid != my_pid and exe_name.startswith(base_name) and exe_name.endswith('.exe'):
+            if pid != my_pid and exe_name.startswith(base_prefix.lower()) and exe_name.endswith('.exe'):
                 pids_to_kill.append(pid)
             entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
             if not kernel32.Process32NextW(snap, ctypes.byref(entry)):
