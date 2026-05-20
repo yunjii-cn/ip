@@ -79,5 +79,18 @@ def _kill_old_instances():
 
 _kill_old_instances()
 
+_cleanup_path = ""
+for arg in sys.argv[1:]:
+    if arg.startswith("--cleanup="):
+        _cleanup_path = arg[len("--cleanup="):]
+
+if _cleanup_path and os.path.isfile(_cleanup_path):
+    for _ in range(10):
+        try:
+            os.remove(_cleanup_path)
+            break
+        except PermissionError:
+            time.sleep(0.5)
+
 import main
 main.main()

@@ -442,6 +442,53 @@ if not getattr(sys, 'frozen', False):
     log.addHandler(_console_handler)
 
 
+def _self_deploy(exe_dir):
+    base_name = "云集智能网联代理专家"
+    deploy_dir = os.path.join(exe_dir, base_name)
+    already_deployed = os.path.isdir(deploy_dir) and os.path.isfile(os.path.join(deploy_dir, ".yunji.lock"))
+    src_exe = os.path.abspath(sys.executable)
+
+    if already_deployed:
+        entry_exe = os.path.join(deploy_dir, f"{base_name}.exe")
+        if os.path.isfile(entry_exe) and os.path.normpath(src_exe) != os.path.normpath(entry_exe):
+            subprocess.Popen([entry_exe, f"--cleanup={src_exe}"])
+            os._exit(0)
+        return deploy_dir
+
+    os.makedirs(deploy_dir, exist_ok=True)
+
+    ver_dir = os.path.join(deploy_dir, "ver")
+    os.makedirs(ver_dir, exist_ok=True)
+    app_dir = os.path.join(deploy_dir, "app")
+    os.makedirs(app_dir, exist_ok=True)
+
+    lock_path = os.path.join(deploy_dir, ".yunji.lock")
+    with open(lock_path, "w", encoding="utf-8") as f:
+        f.write("yunji")
+
+    exe_basename = os.path.basename(src_exe)
+    if not exe_basename.startswith(base_name + "-v"):
+        m = re.search(r'v(\d+\.\d+\.\d+\.\d+)', exe_basename)
+        ver_str = m.group(1) if m else datetime.now().strftime("%Y.%m.%d.%H%M")
+        new_name = f"{base_name}-v{ver_str}.exe"
+    else:
+        new_name = exe_basename
+
+    target_exe = os.path.join(ver_dir, new_name)
+    if os.path.normpath(src_exe) != os.path.normpath(target_exe):
+        shutil.copy2(src_exe, target_exe)
+
+    entry_exe = os.path.join(deploy_dir, f"{base_name}.exe")
+    if not os.path.isfile(entry_exe):
+        try:
+            os.link(target_exe, entry_exe)
+        except OSError:
+            shutil.copy2(target_exe, entry_exe)
+
+    subprocess.Popen([entry_exe, f"--cleanup={src_exe}"])
+    os._exit(0)
+
+
 def _find_dev_dir():
     if getattr(sys, 'frozen', False):
         d = os.path.dirname(os.path.abspath(sys.executable))
@@ -452,7 +499,7 @@ def _find_dev_dir():
             if parent == d:
                 break
             d = parent
-        return os.path.dirname(os.path.abspath(sys.executable))
+        return _self_deploy(os.path.dirname(os.path.abspath(sys.executable)))
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 

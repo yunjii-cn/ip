@@ -48,78 +48,102 @@ description: "云集智能网联代理专家项目开发规范。Invoke when wor
 │ # ========== 构建相关（Git不管理） ==========
 ├── build/                      # 构建目录（按版本组织）
 │   ├── build.py                # 构建脚本
+│   ├── release.py              # 全自动发布脚本
 │   ├── venv/                   # 构建用虚拟环境
 │   └── vYYYY.MM.DD.HHMM/      # 版本构建记录
 │       ├── build.py            # 该版本构建脚本备份
+│       ├── 云集智能网联代理专家-v*.zip  # 整合包（含EXE+内核）
 │       ├── build/              # PyInstaller临时文件
 │       └── dist/               # PyInstaller输出
 ```
 
-## Git管理范围
+## 完整开发→打包→分发流程
 
-| 目录 | Git管理 | 公开 | 说明 |
-|------|---------|------|------|
-| **README.md** | ✅ | ✅ | 项目说明 |
-| **LICENSE** | ✅ | ✅ | GPL-3.0协议 |
-| **docs/** | ✅ | ✅ | 开发文档 |
-| **ver/version.json** | ✅ | ✅ | 版本元数据 |
-| **dev/app/** | ❌ | ❌ | 核心源码，仅本地 |
-| **dev/ver/*.exe** | ❌ | ❌ | EXE文件，通过Release分发 |
-| **build/** | ❌ | ❌ | 构建目录 |
-| **dev/app/Quick/** | ❌ | ❌ | 代理内核 |
+### 三步流程
 
-## 核心文件说明
+```
+┌─────────────────────────────────────────────────────────┐
+│  1. 开发阶段                                             │
+│     编辑 dev/app/main.py                                 │
+│     双击 dev/运行.bat → 测试界面和功能                     │
+│     （Python源码直接运行，改了代码立刻生效）                 │
+└──────────────────────┬──────────────────────────────────┘
+                       │ 功能OK
+                       ▼
+┌─────────────────────────────────────────────────────────┐
+│  2. 打包阶段                                             │
+│     python build/build.py                                │
+│     → EXE输出到 dev/ver/云集智能网联代理专家-v版本号.exe    │
+│     → 创建硬链接 dev/云集智能网联代理专家.exe → ver中的EXE  │
+│     → 生成整合包ZIP（含EXE+内核+配置）                     │
+└──────────────────────┬──────────────────────────────────┘
+                       │ 双击 dev/云集智能网联代理专家.exe 测试
+                       │ 确认稳定
+                       ▼
+┌─────────────────────────────────────────────────────────┐
+│  3. 发布阶段（全自动）                                    │
+│     python build/release.py                              │
+│     → 构建 → 更新version.json → git push                 │
+│     → 创建GitHub Release + 上传EXE+ZIP                   │
+│     → 创建Gitee Release + 上传EXE（省空间）               │
+│     → 用户通过软件更新页面即可检测下载                      │
+└─────────────────────────────────────────────────────────┘
+```
 
-### 应用目录 (`dev/app/`)
+### 全自动发布脚本 (release.py)
 
-| 文件 | 用途 | 说明 |
-|------|------|------|
-| `main.py` | 主程序 | PyQt6 GUI，代理管理核心 |
-| `launcher.py` | 入口文件 | 杀旧进程 + 调用 main.py |
-| `icon.ico` | 应用图标 | Windows图标 |
-| `icon.png` | 高清图标 | PNG格式图标 |
-| `requirements.txt` | Python依赖 | PyQt6等 |
-| `version_history.json` | 版本历史 | 构建记录 |
-| `Quick/` | 代理内核 | quick.exe + 配置 + 数据库 |
+一条命令完成从构建到发布的全流程：
 
-### 构建脚本 (`build/build.py`)
-
-**构建命令**：
 ```bash
-python build/build.py
+python build/release.py
 ```
 
-**构建流程**：
-1. 动态生成版本号：`YYYY.MM.DD.HHMM`
-2. 将版本号注入 `dev/app/main.py` 和 `version_info.txt`
-3. PyInstaller 从 `launcher.py` 构建 EXE
-4. EXE 移动到 `dev/ver/` 目录
-5. 在 `dev/` 创建硬链接入口 `云集智能网联代理专家.exe`
-6. 构建完成后恢复源代码中的版本号
-7. 构建脚本备份到 `build/v版本号/build.py`
+**7步自动流程**：
 
-### 开发启动脚本 (`dev/运行.bat`)
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1/7 | 收集变更描述 | 自动从version_history.json读取，支持编辑 |
+| 2/7 | 构建EXE和整合包 | 调用build.py |
+| 3/7 | 获取版本信息 | 版本号、文件大小、更新内容 |
+| 4/7 | 更新version.json | 更新latest和versions列表 |
+| 5/7 | Git提交并推送 | 推送到GitHub + Gitee |
+| 6/7 | 创建GitHub Release | 上传EXE + ZIP（无空间限制） |
+| 7/7 | 创建Gitee Release | 只上传EXE（1GB空间限制） |
 
-双击即可运行 Python 源码进行开发调试，无需命令行。
+### 分发策略
 
-## 开发工作流
+| 平台 | 上传内容 | 每版本占用 | 原因 |
+|------|---------|-----------|------|
+| **GitHub** | EXE + ZIP | ~108MB | 公开仓库无空间限制 |
+| **Gitee** | 仅EXE | ~35MB | 1GB空间限制，省空间 |
 
-### 标准开发流程
+| 用户场景 | 下载方式 | 体积 | 说明 |
+|---------|---------|------|------|
+| 新用户在线安装 | Release EXE | 35MB | 双击→自部署→自动下载内核 |
+| 新用户离线安装 | Release ZIP | 73MB | 含EXE+内核，解压即用 |
+| 老用户更新 | 软件内更新 | 35MB | 只下载新EXE到ver/，硬链接切换 |
+
+## EXE自部署机制
+
+EXE首次运行时自动检测环境，无需额外安装器：
 
 ```
-1. 日常开发 → 在 dev/app/ 修改代码
-   - 双击 dev/运行.bat 测试（或 python dev/app/launcher.py）
-
-2. 构建EXE → 运行构建脚本
-   python build/build.py
-
-3. 测试EXE → 双击 dev/云集智能网联代理专家.exe 验证
-
-4. Git提交 → 推送到GitHub（Gitee自动镜像）
-   git add README.md docs/ ver/version.json
-   git commit -m "v版本号: 修改描述"
-   git push origin main
+EXE启动
+  │
+  ├─ 发现 .yunji.lock 或 app/ 目录？
+  │   ├─ 是 → 正常运行（已有环境）
+  │   └─ 否 → 首次运行，执行自部署：
+  │            1. 在EXE同级目录创建 云集智能网联代理专家/ 文件夹
+  │            2. 创建 ver/ 和 app/ 子目录
+  │            3. 创建 .yunji.lock 标记文件
+  │            4. 将自己复制到 ver/ 并按版本号命名
+  │            5. 创建硬链接入口 云集智能网联代理专家.exe
+  │            6. 继续正常启动
+  │
+  └─ 之后双击入口EXE → 硬链接指向ver/中的EXE → 正常运行
 ```
+
+**关键代码**：`_self_deploy()` 函数在 `_find_dev_dir()` 中被调用，当EXE在非标准目录运行时自动触发。
 
 ## 版本管理与硬链接机制
 
@@ -148,6 +172,7 @@ dev/
 |---------|---------------|---------|
 | `dev/云集智能网联代理专家.exe` | `dev/` | 直接找到 `.yunji.lock` → `dev/` |
 | `dev/ver/*-v2026.xx.xx.xxxx.exe` | `dev/ver/` | 向上一层 → `dev/` |
+| 任意目录首次运行 | 任意目录 | 触发 `_self_deploy()` → 自动部署 |
 | `python main.py` | - | 从 `__file__` 推算 → `dev/` |
 
 ### 版本切换流程
@@ -162,37 +187,26 @@ dev/
 
 ### 应用内下载
 
-- 远程版本通过 Gitee Releases 分发
-- 下载地址格式：`https://gitee.com/yunjii/ip/releases/download/v版本号/文件名`
+- 远程版本通过 GitHub/Gitee Releases 分发
+- 并行双源请求，谁先返回用谁
+- 下载地址格式：
+  - Gitee: `https://gitee.com/yunjii/ip/releases/download/v版本号/文件名`（国内直连）
+  - GitHub: `https://github.com/yunjii-cn/ip/releases/download/v版本号/文件名`（需代理）
 - 下载到 `dev/ver/` 目录，支持进度显示
 - 下载完成后询问是否立即切换
 
-## 打包和发布
+## Git管理范围
 
-### 发布流程
-
-```
-1. 构建 → python build/build.py
-2. 测试 → 运行EXE验证功能
-3. 创建GitHub Release → 上传EXE作为Release资产
-4. 更新ver/version.json → 更新latest和versions
-5. Git提交并推送到GitHub（Gitee自动镜像）
-```
-
-### 发布整合包结构
-
-```
-发布目录/
-├── 云集智能网联代理专家.exe          # 硬链接入口
-├── ver/                             # 版本仓库
-│   └── 云集智能网联代理专家-vYYYY.MM.DD.HHMM.exe
-└── app/                             # 应用资源目录
-    └── Quick/                       # 代理内核
-        ├── quick.exe
-        ├── config.yaml
-        ├── Country.mmdb
-        └── GeoSite.dat
-```
+| 目录 | Git管理 | 公开 | 说明 |
+|------|---------|------|------|
+| **README.md** | ✅ | ✅ | 项目说明 |
+| **LICENSE** | ✅ | ✅ | GPL-3.0协议 |
+| **docs/** | ✅ | ✅ | 开发文档 |
+| **ver/version.json** | ✅ | ✅ | 版本元数据 |
+| **dev/app/** | ❌ | ❌ | 核心源码，仅本地 |
+| **dev/ver/*.exe** | ❌ | ❌ | EXE文件，通过Release分发 |
+| **build/** | ❌ | ❌ | 构建目录 |
+| **dev/app/Quick/** | ❌ | ❌ | 代理内核 |
 
 ## 开源策略与版权保护
 
@@ -215,6 +229,11 @@ dev/
 - 只需推送到 GitHub，Gitee 通过内置镜像功能自动同步
 - Gitee 镜像设置：Gitee 仓库 → 管理 → 镜像管理 → 从 GitHub 导入
 
+**其他项目复用**：如果Gitee也是公开仓库，则：
+- GitHub和Gitee都无需Token即可读取version.json
+- 软件更新仍可双源并行，但无需Token配置
+- Release上传仍需Token（两个平台都需要）
+
 ### 分层公开策略
 
 | 内容 | 公开方式 | 说明 |
@@ -222,7 +241,7 @@ dev/
 | README.md / LICENSE | GitHub 仓库公开 | 项目介绍和协议 |
 | ver/version.json | GitHub 仓库公开 | 版本元数据（供软件更新检查） |
 | docs/ | GitHub 仓库公开 | 开发文档 |
-| EXE文件 | GitHub Releases | 用户下载，非仓库存储 |
+| EXE文件 | GitHub/Gitee Releases | 用户下载，非仓库存储 |
 | dev/app/ 源码 | **不公开** | 核心代码仅本地保留 |
 | build/ 构建脚本 | **不公开** | 构建工具仅本地保留 |
 
@@ -232,12 +251,10 @@ dev/
 
 | 优先级 | 来源 | URL方式 | 需要Token | 说明 |
 |--------|------|---------|-----------|------|
-| 并行 | Gitee | `gitee.com/api/v5/repos/yunjii/ip/contents/ver/version.json` | ✅ `.gitee_token` | 国内直连 |
+| 并行 | Gitee | `gitee.com/api/v5/repos/yunjii/ip/contents/ver/version.json` | 视仓库可见性 | 国内直连 |
 | 并行 | GitHub | `raw.githubusercontent.com/yunjii-cn/ip/main/ver/version.json` | ❌ | 需代理 |
 
-下载EXE时根据版本检查的来源自动选择对应的 Releases：
-- Gitee → `gitee.com/yunjii/ip/releases/download/v版本号/文件名`（国内直连）
-- GitHub → `github.com/yunjii-cn/ip/releases/download/v版本号/文件名`（需代理）
+下载EXE时根据版本检查的来源自动选择对应的 Releases。
 
 ### 令牌管理
 
@@ -245,10 +262,44 @@ dev/
 
 | 文件 | 用途 | 位置 |
 |------|------|------|
-| `.gitee_token` | Gitee私有仓库访问令牌 | `dev/app/.gitee_token` |
-| `.github_token` | GitHub API令牌（可选） | `dev/app/.github_token` |
+| `.gitee_token` | Gitee仓库访问令牌 | `dev/app/.gitee_token` |
+| `.github_token` | GitHub API令牌 | `dev/app/.github_token` |
 
 **安全提醒**：源码中不得硬编码任何令牌或密钥。
+
+## 核心文件说明
+
+### 应用目录 (`dev/app/`)
+
+| 文件 | 用途 | 说明 |
+|------|------|------|
+| `main.py` | 主程序 | PyQt6 GUI，代理管理核心，含自部署逻辑 |
+| `launcher.py` | 入口文件 | 杀旧进程 + 调用 main.py |
+| `icon.ico` | 应用图标 | Windows图标 |
+| `icon.png` | 高清图标 | PNG格式图标 |
+| `requirements.txt` | Python依赖 | PyQt6等 |
+| `version_history.json` | 版本历史 | 构建记录 |
+| `Quick/` | 代理内核 | quick.exe + 配置 + 数据库 |
+
+### 构建脚本 (`build/build.py`)
+
+**构建命令**：
+```bash
+python build/build.py
+```
+
+**构建流程**：
+1. 动态生成版本号：`YYYY.MM.DD.HHMM`
+2. 将版本号注入 `dev/app/main.py` 和 `version_info.txt`
+3. PyInstaller 从 `launcher.py` 构建 EXE
+4. EXE 移动到 `dev/ver/` 目录
+5. 在 `dev/` 创建硬链接入口 `云集智能网联代理专家.exe`
+6. 生成整合包ZIP（含EXE+内核+配置）
+7. 构建完成后恢复源代码中的版本号
+
+### 开发启动脚本 (`dev/运行.bat`)
+
+双击即可运行 Python 源码进行开发调试，无需命令行。
 
 ## 技术栈
 
@@ -280,6 +331,12 @@ When working on this project, follow these rules:
 - 构建完成后源码中的版本号会被恢复，不要手动修改版本号
 - EXE 输出到 `dev/ver/` 目录，硬链接入口在 `dev/` 目录
 
+### 发布规范
+- 发布命令：`python build/release.py`（全自动，一条命令完成构建+发布）
+- GitHub Release 上传 EXE + ZIP（无空间限制）
+- Gitee Release 只上传 EXE（1GB空间限制，自动清理旧版本）
+- 发布前确保 `dev/app/.gitee_token` 和 `dev/app/.github_token` 已配置
+
 ### Git提交规范
 - 只提交公开文件：`README.md`、`docs/`、`ver/version.json`
 - 不提交私有文件：`dev/app/`、`build/`、`dev/ver/*.exe`
@@ -290,6 +347,11 @@ When working on this project, follow these rules:
 - 版本切换使用 Windows 硬链接（mklink /H），不使用文件复制
 - 路径定位依赖 `.yunji.lock` 标记文件，不要删除此文件
 - 版本切换通过生成 `_switch_version.bat` 批处理完成
+
+### 自部署规范
+- EXE首次运行时自动检测环境，无需安装器
+- `_self_deploy()` 函数负责创建目录结构和硬链接入口
+- 自部署后EXE在 `ver/` 目录中，入口硬链接在部署根目录
 
 ### 安全规范
 - 令牌文件（`.gitee_token`、`.github_token`）不入 Git
