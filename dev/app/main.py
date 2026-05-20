@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
     QSplashScreen, QScrollArea, QLineEdit, QStyle
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QPoint, QPropertyAnimation, QEasingCurve, pyqtProperty, QRectF, QMetaObject, Q_ARG
-from PyQt6.QtGui import QPixmap, QIcon, QFont, QColor, QPainter, QPen, QFontMetrics, QPalette, QLinearGradient
+from PyQt6.QtGui import QPixmap, QIcon, QFont, QColor, QPainter, QPen, QFontMetrics, QPalette, QLinearGradient, QTextOption
 
 VERSION = datetime.now().strftime("%Y.%m.%d.%H%M")
 GITHUB_REPO = "yunjii-cn/ip"
@@ -717,6 +717,21 @@ def download_config(url, timeout=NODE_TEST_TIMEOUT):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    if is_proxy_running():
+        try:
+            proxy_handler = urllib.request.ProxyHandler({
+                'http': f'http://{PROXY_URL}',
+                'https': f'http://{PROXY_URL}',
+            })
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=ctx),
+                proxy_handler,
+            )
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with opener.open(req, timeout=timeout) as resp:
+                return resp.read()
+        except Exception:
+            pass
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
         return resp.read()
@@ -936,6 +951,18 @@ def get_system_proxy():
         return False, ""
 
 
+def get_available_proxy_url():
+    if is_proxy_running():
+        return f"http://{PROXY_URL}"
+    sys_enabled, sys_server = get_system_proxy()
+    if sys_enabled and sys_server:
+        proxy_url = sys_server
+        if not proxy_url.startswith("http://") and not proxy_url.startswith("https://"):
+            proxy_url = f"http://{proxy_url}"
+        return proxy_url
+    return None
+
+
 def load_settings():
     path = os.path.join(get_app_dir(), "launcher_settings.json")
     defaults = {
@@ -948,9 +975,10 @@ def load_settings():
         "browser_type": "system",
         "system_browser_path": "",
         "quick_dir_path": "",
+        "realtime_reconnect": False,
         "auto_line_switch": False,
         "auto_line_interval": 30,
-        "realtime_detect": False,
+        "always_update_config": False,
         "browser_proxy_mode": "all",
         "current_line": "",
         "proxy_enabled": False,
@@ -1012,7 +1040,21 @@ class DownloadWorker(QThread):
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             req = urllib.request.Request(self.url, headers={"User-Agent": "Mozilla/5.0"})
-            resp = urllib.request.urlopen(req, timeout=60, context=ctx)
+            if is_proxy_running():
+                try:
+                    proxy_handler = urllib.request.ProxyHandler({
+                        'http': f'http://{PROXY_URL}',
+                        'https': f'http://{PROXY_URL}',
+                    })
+                    opener = urllib.request.build_opener(
+                        urllib.request.HTTPSHandler(context=ctx),
+                        proxy_handler,
+                    )
+                    resp = opener.open(req, timeout=60)
+                except Exception:
+                    resp = urllib.request.urlopen(req, timeout=60, context=ctx)
+            else:
+                resp = urllib.request.urlopen(req, timeout=60, context=ctx)
             total = int(resp.headers.get("Content-Length", 0))
             tmp_path = self.save_path + ".downloading"
             downloaded = 0
@@ -1036,47 +1078,55 @@ class DownloadWorker(QThread):
             self.finished.emit(False, f"下载失败: {e}", "")
 
 
-class KernelUpdateWorker(QThread):
+class KernelVersionWorker(QThread):
+    finished = pyqtSignal(list, str)
     progress = pyqtSignal(str)
-    finished = pyqtSignal(bool, str)
-
-    MIRROR_PREFIXES = [
-        "",
-        "https://mirror.ghproxy.com/",
-        "https://gh-proxy.com/",
-        "https://ghfast.top/",
-    ]
 
     def __init__(self, quick_dir):
         super().__init__()
         self.quick_dir = quick_dir
 
-    def _fetch_json(self, url, timeout=15):
+    def _build_opener(self, proxy_url=None):
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        if proxy_url:
+            try:
+                proxy_handler = urllib.request.ProxyHandler({
+                    'http': proxy_url,
+                    'https': proxy_url,
+                })
+                opener = urllib.request.build_opener(
+                    urllib.request.HTTPSHandler(context=ctx),
+                    proxy_handler,
+                )
+                return opener, ctx
+            except Exception:
+                pass
+        elif is_proxy_running():
+            try:
+                proxy_handler = urllib.request.ProxyHandler({
+                    'http': f'http://{PROXY_URL}',
+                    'https': f'http://{PROXY_URL}',
+                })
+                opener = urllib.request.build_opener(
+                    urllib.request.HTTPSHandler(context=ctx),
+                    proxy_handler,
+                )
+                return opener, ctx
+            except Exception:
+                pass
+        return None, ctx
 
-    def _download_file(self, url, save_path, timeout=120):
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+    def _fetch_json(self, url, timeout=15, proxy_url=None):
+        opener, ctx = self._build_opener(proxy_url=proxy_url)
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            total = int(resp.headers.get("Content-Length", 0))
-            downloaded = 0
-            with open(save_path, "wb") as f:
-                while True:
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total > 0:
-                        pct = int(downloaded * 100 / total)
-                        self.progress.emit(f"正在下载 {pct}% ({downloaded // 1024 // 1024}/{total // 1024 // 1024} MB)")
+        if opener:
+            with opener.open(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        else:
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                return json.loads(resp.read().decode("utf-8"))
 
     def _find_asset(self, release):
         for asset in release.get("assets", []):
@@ -1089,44 +1139,223 @@ class KernelUpdateWorker(QThread):
                 return asset.get("name", ""), asset.get("browser_download_url", "")
         return None, None
 
+    def _get_current_version(self):
+        ver_file = os.path.join(self.quick_dir, "_kernel_version.txt")
+        if os.path.isfile(ver_file):
+            try:
+                with open(ver_file, "r", encoding="utf-8") as f:
+                    v = f.read().strip()
+                    if v:
+                        return v
+            except Exception:
+                pass
+        exe_path = os.path.join(self.quick_dir, "quick.exe")
+        if not os.path.isfile(exe_path):
+            return ""
+        try:
+            result = subprocess.run(
+                [exe_path, "-v"],
+                capture_output=True, text=True, timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            output = (result.stdout or "") + (result.stderr or "")
+            m = re.search(r'v?(\d+\.\d+\.\d+)', output)
+            if m:
+                ver = m.group(1)
+                try:
+                    with open(ver_file, "w", encoding="utf-8") as f:
+                        f.write(ver)
+                except Exception:
+                    pass
+                return ver
+        except Exception:
+            pass
+        return ""
+
     def run(self):
         try:
-            self.progress.emit("正在获取最新版本信息...")
-
-            release = None
-            api_url = f"https://api.github.com/repos/{MIHOMO_REPO}/releases/latest"
-            for prefix in self.MIRROR_PREFIXES:
+            self.progress.emit("正在获取内核版本列表...")
+            api_url = f"https://api.github.com/repos/{MIHOMO_REPO}/releases?per_page=15"
+            mirror_prefixes = [
+                "https://gh-proxy.com/",
+                "https://ghproxy.net/",
+                "https://ghproxy.homeboyc.cn/",
+                "https://ghfast.top/",
+                "https://mirror.ghproxy.com/",
+            ]
+            releases = None
+            for prefix in mirror_prefixes:
+                if self.isInterruptionRequested():
+                    self.finished.emit([], "已取消")
+                    return
                 try:
-                    url = prefix + api_url if prefix else api_url
-                    self.progress.emit(f"尝试连接{'加速镜像' if prefix else 'GitHub'}...")
-                    release = self._fetch_json(url, timeout=10)
-                    if release and release.get("tag_name"):
+                    url = prefix + api_url
+                    self.progress.emit(f"尝试加速镜像...")
+                    releases = self._fetch_json(url, timeout=20)
+                    if releases and isinstance(releases, list):
                         break
-                    release = None
+                    releases = None
                 except Exception:
-                    release = None
+                    releases = None
                     continue
-
-            if not release:
-                self.finished.emit(False, "所有源均连接不上，请开启全局系统代理后再尝试")
-                return
-
-            latest_tag = release.get("tag_name", "")
-            asset_name, github_url = self._find_asset(release)
-            if not github_url:
-                self.finished.emit(False, "未找到适合的 Windows 内核文件")
-                return
-
-            current_exe = os.path.join(self.quick_dir, "quick.exe")
-            tmp_dir = tempfile.mkdtemp(prefix="mihomo_update_")
-            zip_path = os.path.join(tmp_dir, asset_name)
-
-            self.progress.emit(f"正在下载 mihomo {latest_tag}...")
-            downloaded = False
-            for prefix in self.MIRROR_PREFIXES:
+            if not releases:
+                if is_proxy_running():
+                    try:
+                        self.progress.emit("尝试通过本地代理直连GitHub...")
+                        releases = self._fetch_json(api_url, timeout=30)
+                        if not (releases and isinstance(releases, list)):
+                            releases = None
+                    except Exception:
+                        releases = None
+            if not releases:
+                sys_enabled, sys_server = get_system_proxy()
+                if sys_enabled and sys_server and not is_proxy_running():
+                    proxy_url = sys_server
+                    if not proxy_url.startswith("http://") and not proxy_url.startswith("https://"):
+                        proxy_url = f"http://{proxy_url}"
+                    try:
+                        self.progress.emit("尝试通过系统代理直连GitHub...")
+                        releases = self._fetch_json(api_url, timeout=30, proxy_url=proxy_url)
+                        if not (releases and isinstance(releases, list)):
+                            releases = None
+                    except Exception:
+                        releases = None
+            if not releases:
                 try:
-                    url = prefix + github_url if prefix else github_url
-                    self._download_file(url, zip_path)
+                    self.progress.emit("尝试GitHub直连...")
+                    releases = self._fetch_json(api_url, timeout=30)
+                    if not (releases and isinstance(releases, list)):
+                        releases = None
+                except Exception:
+                    releases = None
+            if not releases:
+                self.finished.emit([], "无法连接更新服务器，请检查网络后重试")
+                return
+            result = []
+            for rel in releases:
+                tag = rel.get("tag_name", "")
+                if not tag:
+                    continue
+                asset_name, download_url = self._find_asset(rel)
+                is_prerelease = rel.get("prerelease", False) or "-p" in tag or "-alpha" in tag or "-beta" in tag or "-rc" in tag
+                result.append({
+                    "tag": tag,
+                    "name": rel.get("name", tag),
+                    "published_at": rel.get("published_at", "")[:10],
+                    "body": (rel.get("body") or "")[:500],
+                    "asset_name": asset_name,
+                    "download_url": download_url,
+                    "prerelease": is_prerelease,
+                })
+            current_ver = self._get_current_version()
+            self.finished.emit(result, current_ver)
+        except Exception as e:
+            self.finished.emit([], f"获取版本列表失败: {e}")
+
+
+class KernelDownloadWorker(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(bool, str, str)
+
+    MIRROR_PREFIXES = [
+        "https://gh-proxy.com/",
+        "https://ghproxy.net/",
+        "https://ghproxy.homeboyc.cn/",
+        "https://ghfast.top/",
+        "https://mirror.ghproxy.com/",
+        "",
+    ]
+
+    def __init__(self, quick_dir, tag, download_url, asset_name):
+        super().__init__()
+        self.quick_dir = quick_dir
+        self.tag = tag
+        self.download_url = download_url
+        self.asset_name = asset_name
+
+    def _build_opener(self, proxy_url=None):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        if proxy_url:
+            try:
+                proxy_handler = urllib.request.ProxyHandler({
+                    'http': proxy_url,
+                    'https': proxy_url,
+                })
+                opener = urllib.request.build_opener(
+                    urllib.request.HTTPSHandler(context=ctx),
+                    proxy_handler,
+                )
+                return opener, ctx
+            except Exception:
+                pass
+        elif is_proxy_running():
+            try:
+                proxy_handler = urllib.request.ProxyHandler({
+                    'http': f'http://{PROXY_URL}',
+                    'https': f'http://{PROXY_URL}',
+                })
+                opener = urllib.request.build_opener(
+                    urllib.request.HTTPSHandler(context=ctx),
+                    proxy_handler,
+                )
+                return opener, ctx
+            except Exception:
+                pass
+        return None, ctx
+
+    def _download_file(self, url, save_path, timeout=180, proxy_url=None):
+        opener, ctx = self._build_opener(proxy_url=proxy_url)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        if opener:
+            resp = opener.open(req, timeout=timeout)
+        else:
+            resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        with resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            with open(save_path, "wb") as f:
+                while True:
+                    if self.isInterruptionRequested():
+                        return
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total > 0:
+                        pct = int(downloaded * 100 / total)
+                        self.progress.emit(f"正在下载 {pct}% ({downloaded // 1024 // 1024}/{total // 1024 // 1024} MB)")
+
+    def run(self):
+        try:
+            kernels_dir = os.path.join(self.quick_dir, "kernels")
+            os.makedirs(kernels_dir, exist_ok=True)
+            target_exe = os.path.join(kernels_dir, f"mihomo_{self.tag}.exe")
+            if os.path.isfile(target_exe) and os.path.getsize(target_exe) > 1000:
+                self.finished.emit(True, f"mihomo {self.tag} 已存在", target_exe)
+                return
+
+            tmp_dir = tempfile.mkdtemp(prefix="mihomo_dl_")
+            zip_path = os.path.join(tmp_dir, self.asset_name or "mihomo.zip")
+
+            self.progress.emit(f"正在下载 mihomo {self.tag}...")
+            dl_prefixes = [p for p in self.MIRROR_PREFIXES if p]
+            downloaded = False
+            for prefix in dl_prefixes:
+                if self.isInterruptionRequested():
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                    self.finished.emit(False, "已取消", "")
+                    return
+                try:
+                    url = prefix + self.download_url
+                    self.progress.emit(f"通过加速镜像下载...")
+                    self._download_file(url, zip_path, timeout=180)
+                    if self.isInterruptionRequested():
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+                        self.finished.emit(False, "已取消", "")
+                        return
                     if os.path.isfile(zip_path) and os.path.getsize(zip_path) > 1000:
                         downloaded = True
                         break
@@ -1139,8 +1368,53 @@ class KernelUpdateWorker(QThread):
                     continue
 
             if not downloaded:
+                if is_proxy_running():
+                    try:
+                        self.progress.emit("通过本地代理直连下载...")
+                        self._download_file(self.download_url, zip_path, timeout=180)
+                        if os.path.isfile(zip_path) and os.path.getsize(zip_path) > 1000:
+                            downloaded = True
+                        else:
+                            if os.path.isfile(zip_path):
+                                os.remove(zip_path)
+                    except Exception:
+                        if os.path.isfile(zip_path):
+                            os.remove(zip_path)
+
+            if not downloaded:
+                sys_enabled, sys_server = get_system_proxy()
+                if sys_enabled and sys_server and not is_proxy_running():
+                    proxy_url = sys_server
+                    if not proxy_url.startswith("http://") and not proxy_url.startswith("https://"):
+                        proxy_url = f"http://{proxy_url}"
+                    try:
+                        self.progress.emit("通过系统代理直连下载...")
+                        self._download_file(self.download_url, zip_path, timeout=180, proxy_url=proxy_url)
+                        if os.path.isfile(zip_path) and os.path.getsize(zip_path) > 1000:
+                            downloaded = True
+                        else:
+                            if os.path.isfile(zip_path):
+                                os.remove(zip_path)
+                    except Exception:
+                        if os.path.isfile(zip_path):
+                            os.remove(zip_path)
+
+            if not downloaded:
+                try:
+                    self.progress.emit("GitHub直连下载...")
+                    self._download_file(self.download_url, zip_path, timeout=180)
+                    if os.path.isfile(zip_path) and os.path.getsize(zip_path) > 1000:
+                        downloaded = True
+                    else:
+                        if os.path.isfile(zip_path):
+                            os.remove(zip_path)
+                except Exception:
+                    if os.path.isfile(zip_path):
+                        os.remove(zip_path)
+
+            if not downloaded:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
-                self.finished.emit(False, "所有源均连接不上，请开启全局系统代理后再尝试")
+                self.finished.emit(False, "下载失败，请检查网络后重试", "")
                 return
 
             self.progress.emit("正在解压...")
@@ -1152,29 +1426,16 @@ class KernelUpdateWorker(QThread):
                         break
                 if not exe_name:
                     shutil.rmtree(tmp_dir, ignore_errors=True)
-                    self.finished.emit(False, "压缩包中未找到可执行文件")
+                    self.finished.emit(False, "压缩包中未找到可执行文件", "")
                     return
                 zf.extract(exe_name, tmp_dir)
-                new_exe = os.path.join(tmp_dir, exe_name)
+                extracted = os.path.join(tmp_dir, exe_name)
 
-            self.progress.emit("正在替换内核文件...")
-            backup_path = current_exe + ".bak"
-            if os.path.isfile(backup_path):
-                os.remove(backup_path)
-            if os.path.isfile(current_exe):
-                os.rename(current_exe, backup_path)
-            shutil.move(new_exe, current_exe)
-
-            try:
-                os.remove(backup_path)
-            except Exception:
-                pass
-
+            shutil.move(extracted, target_exe)
             shutil.rmtree(tmp_dir, ignore_errors=True)
-            self.finished.emit(True, f"内核已更新至 mihomo {latest_tag}")
-
+            self.finished.emit(True, f"mihomo {self.tag} 下载完成", target_exe)
         except Exception as e:
-            self.finished.emit(False, f"更新失败: {e}")
+            self.finished.emit(False, f"下载失败: {e}", "")
 
 
 class ServiceWorker(QThread):
@@ -1466,7 +1727,7 @@ class SplashScreen(QSplashScreen):
                 base = sys._MEIPASS
             else:
                 base = os.path.dirname(os.path.abspath(__file__))
-            for name in ('icon.png', 'icon.ico'):
+            for name in ('ico.png', 'icon.png', 'icon.ico'):
                 p = os.path.join(base, name)
                 if os.path.exists(p):
                     self._icon_pixmap = QPixmap(p)
@@ -1587,6 +1848,44 @@ class _HelpBubble(QFrame):
         super().leaveEvent(event)
 
 
+class CopyableLabel(QTextEdit):
+    def __init__(self, text="", font_size="8pt", max_height=40, parent=None):
+        super().__init__(parent)
+        self._font_size = font_size
+        self._color = "#888"
+        self.setPlainText(text)
+        self.setReadOnly(True)
+        self.setMaximumHeight(max_height)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self._apply_style()
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setWordWrapMode(QTextOption.WrapMode.NoWrap)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+    def _apply_style(self):
+        self.setStyleSheet(
+            f"QTextEdit {{ background-color: transparent; color: {self._color}; "
+            f"font-size: {self._font_size}; border: none; padding: 0px; }} "
+            f"QTextEdit:hover {{ background-color: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 3px; padding: 2px; }}"
+        )
+
+    def setText(self, text):
+        self.setPlainText(text)
+
+    def setStyleSheet(self, style):
+        if "QTextEdit" not in style:
+            import re
+            m = re.search(r'color:\s*([^;]+)', style)
+            if m:
+                self._color = m.group(1).strip()
+            m2 = re.search(r'font-size:\s*([^;]+)', style)
+            if m2:
+                self._font_size = m2.group(1).strip()
+            self._apply_style()
+        else:
+            super().setStyleSheet(style)
+
+
 def _make_help_btn(tooltip, detail_title, detail_text):
     btn = QPushButton()
     btn.setFixedSize(22, 22)
@@ -1622,6 +1921,7 @@ def _make_help_btn(tooltip, detail_title, detail_text):
 
 class MainWindow(QMainWindow):
     _version_data_ready = pyqtSignal()
+    _kernel_versions_ready = pyqtSignal()
 
     def __init__(self, splash=None):
         super().__init__()
@@ -1636,6 +1936,7 @@ class MainWindow(QMainWindow):
 
         self.settings = load_settings()
         self._version_data_ready.connect(self._on_version_data_ready)
+        self._kernel_versions_ready.connect(self._on_kernel_versions_ready)
 
         global PROXY_HOST, PROXY_PORT
         saved_host = self.settings.get("proxy_host", PROXY_HOST)
@@ -1682,6 +1983,8 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(1000, self._startup_download_config)
 
+        QTimer.singleShot(300, self._load_kernel_versions_cache)
+
         if self._splash:
             self._splash.set_progress(1.0, "加载完成！")
             QTimer.singleShot(200, self._finish_splash)
@@ -1708,9 +2011,15 @@ class MainWindow(QMainWindow):
         return None
 
     def _set_icon(self):
-        ico_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
-        if os.path.isfile(ico_path):
-            self.setWindowIcon(QIcon(ico_path))
+        if hasattr(sys, '_MEIPASS'):
+            base = sys._MEIPASS
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+        for name in ('ico.png', 'icon.png', 'icon.ico'):
+            p = os.path.join(base, name)
+            if os.path.isfile(p):
+                self.setWindowIcon(QIcon(p))
+                break
 
     def _build_ui(self):
         central = QWidget()
@@ -1773,7 +2082,7 @@ class MainWindow(QMainWindow):
         status_card = QFrame()
         status_card.setObjectName("card")
         sc = QVBoxLayout(status_card)
-        sc.setContentsMargins(16, 14, 16, 14)
+        sc.setContentsMargins(20, 14, 20, 14)
         sc.setSpacing(8)
 
         status_top = QHBoxLayout()
@@ -1905,6 +2214,9 @@ class MainWindow(QMainWindow):
 
         si_layout.addStretch()
 
+        self.line_progress = CopyableLabel("", max_height=26)
+        si_layout.addWidget(self.line_progress)
+
         self.btn_test = QPushButton("🔍 检测线路")
         self.btn_test.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_test.setFixedSize(90, 26)
@@ -1914,7 +2226,7 @@ class MainWindow(QMainWindow):
             f"QPushButton:hover {{ background-color: {COLOR_RED_LIGHT}; }}"
             f"QPushButton:disabled {{ background-color: #333; color: #666; }}"
         )
-        self.btn_test.clicked.connect(self._on_test_lines)
+        self.btn_test.clicked.connect(self._on_test_btn_clicked)
         si_layout.addWidget(self.btn_test, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         sc.addWidget(status_info)
@@ -1991,76 +2303,109 @@ class MainWindow(QMainWindow):
         sm_layout_title.addWidget(_make_help_btn(
             "智能线路管理",
             "智能线路说明",
-            "【实时检测】\n"
-            "开启后持续监测当前线路的连通性，一旦断线自动重连。\n"
-            "适合需要长时间稳定连接的场景。\n\n"
-            "【超时切换最快线路】\n"
-            "按设定间隔定时检测所有线路延迟，自动切换到最快的线路。\n"
-            "适合对速度有要求的场景。\n\n"
-            "【检测间隔】\n"
-            "设置自动检测的时间间隔，范围5-120分钟。"
+            "【断线自动重连】\n"
+            "每10秒检测代理连通性，发现断线时自动重连当前线路。\n"
+            "适合网络不稳定时保持代理持续在线。\n\n"
+            "【定时切换最快线路】\n"
+            "按设定间隔检测所有线路延迟，自动切换到最快线路。\n"
+            "适合长时间使用时自动优化线路质量。\n\n"
+            "两个功能独立控制，可按需开启，也可同时开启互补。\n\n"
+            "【每次检测前更新配置】\n"
+            "开启后，每次检测线路都会先下载最新线路配置。\n"
+            "关闭时，每天仅自动更新一次配置。"
         ))
         sm_layout_title.addStretch()
         sm.addLayout(sm_layout_title)
 
-        realtime_row = QFrame()
-        realtime_row.setObjectName("switch-row")
-        rr = QHBoxLayout(realtime_row)
-        rr.setContentsMargins(14, 8, 14, 8)
-        realtime_info = QVBoxLayout()
-        realtime_info.setSpacing(1)
-        realtime_lbl = QLabel("📡 实时检测")
-        realtime_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
-        realtime_info.addWidget(realtime_lbl)
-        realtime_desc = QLabel("持续监测连通性，断线自动重连")
-        realtime_desc.setObjectName("dim")
-        realtime_desc.setStyleSheet("font-size: 8pt;")
-        realtime_info.addWidget(realtime_desc)
-        rr.addLayout(realtime_info, stretch=1)
-        self.switch_realtime_detect = ToggleSwitch("", default=self.settings.get("realtime_detect", False))
-        self.switch_realtime_detect.setFixedWidth(80)
-        self.switch_realtime_detect.toggled.connect(self._on_realtime_detect_toggled)
-        rr.addWidget(self.switch_realtime_detect, alignment=Qt.AlignmentFlag.AlignVCenter)
-        sm.addWidget(realtime_row)
+        reconnect_row = QFrame()
+        reconnect_row.setObjectName("switch-row")
+        rrr = QHBoxLayout(reconnect_row)
+        rrr.setContentsMargins(14, 8, 14, 8)
+        reconnect_info = QVBoxLayout()
+        reconnect_info.setSpacing(1)
+        reconnect_lbl = QLabel("🔄 断线自动重连")
+        reconnect_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
+        reconnect_info.addWidget(reconnect_lbl)
+        reconnect_desc = QLabel("每10秒检测连通性，断线时自动重连当前线路")
+        reconnect_desc.setObjectName("dim")
+        reconnect_desc.setStyleSheet("font-size: 8pt;")
+        reconnect_info.addWidget(reconnect_desc)
+        rrr.addLayout(reconnect_info, stretch=1)
+        self.switch_realtime_reconnect = ToggleSwitch("", default=self.settings.get("realtime_reconnect", False))
+        self.switch_realtime_reconnect.setFixedWidth(80)
+        self.switch_realtime_reconnect.toggled.connect(self._on_realtime_reconnect_toggled)
+        rrr.addWidget(self.switch_realtime_reconnect, alignment=Qt.AlignmentFlag.AlignVCenter)
+        sm.addWidget(reconnect_row)
 
-        timeout_row = QFrame()
-        timeout_row.setObjectName("switch-row")
-        tr = QHBoxLayout(timeout_row)
-        tr.setContentsMargins(14, 8, 14, 8)
-        timeout_info = QVBoxLayout()
-        timeout_info.setSpacing(1)
-        timeout_lbl = QLabel("⚡ 超时切换最快线路")
-        timeout_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
-        timeout_info.addWidget(timeout_lbl)
-        timeout_desc = QLabel("按间隔定时检测，自动切换到最快线路")
-        timeout_desc.setObjectName("dim")
-        timeout_desc.setStyleSheet("font-size: 8pt;")
-        timeout_info.addWidget(timeout_desc)
-        tr.addLayout(timeout_info, stretch=1)
-        self.switch_auto_line = ToggleSwitch("", default=self.settings.get("auto_line_switch", False))
-        self.switch_auto_line.setFixedWidth(80)
-        self.switch_auto_line.toggled.connect(self._on_auto_line_switch_toggled)
-        tr.addWidget(self.switch_auto_line, alignment=Qt.AlignmentFlag.AlignVCenter)
-        sm.addWidget(timeout_row)
-
-        interval_row = QHBoxLayout()
-        interval_row.setSpacing(8)
-        interval_lbl = QLabel("检测间隔:")
+        auto_line_row = QFrame()
+        auto_line_row.setObjectName("switch-row")
+        alr = QHBoxLayout(auto_line_row)
+        alr.setContentsMargins(14, 8, 14, 8)
+        auto_line_info = QVBoxLayout()
+        auto_line_info.setSpacing(1)
+        auto_line_lbl = QLabel("⚡ 定时切换最快线路")
+        auto_line_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
+        auto_line_info.addWidget(auto_line_lbl)
+        auto_line_desc = QLabel("按间隔检测所有线路延迟，自动切换到最快线路")
+        auto_line_desc.setObjectName("dim")
+        auto_line_desc.setStyleSheet("font-size: 8pt;")
+        auto_line_info.addWidget(auto_line_desc)
+        alr.addLayout(auto_line_info, stretch=1)
+        interval_wrap = QHBoxLayout()
+        interval_wrap.setSpacing(6)
+        interval_lbl = QLabel("间隔:")
         interval_lbl.setObjectName("dim")
         interval_lbl.setStyleSheet("font-size: 9pt;")
-        interval_row.addWidget(interval_lbl)
+        interval_wrap.addWidget(interval_lbl)
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(5, 120)
         self.interval_spin.setValue(self.settings.get("auto_line_interval", 30))
         self.interval_spin.setSuffix(" 分钟")
+        self.interval_spin.setFixedWidth(90)
         self.interval_spin.valueChanged.connect(self._on_interval_changed)
-        interval_row.addWidget(self.interval_spin)
-        interval_row.addStretch()
+        interval_wrap.addWidget(self.interval_spin)
         self.auto_line_status = QLabel("")
         self.auto_line_status.setObjectName("dim")
         self.auto_line_status.setStyleSheet("font-size: 8pt;")
-        interval_row.addWidget(self.auto_line_status)
-        sm.addLayout(interval_row)
+        interval_wrap.addWidget(self.auto_line_status)
+        alr.addLayout(interval_wrap)
+        self.switch_auto_line = ToggleSwitch("", default=self.settings.get("auto_line_switch", False))
+        self.switch_auto_line.setFixedWidth(80)
+        self.switch_auto_line.toggled.connect(self._on_auto_line_switch_toggled)
+        alr.addWidget(self.switch_auto_line, alignment=Qt.AlignmentFlag.AlignVCenter)
+        sm.addWidget(auto_line_row)
+
+        update_config_row = QFrame()
+        update_config_row.setObjectName("switch-row")
+        ucr = QHBoxLayout(update_config_row)
+        ucr.setContentsMargins(14, 8, 14, 8)
+        update_config_info = QVBoxLayout()
+        update_config_info.setSpacing(1)
+        update_config_title_row = QHBoxLayout()
+        update_config_title_row.setSpacing(4)
+        update_config_lbl = QLabel("📥 每次检测前更新配置")
+        update_config_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
+        update_config_title_row.addWidget(update_config_lbl)
+        update_config_title_row.addWidget(_make_help_btn(
+            "每次检测前更新配置",
+            "每次检测前更新配置说明",
+            "【每次检测前更新配置】\n"
+            "开启后，每次点击「检测线路」都会先下载最新的线路服务器配置。\n"
+            "关闭时，每天仅自动更新一次配置，当天已更新过则直接检测。\n\n"
+            "建议在网络不稳定时开启，确保使用最新的线路信息。"
+        ))
+        update_config_title_row.addStretch()
+        update_config_info.addLayout(update_config_title_row)
+        update_config_desc = QLabel("开启后检测线路时始终先更新线路配置")
+        update_config_desc.setObjectName("dim")
+        update_config_desc.setStyleSheet("font-size: 8pt;")
+        update_config_info.addWidget(update_config_desc)
+        ucr.addLayout(update_config_info, stretch=1)
+        self.switch_always_update_config = ToggleSwitch("", default=self.settings.get("always_update_config", False))
+        self.switch_always_update_config.setFixedWidth(80)
+        self.switch_always_update_config.toggled.connect(lambda checked: self._save_setting("always_update_config", checked))
+        ucr.addWidget(self.switch_always_update_config, alignment=Qt.AlignmentFlag.AlignVCenter)
+        sm.addWidget(update_config_row)
 
         layout.addWidget(smart_card)
 
@@ -2177,23 +2522,20 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(browser_card)
 
-        self.line_progress = QLabel("")
-        self.line_progress.setObjectName("dim")
-        self.line_progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.line_progress)
         layout.addStretch()
         return page
 
     def _build_proxy_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
 
         proxy_card = QFrame()
         proxy_card.setObjectName("card")
         pl = QVBoxLayout(proxy_card)
-        pl.setSpacing(10)
+        pl.setContentsMargins(20, 14, 20, 14)
+        pl.setSpacing(8)
 
         proxy_title = QLabel("代理功能")
         proxy_title.setObjectName("accent")
@@ -2220,9 +2562,9 @@ class MainWindow(QMainWindow):
         browser_row = QFrame()
         browser_row.setObjectName("switch-row")
         br = QHBoxLayout(browser_row)
-        br.setContentsMargins(12, 6, 12, 6)
+        br.setContentsMargins(14, 8, 14, 8)
         browser_info = QVBoxLayout()
-        browser_info.setSpacing(0)
+        browser_info.setSpacing(1)
         browser_lbl = QLabel("🌐 浏览器代理")
         browser_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
         browser_info.addWidget(browser_lbl)
@@ -2234,13 +2576,13 @@ class MainWindow(QMainWindow):
         browser_switch = ToggleSwitch("", default=True)
         browser_switch.setEnabled(False)
         browser_switch.setFixedWidth(80)
-        br.addWidget(browser_switch)
+        br.addWidget(browser_switch, alignment=Qt.AlignmentFlag.AlignVCenter)
         pl.addWidget(browser_row)
 
         browser_mode_row = QFrame()
         browser_mode_row.setObjectName("switch-row")
         bmr = QHBoxLayout(browser_mode_row)
-        bmr.setContentsMargins(12, 6, 12, 6)
+        bmr.setContentsMargins(14, 8, 14, 8)
         bmr.addWidget(QLabel("代理范围:"))
         self.browser_proxy_group = []
         self.all_browser_rb = RadioButton("全部浏览器", default=self.settings.get("browser_proxy_mode", "all") == "all")
@@ -2264,9 +2606,9 @@ class MainWindow(QMainWindow):
         global_row = QFrame()
         global_row.setObjectName("switch-row")
         gr = QHBoxLayout(global_row)
-        gr.setContentsMargins(12, 6, 12, 6)
+        gr.setContentsMargins(14, 8, 14, 8)
         global_info = QVBoxLayout()
-        global_info.setSpacing(0)
+        global_info.setSpacing(1)
         global_lbl = QLabel("🌍 全局系统代理")
         global_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
         global_info.addWidget(global_lbl)
@@ -2278,7 +2620,7 @@ class MainWindow(QMainWindow):
         self.switch_global_proxy = ToggleSwitch("", default=self.settings.get("global_proxy", False))
         self.switch_global_proxy.setFixedWidth(80)
         self.switch_global_proxy.toggled.connect(self._on_global_proxy_toggled)
-        gr.addWidget(self.switch_global_proxy)
+        gr.addWidget(self.switch_global_proxy, alignment=Qt.AlignmentFlag.AlignVCenter)
         pl.addWidget(global_row)
 
         self.global_restart_hint = QLabel("⚠ 修改后需重启服务生效")
@@ -2292,11 +2634,13 @@ class MainWindow(QMainWindow):
         custom_card = QFrame()
         custom_card.setObjectName("card")
         cl = QVBoxLayout(custom_card)
+        cl.setContentsMargins(20, 14, 20, 14)
         cl.setSpacing(8)
 
         custom_header = QHBoxLayout()
+        custom_header.setContentsMargins(14, 8, 14, 8)
         custom_info = QVBoxLayout()
-        custom_info.setSpacing(0)
+        custom_info.setSpacing(1)
         custom_title_row = QHBoxLayout()
         custom_title_row.setSpacing(4)
         custom_title = QLabel("🎯 指定程序代理")
@@ -2323,7 +2667,7 @@ class MainWindow(QMainWindow):
         self.switch_custom_apps = ToggleSwitch("", default=self.settings.get("custom_apps_enabled", False))
         self.switch_custom_apps.setFixedWidth(80)
         self.switch_custom_apps.toggled.connect(self._on_custom_apps_toggled)
-        custom_header.addWidget(self.switch_custom_apps)
+        custom_header.addWidget(self.switch_custom_apps, alignment=Qt.AlignmentFlag.AlignVCenter)
         cl.addLayout(custom_header)
 
         self.custom_restart_hint = QLabel("⚠ 修改后需重启服务生效")
@@ -2332,36 +2676,39 @@ class MainWindow(QMainWindow):
         self.custom_restart_hint.setVisible(False)
         cl.addWidget(self.custom_restart_hint)
 
-        app_btn_row = QHBoxLayout()
-        app_btn_row.setSpacing(8)
-        add_btn = QPushButton("＋ 添加程序")
+        app_combo_row = QHBoxLayout()
+        app_combo_row.setSpacing(8)
+        app_combo_row.setContentsMargins(14, 0, 14, 0)
+        self.app_combo = QComboBox()
+        self.app_combo.setFixedHeight(28)
+        for app_path in self.settings.get("custom_apps", []):
+            self._add_app_item(app_path)
+        app_combo_row.addWidget(self.app_combo, stretch=1)
+        add_btn = QPushButton("＋添加")
         add_btn.setObjectName("small-blue")
         add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_btn.setFixedSize(60, 28)
         add_btn.clicked.connect(self._on_add_app)
-        app_btn_row.addWidget(add_btn)
-        remove_btn = QPushButton("－ 删除程序")
+        app_combo_row.addWidget(add_btn)
+        remove_btn = QPushButton("－删除")
         remove_btn.setObjectName("small-red")
         remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove_btn.setFixedSize(60, 28)
         remove_btn.setStyleSheet(
             f"QPushButton {{ background-color: {COLOR_RED}; color: #FFFFFF; padding: 4px 12px; "
             f"font-size: 8pt; font-weight: bold; border-radius: 4px; border: none; }}"
             f"QPushButton:hover {{ background-color: {COLOR_RED_LIGHT}; }}"
         )
         remove_btn.clicked.connect(self._on_remove_app)
-        app_btn_row.addWidget(remove_btn)
-        app_btn_row.addStretch()
-        cl.addLayout(app_btn_row)
-        self.app_list = QListWidget()
-        self.app_list.setMaximumHeight(120)
-        for app_path in self.settings.get("custom_apps", []):
-            self._add_app_item(app_path)
-        cl.addWidget(self.app_list)
+        app_combo_row.addWidget(remove_btn)
+        cl.addLayout(app_combo_row)
 
         layout.addWidget(custom_card)
 
         startup_card = QFrame()
         startup_card.setObjectName("card")
         sl = QVBoxLayout(startup_card)
+        sl.setContentsMargins(20, 14, 20, 14)
         sl.setSpacing(8)
 
         startup_title = QLabel("启动设置")
@@ -2383,9 +2730,9 @@ class MainWindow(QMainWindow):
         autostart_row = QFrame()
         autostart_row.setObjectName("switch-row")
         asr = QHBoxLayout(autostart_row)
-        asr.setContentsMargins(12, 6, 12, 6)
+        asr.setContentsMargins(14, 8, 14, 8)
         autostart_info = QVBoxLayout()
-        autostart_info.setSpacing(0)
+        autostart_info.setSpacing(1)
         autostart_lbl = QLabel("🚀 启动时自动开启服务")
         autostart_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
         autostart_info.addWidget(autostart_lbl)
@@ -2397,75 +2744,87 @@ class MainWindow(QMainWindow):
         self.switch_auto_start = ToggleSwitch("", default=self.settings.get("auto_start", True))
         self.switch_auto_start.setFixedWidth(80)
         self.switch_auto_start.toggled.connect(self._on_auto_start_toggled)
-        asr.addWidget(self.switch_auto_start)
+        asr.addWidget(self.switch_auto_start, alignment=Qt.AlignmentFlag.AlignVCenter)
         sl.addWidget(autostart_row)
 
         layout.addWidget(startup_card)
 
-        update_card = QFrame()
-        update_card.setObjectName("card")
-        ul = QVBoxLayout(update_card)
-        ul.setSpacing(8)
+        kernel_card = QFrame()
+        kernel_card.setObjectName("card")
+        kl = QVBoxLayout(kernel_card)
+        kl.setSpacing(8)
+        kl.setContentsMargins(20, 14, 20, 14)
 
-        update_title = QLabel("更新管理")
-        update_title.setObjectName("accent")
-        update_title.setStyleSheet("font-size: 9pt; font-weight: bold;")
-        ul_title_row = QHBoxLayout()
-        ul_title_row.setSpacing(4)
-        ul_title_row.addWidget(update_title)
-        ul_title_row.addWidget(_make_help_btn(
-            "更新管理",
-            "更新管理说明",
-            "【更新代理内核版本】\n"
-            "自动从 GitHub 下载最新版 mihomo 内核并替换 quick.exe。\n"
-            "如代理正在运行，更新后会自动重启服务。\n\n"
-            "【更新线路配置】\n"
-            "下载最新的线路服务器列表。\n"
-            "检测线路时会自动更新配置（每天仅自动更新一次），\n"
-            "如需立即更新可手动点击此按钮。"
+        kernel_title_row = QHBoxLayout()
+        kernel_title_row.setSpacing(4)
+        kernel_title = QLabel("代理内核")
+        kernel_title.setObjectName("accent")
+        kernel_title.setStyleSheet("font-size: 9pt; font-weight: bold;")
+        kernel_title_row.addWidget(kernel_title)
+        kernel_title_row.addWidget(_make_help_btn(
+            "代理内核",
+            "代理内核说明",
+            "【代理内核版本管理】\n"
+            "管理 mihomo 代理内核的版本，支持查看、下载和切换。\n\n"
+            "【当前版本】\n"
+            "显示当前正在使用的内核版本。\n\n"
+            "【检查更新】\n"
+            "从 GitHub 获取最新的内核版本列表。\n"
+            "如代理正在运行，将优先通过代理加速下载。\n\n"
+            "【切换版本】\n"
+            "切换到已下载的其他内核版本。\n"
+            "如遇新版本问题，可回滚到旧版本。"
         ))
-        ul_title_row.addStretch()
-        ul.addLayout(ul_title_row)
+        kernel_title_row.addStretch()
+        kl.addLayout(kernel_title_row)
 
-        update_btn_row = QHBoxLayout()
-        update_btn_row.setSpacing(16)
+        kernel_info_row = QHBoxLayout()
+        kernel_info_row.setSpacing(12)
+        self.kernel_current_label = QLabel(f"当前版本: {self._get_mihomo_version() or '未知'}")
+        self.kernel_current_label.setStyleSheet(f"font-size: 9pt; color: {COLOR_GREEN}; font-weight: bold;")
+        kernel_info_row.addWidget(self.kernel_current_label)
+        self.kernel_latest_label = QLabel("")
+        self.kernel_latest_label.setStyleSheet(f"font-size: 9pt; color: {COLOR_DIM};")
+        kernel_info_row.addWidget(self.kernel_latest_label)
+        kernel_info_row.addStretch()
 
-        btn_update_quick = QPushButton("🔄 更新代理内核")
-        btn_update_quick.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_update_quick.setFixedSize(140, 34)
-        btn_update_quick.setStyleSheet(
+        self.btn_check_kernel = QPushButton("🔄 检查更新")
+        self.btn_check_kernel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_check_kernel.setFixedSize(100, 28)
+        self.btn_check_kernel.setStyleSheet(
             f"QPushButton {{ background-color: {COLOR_BLUE}; color: #FFFFFF; border: none; border-radius: 6px; "
-            f"font-size: 9pt; font-weight: bold; }}"
+            f"font-size: 8pt; font-weight: bold; }}"
             f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
         )
-        btn_update_quick.clicked.connect(self._on_update_quick)
-        update_btn_row.addWidget(btn_update_quick)
+        self.btn_check_kernel.clicked.connect(self._on_check_kernel_btn)
+        kernel_info_row.addWidget(self.btn_check_kernel)
 
-        btn_update_config = QPushButton("📥 更新线路配置")
-        btn_update_config.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_update_config.setFixedSize(140, 34)
-        btn_update_config.setStyleSheet(
-            f"QPushButton {{ background-color: #1B5E20; color: #FFFFFF; border: none; border-radius: 6px; "
-            f"font-size: 9pt; font-weight: bold; }}"
-            f"QPushButton:hover {{ background-color: #2E7D32; }}"
+        kl.addLayout(kernel_info_row)
+
+        self.kernel_status = CopyableLabel("", max_height=30)
+        kl.addWidget(self.kernel_status)
+
+        self._kernel_scroll = QScrollArea()
+        self._kernel_scroll.setWidgetResizable(True)
+        self._kernel_scroll.setStyleSheet(
+            f"QScrollArea {{ background-color: {COLOR_BG}; border: 1px solid {COLOR_BORDER}; border-radius: 4px; }}"
+            f"QScrollBar:vertical {{ width: 6px; background: transparent; }}"
+            f"QScrollBar::handle:vertical {{ background: #444; border-radius: 3px; min-height: 20px; }}"
         )
-        btn_update_config.clicked.connect(self._on_update_config)
-        update_btn_row.addWidget(btn_update_config)
+        self._kernel_scroll_content = QWidget()
+        self._kernel_scroll_layout = QVBoxLayout(self._kernel_scroll_content)
+        self._kernel_scroll_layout.setContentsMargins(0, 0, 0, 0)
+        self._kernel_scroll_layout.setSpacing(0)
+        self._kernel_scroll_layout.addStretch()
+        self._kernel_scroll.setWidget(self._kernel_scroll_content)
+        kl.addWidget(self._kernel_scroll, stretch=1)
 
-        update_btn_row.addStretch()
-        ul.addLayout(update_btn_row)
-        self.update_status = QLabel("")
-        self.update_status.setObjectName("dim")
-        self.update_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ul.addWidget(self.update_status)
-
-        layout.addWidget(update_card)
+        layout.addWidget(kernel_card, stretch=1)
 
         self.sys_proxy_lbl = QLabel("")
         self.sys_proxy_lbl.setObjectName("dim")
         self._update_sys_proxy_label()
         layout.addWidget(self.sys_proxy_lbl)
-        layout.addStretch()
         return page
 
     def _build_log_tab(self):
@@ -2627,6 +2986,9 @@ class MainWindow(QMainWindow):
         self.browser_combo.blockSignals(False)
 
     def _get_quick_version(self):
+        ver = self._get_mihomo_version()
+        if ver:
+            return f"mihomo v{ver}"
         if not self.quick_dir:
             return None
         try:
@@ -2634,10 +2996,64 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
+    def _get_mihomo_version(self):
+        if not self.quick_dir:
+            return ""
+        ver_file = os.path.join(self.quick_dir, "_kernel_version.txt")
+        if os.path.isfile(ver_file):
+            try:
+                with open(ver_file, "r", encoding="utf-8") as f:
+                    v = f.read().strip()
+                    if v:
+                        return v
+            except Exception:
+                pass
+        exe_path = os.path.join(self.quick_dir, "quick.exe")
+        if not os.path.isfile(exe_path):
+            return ""
+        try:
+            result = subprocess.run(
+                [exe_path, "-v"],
+                capture_output=True, text=True, timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            output = (result.stdout or "") + (result.stderr or "")
+            m = re.search(r'v?(\d+\.\d+\.\d+)', output)
+            if m:
+                ver = m.group(1)
+                try:
+                    with open(ver_file, "w", encoding="utf-8") as f:
+                        f.write(ver)
+                except Exception:
+                    pass
+                return ver
+        except Exception:
+            pass
+        return ""
+
+    def _list_local_kernels(self):
+        if not self.quick_dir:
+            return []
+        kernels_dir = os.path.join(self.quick_dir, "kernels")
+        if not os.path.isdir(kernels_dir):
+            return []
+        result = []
+        for f in os.listdir(kernels_dir):
+            if f.startswith("mihomo_") and f.endswith(".exe"):
+                m = re.search(r'mihomo_(v?[\d.]+)\.exe', f)
+                if m:
+                    tag = m.group(1)
+                    if not tag.startswith("v"):
+                        tag = "v" + tag
+                    result.append({
+                        "tag": tag,
+                        "path": os.path.join(kernels_dir, f),
+                        "size_mb": round(os.path.getsize(os.path.join(kernels_dir, f)) / 1024 / 1024, 1),
+                    })
+        return result
+
     def _add_app_item(self, app_path):
-        item = QListWidgetItem(os.path.basename(app_path))
-        item.setData(Qt.ItemDataRole.UserRole, app_path)
-        self.app_list.addItem(item)
+        self.app_combo.addItem(os.path.basename(app_path), app_path)
 
     def _append_log(self, msg):
         self.log_text.append(msg)
@@ -2832,10 +3248,10 @@ class MainWindow(QMainWindow):
                 self._update_sys_proxy_label()
             self.global_restart_hint.setVisible(False)
             self.custom_restart_hint.setVisible(False)
+            if self.settings.get("realtime_reconnect", False):
+                self._start_realtime_monitor()
             if self.settings.get("auto_line_switch", False):
                 self._start_auto_line_timer()
-            if self.settings.get("realtime_detect", False):
-                self._start_realtime_monitor()
             self._update_active_line()
         else:
             self.svc_detail_label.setText(msg)
@@ -2846,6 +3262,7 @@ class MainWindow(QMainWindow):
             set_system_proxy(False)
             self._update_sys_proxy_label()
         stop_quick()
+        self._stop_realtime_monitor()
         self._stop_auto_line_timer()
         self.svc_detail_label.setText("服务已停止")
 
@@ -2966,13 +3383,19 @@ class MainWindow(QMainWindow):
         self._save_setting("auto_open_browser", checked)
         log.info(f"检测线路后打开浏览器: {'开启' if checked else '关闭'}")
 
-    def _on_realtime_detect_toggled(self, checked):
-        self._save_setting("realtime_detect", checked)
+    def _on_realtime_reconnect_toggled(self, checked):
+        self._save_setting("realtime_reconnect", checked)
         if checked and is_proxy_running():
             self._start_realtime_monitor()
         else:
             self._stop_realtime_monitor()
-        log.info(f"实时检测: {'开启' if checked else '关闭'}")
+
+    def _on_auto_line_switch_toggled(self, checked):
+        self._save_setting("auto_line_switch", checked)
+        if checked and is_proxy_running():
+            self._start_auto_line_timer()
+        else:
+            self._stop_auto_line_timer()
 
     def _start_realtime_monitor(self):
         if hasattr(self, '_realtime_timer') and self._realtime_timer:
@@ -3008,14 +3431,6 @@ class MainWindow(QMainWindow):
         self._save_setting("auto_start", checked)
         log.info(f"启动时自动开启服务: {'开启' if checked else '关闭'}")
 
-    def _on_auto_line_switch_toggled(self, checked):
-        self._save_setting("auto_line_switch", checked)
-        if checked and is_proxy_running():
-            self._start_auto_line_timer()
-        else:
-            self._stop_auto_line_timer()
-        log.info(f"自动线路切换: {'开启' if checked else '关闭'}")
-
     def _on_interval_changed(self, value):
         self._save_setting("auto_line_interval", value)
         if self.settings.get("auto_line_switch", False) and is_proxy_running():
@@ -3023,10 +3438,28 @@ class MainWindow(QMainWindow):
         log.info(f"自动检测间隔: {value}分钟")
 
     def _should_skip_config_update(self):
+        if self.settings.get("always_update_config", False):
+            return False
         saved_date = self.settings.get("last_config_update_date", "")
         if not saved_date:
             return False
         return saved_date == date.today().isoformat()
+
+    def _on_test_btn_clicked(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.requestInterruption()
+            self.worker.quit()
+            self.worker.wait(3000)
+            self.btn_test.setEnabled(True)
+            self.btn_test.setText("🔍 检测线路")
+            self.line_progress.setText("已取消")
+            self.line_progress.setStyleSheet(f"color: {COLOR_ORANGE};")
+            for name, info in self.line_rows.items():
+                if info["status"].text() in ("检测中...", "更新配置...", "未检测"):
+                    info["status"].setText("已取消")
+                    info["status"].setStyleSheet(f"color: {COLOR_ORANGE}; font-size: 9pt;")
+            return
+        self._on_test_lines()
 
     def _on_test_lines(self):
         if not self.quick_dir:
@@ -3038,8 +3471,8 @@ class MainWindow(QMainWindow):
         if self._should_skip_config_update():
             self._start_line_test()
             return
-        self.btn_test.setEnabled(False)
-        self.btn_test.setText("更新配置...")
+        self.btn_test.setEnabled(True)
+        self.btn_test.setText("⏹ 取消")
         for name, info in self.line_rows.items():
             info["status"].setText("更新配置...")
             info["status"].setStyleSheet(f"color: {COLOR_ORANGE}; font-size: 9pt;")
@@ -3050,8 +3483,8 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def _start_line_test(self):
-        self.btn_test.setEnabled(False)
-        self.btn_test.setText("检测中...")
+        self.btn_test.setEnabled(True)
+        self.btn_test.setText("⏹ 取消")
         for name, info in self.line_rows.items():
             info["status"].setText("检测中...")
             info["status"].setStyleSheet(f"color: {COLOR_ORANGE}; font-size: 9pt;")
@@ -3096,13 +3529,13 @@ class MainWindow(QMainWindow):
         try:
             if not ok:
                 self.line_progress.setText(msg if msg else "检测失败")
-                self.line_progress.setStyleSheet("color: #FF6B80;")
+                self.line_progress.setStyleSheet("font-size: 8pt; color: #FF6B80;")
                 return
 
             worker = self.worker
             if not worker or "results" not in worker.kwargs:
                 self.line_progress.setText("检测结果异常")
-                self.line_progress.setStyleSheet("color: #FF6B80;")
+                self.line_progress.setStyleSheet("font-size: 8pt; color: #FF6B80;")
                 return
 
             results = list(worker.kwargs["results"])
@@ -3129,18 +3562,18 @@ class MainWindow(QMainWindow):
                     self.line_rows[fastest[0]]["status"].setText(f"最快 ✓ (平均{fastest[1]:.2f}s)")
                     self.line_rows[fastest[0]]["status"].setStyleSheet(f"color: {COLOR_ORANGE}; font-weight: bold; font-size: 9pt;")
                 self.line_progress.setText(f"检测完成 - {len(valid)}条可用线路")
-                self.line_progress.setStyleSheet(f"color: {COLOR_GREEN};")
+                self.line_progress.setStyleSheet(f"font-size: 8pt; color: {COLOR_GREEN};")
                 if auto_switch and fastest[0] in self.line_rows:
                     self._pending_browser_open = self.switch_auto_browser.isChecked()
                     self._on_use_line(fastest[0])
             else:
                 self.line_progress.setText("检测完成 - 无可用线路")
-                self.line_progress.setStyleSheet("color: #FF6B80;")
+                self.line_progress.setStyleSheet("font-size: 8pt; color: #FF6B80;")
         except Exception as e:
             import traceback
             log.error(f"检测结果显示异常: {e}\n{traceback.format_exc()}")
             self.line_progress.setText(f"检测出错: {e}")
-            self.line_progress.setStyleSheet("color: #FF6B80;")
+            self.line_progress.setStyleSheet("font-size: 8pt; color: #FF6B80;")
 
     def _on_use_line(self, name):
         if not self.quick_dir:
@@ -3203,8 +3636,7 @@ class MainWindow(QMainWindow):
         if path:
             self._add_app_item(path)
             self.settings["custom_apps"] = [
-                self.app_list.item(i).data(Qt.ItemDataRole.UserRole)
-                for i in range(self.app_list.count())
+                self.app_combo.itemData(i) for i in range(self.app_combo.count())
             ]
             save_settings(self.settings)
             if is_proxy_running():
@@ -3215,21 +3647,20 @@ class MainWindow(QMainWindow):
                 self.custom_restart_hint.setVisible(True)
 
     def _on_remove_app(self):
-        current_item = self.app_list.currentItem()
-        if not current_item:
-            QMessageBox.information(self, "提示", "请先在列表中选择要删除的程序")
+        idx = self.app_combo.currentIndex()
+        if idx < 0:
+            QMessageBox.information(self, "提示", "请先选择要删除的程序")
             return
-        app_name = current_item.text()
+        app_name = self.app_combo.itemText(idx)
         reply = QMessageBox.question(
             self, "确认删除", f"确定要删除「{app_name}」吗？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
-            self.app_list.takeItem(self.app_list.row(current_item))
+            self.app_combo.removeItem(idx)
             self.settings["custom_apps"] = [
-                self.app_list.item(i).data(Qt.ItemDataRole.UserRole)
-                for i in range(self.app_list.count())
+                self.app_combo.itemData(i) for i in range(self.app_combo.count())
             ]
             save_settings(self.settings)
             if is_proxy_running():
@@ -4074,13 +4505,29 @@ class MainWindow(QMainWindow):
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
 
+                def _urlopen_with_proxy(req, timeout=10):
+                    if is_proxy_running():
+                        try:
+                            proxy_handler = urllib.request.ProxyHandler({
+                                'http': f'http://{PROXY_URL}',
+                                'https': f'http://{PROXY_URL}',
+                            })
+                            opener = urllib.request.build_opener(
+                                urllib.request.HTTPSHandler(context=ctx),
+                                proxy_handler,
+                            )
+                            return opener.open(req, timeout=timeout)
+                        except Exception:
+                            pass
+                    return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+
                 data = None
                 gitee_url = f"https://gitee.com/api/v5/repos/{GITEE_REPO}/commits?per_page=20"
                 if GITEE_TOKEN:
                     gitee_url += f"&access_token={GITEE_TOKEN}"
                 try:
                     req = urllib.request.Request(gitee_url, headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+                    with _urlopen_with_proxy(req, timeout=10) as resp:
                         data = json.loads(resp.read().decode())
                 except Exception:
                     pass
@@ -4091,7 +4538,7 @@ class MainWindow(QMainWindow):
                     if GITHUB_TOKEN:
                         headers["Authorization"] = f"token {GITHUB_TOKEN}"
                     req = urllib.request.Request(github_url, headers=headers)
-                    with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
+                    with _urlopen_with_proxy(req, timeout=8) as resp:
                         data = json.loads(resp.read().decode())
 
                 commits = []
@@ -4225,6 +4672,34 @@ class MainWindow(QMainWindow):
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
 
+            def _urlopen_with_proxy(req, timeout=6):
+                if is_proxy_running():
+                    try:
+                        proxy_handler = urllib.request.ProxyHandler({
+                            'http': f'http://{PROXY_URL}',
+                            'https': f'http://{PROXY_URL}',
+                        })
+                        opener = urllib.request.build_opener(
+                            urllib.request.HTTPSHandler(context=ctx),
+                            proxy_handler,
+                        )
+                        return opener.open(req, timeout=timeout)
+                    except Exception:
+                        pass
+                try:
+                    return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+                except Exception:
+                    pass
+                proxy_handler = urllib.request.ProxyHandler({
+                    'http': f'http://{PROXY_URL}',
+                    'https': f'http://{PROXY_URL}',
+                })
+                opener = urllib.request.build_opener(
+                    urllib.request.HTTPSHandler(context=ctx),
+                    proxy_handler,
+                )
+                return opener.open(req, timeout=timeout)
+
             result = [None, None]
 
             def try_gitee():
@@ -4233,7 +4708,7 @@ class MainWindow(QMainWindow):
                     if GITEE_TOKEN:
                         gitee_url += f"&access_token={GITEE_TOKEN}"
                     req = urllib.request.Request(gitee_url, headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req, timeout=6, context=ctx) as resp:
+                    with _urlopen_with_proxy(req, timeout=6) as resp:
                         raw = resp.read().decode()
                     api_data = json.loads(raw)
                     if isinstance(api_data, list):
@@ -4253,7 +4728,7 @@ class MainWindow(QMainWindow):
                     if GITHUB_TOKEN:
                         gh_headers["Authorization"] = f"token {GITHUB_TOKEN}"
                     req = urllib.request.Request(github_url, headers=gh_headers)
-                    with urllib.request.urlopen(req, timeout=6, context=ctx) as resp:
+                    with _urlopen_with_proxy(req, timeout=6) as resp:
                         raw = resp.read().decode()
                     api_data = json.loads(raw)
                     import base64
@@ -4263,7 +4738,7 @@ class MainWindow(QMainWindow):
                     try:
                         github_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/ver/version.json"
                         req = urllib.request.Request(github_url, headers={"User-Agent": "Mozilla/5.0"})
-                        with urllib.request.urlopen(req, timeout=6, context=ctx) as resp:
+                        with _urlopen_with_proxy(req, timeout=6) as resp:
                             result[1] = (json.loads(resp.read().decode()), "github")
                     except Exception:
                         result[1] = (None, None)
@@ -4285,7 +4760,7 @@ class MainWindow(QMainWindow):
             try:
                 data, source = _fetch_version_json()
                 if data is None:
-                    self._ver_info_text = "❌ 无法连接远程仓库"
+                    self._ver_info_text = "❌ 无法连接远程仓库，请检查网络或开启代理后重试"
                     self._version_data_ready.emit()
                     return
 
@@ -4439,7 +4914,24 @@ class MainWindow(QMainWindow):
             if not os.path.isfile(target_in_ver):
                 shutil.copy2(exe_path, target_in_ver)
 
-        entry_exe = os.path.join(dev_dir, "云集智能网联代理专家.exe")
+        tag = target_filename
+        for prefix in (f"{APP_NAME}-v", f"{APP_NAME}-"):
+            if tag.startswith(prefix):
+                tag = tag[len(prefix):]
+        if tag.endswith(".exe"):
+            tag = tag[:-4]
+
+        settings_path = os.path.join(dev_dir, "app", "launcher_settings.json")
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+        except Exception:
+            settings = {}
+        settings["current_app_version"] = tag
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+
+        stub_path = os.path.join(dev_dir, "云集智能网联代理专家.exe")
         my_pid = os.getpid()
 
         bat_path = os.path.join(dev_dir, "_switch_version.bat")
@@ -4447,8 +4939,7 @@ class MainWindow(QMainWindow):
             f.write("@echo off\n")
             f.write("chcp 65001 >nul 2>&1\n")
             f.write(f"set MY_PID={my_pid}\n")
-            f.write(f"set ENTRY_EXE={entry_exe}\n")
-            f.write(f"set TARGET_EXE={target_in_ver}\n")
+            f.write(f"set STUB_EXE={stub_path}\n")
             f.write("set MAX_WAIT=30\n")
             f.write("set WAITED=0\n")
             f.write(":wait_loop\n")
@@ -4463,12 +4954,11 @@ class MainWindow(QMainWindow):
             f.write("        goto wait_loop\n")
             f.write("    )\n")
             f.write(")\n")
-            f.write("if exist \"%ENTRY_EXE%\" del /f /q \"%ENTRY_EXE%\"\n")
-            f.write("mklink /H \"%ENTRY_EXE%\" \"%TARGET_EXE%\" >nul 2>&1\n")
-            f.write("if not exist \"%ENTRY_EXE%\" (\n")
-            f.write("    copy /y \"%TARGET_EXE%\" \"%ENTRY_EXE%\" >nul\n")
+            f.write("if exist \"%STUB_EXE%\" (\n")
+            f.write("    start \"\" \"%STUB_EXE%\"\n")
+            f.write(") else (\n")
+            f.write(f"    start \"\" \"{target_in_ver}\"\n")
             f.write(")\n")
-            f.write("start \"\" \"%ENTRY_EXE%\"\n")
             f.write("del /f /q \"%~f0\"\n")
 
         subprocess.Popen(
@@ -4487,51 +4977,382 @@ class MainWindow(QMainWindow):
             return
         self._on_download_version(self._latest_info)
 
-    def _on_update_config(self):
-        if not self.quick_dir:
+    def _get_kernel_cache_path(self):
+        return os.path.join(get_app_dir(), "kernel_versions_cache.json")
+
+    def _get_kernel_cache_last_check(self):
+        try:
+            with open(self._get_kernel_cache_path(), "r", encoding="utf-8") as f:
+                return json.load(f).get("last_check", "")
+        except Exception:
+            return ""
+
+    def _load_kernel_versions_cache(self):
+        try:
+            with open(self._get_kernel_cache_path(), "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            releases = cache.get("releases", [])
+            if releases and isinstance(releases, list):
+                self._kernel_releases = releases
+                self._kernel_current_ver = self._get_mihomo_version()
+                self._kernel_versions_ready.emit()
+        except Exception:
+            pass
+
+    def _on_check_kernel_btn(self):
+        if hasattr(self, '_kernel_ver_worker') and self._kernel_ver_worker and self._kernel_ver_worker.isRunning():
+            self._kernel_ver_worker.requestInterruption()
+            self._kernel_ver_worker.quit()
+            self._kernel_ver_worker.wait(3000)
+            self.btn_check_kernel.setText("🔄 检查更新")
+            self.kernel_status.setText("已取消")
+            self.kernel_status.setStyleSheet(f"color: {COLOR_ORANGE};")
             return
-        self.worker = ServiceWorker("update_config", quick_dir=self.quick_dir, current_line=self.current_line)
-        self.worker.progress.connect(lambda t: self.update_status.setText(t))
-        self.worker.finished.connect(self._on_update_config_finished)
-        self.worker.start()
-
-    def _on_update_config_finished(self, ok, msg):
-        self.update_status.setText(msg)
-        self.update_status.setStyleSheet(f"color: {COLOR_GREEN};" if ok else "color: #FF6B80;")
-        if ok:
-            self._save_setting("last_config_update_date", date.today().isoformat())
-
-    def _on_update_quick(self):
         if not self.quick_dir:
             QMessageBox.warning(self, "提示", "未找到代理内核目录")
             return
-        if hasattr(self, '_kernel_worker') and self._kernel_worker and self._kernel_worker.isRunning():
-            QMessageBox.information(self, "提示", "内核更新正在进行中")
+        self.btn_check_kernel.setText("⏹ 取消")
+        self.kernel_status.setText("正在检查内核版本...")
+        self.kernel_status.setStyleSheet(f"color: {COLOR_ORANGE};")
+        self._kernel_ver_worker = KernelVersionWorker(self.quick_dir)
+        self._kernel_ver_worker.progress.connect(lambda t: (
+            self.kernel_status.setText(t),
+            self.kernel_status.setStyleSheet(f"color: {COLOR_ORANGE};")
+        ))
+        self._kernel_ver_worker.finished.connect(self._on_kernel_versions_fetched)
+        self._kernel_ver_worker.start()
+
+    def _on_kernel_versions_fetched(self, releases, current_ver):
+        self.btn_check_kernel.setText("🔄 检查更新")
+        if not releases:
+            self.kernel_status.setText(current_ver if current_ver.startswith("获取") or current_ver.startswith("无法") else "获取版本列表失败")
+            self.kernel_status.setStyleSheet("color: #FF6B80;")
+            return
+        self._kernel_releases = releases
+        self._kernel_current_ver = current_ver
+        cache_path = os.path.join(get_app_dir(), "kernel_versions_cache.json")
+        try:
+            cache_data = {
+                "releases": releases,
+                "current_ver": current_ver,
+                "last_check": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            }
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(cache_data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        self._kernel_versions_ready.emit()
+
+    def _on_kernel_versions_ready(self):
+        releases = getattr(self, '_kernel_releases', [])
+        current_ver = getattr(self, '_kernel_current_ver', '')
+        if not releases:
+            self.kernel_status.setText("暂无可用版本")
+            self.kernel_status.setStyleSheet(f"color: {COLOR_DIM};")
+            return
+
+        local_kernels = self._list_local_kernels()
+        local_map = {k["tag"]: k for k in local_kernels}
+
+        stable_releases = [r for r in releases if not r.get("prerelease", False)]
+        latest_tag = stable_releases[0]["tag"] if stable_releases else (releases[0]["tag"] if releases else "")
+        is_latest = current_ver and latest_tag and current_ver == latest_tag.lstrip("v")
+
+        if current_ver:
+            self.kernel_current_label.setText(f"当前版本: v{current_ver}")
+            self.kernel_current_label.setStyleSheet(f"font-size: 9pt; color: {COLOR_GREEN}; font-weight: bold;")
+        else:
+            self.kernel_current_label.setText("当前版本: 未知")
+            self.kernel_current_label.setStyleSheet(f"font-size: 9pt; color: {COLOR_ORANGE}; font-weight: bold;")
+
+        if is_latest:
+            self.kernel_latest_label.setText("✅ 已是最新版本")
+            self.kernel_latest_label.setStyleSheet(f"font-size: 9pt; color: {COLOR_GREEN};")
+        elif latest_tag:
+            self.kernel_latest_label.setText(f"最新版本: {latest_tag}")
+            self.kernel_latest_label.setStyleSheet(f"font-size: 9pt; color: {COLOR_BLUE_LIGHT};")
+
+        last_check = self._get_kernel_cache_last_check()
+        check_info = f"共 {len(releases)} 个版本可用"
+        if last_check:
+            check_info += f"  |  上次检查: {last_check}"
+        self.kernel_status.setText(check_info)
+        self.kernel_status.setStyleSheet(f"color: {COLOR_DIM};")
+
+        while self._kernel_scroll_layout.count() > 1:
+            item = self._kernel_scroll_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        header_row = QFrame()
+        header_row.setStyleSheet("background-color: #1a1a1a; border: none; border-bottom: 1px solid #2a2a2a;")
+        header_layout = QHBoxLayout(header_row)
+        header_layout.setContentsMargins(10, 5, 10, 5)
+        header_layout.setSpacing(0)
+        for text, width, stretch in [("版本", 100, 0), ("发布日期", 90, 0), ("状态", 100, 0), ("操作", 140, 0)]:
+            lbl = QLabel(text)
+            if width > 0:
+                lbl.setFixedWidth(width)
+            lbl.setStyleSheet("font-size: 8pt; color: #FFFFFF; border: none; font-weight: bold;")
+            header_layout.addWidget(lbl, stretch=stretch)
+        self._kernel_scroll_layout.insertWidget(0, header_row)
+
+        sorted_releases = sorted(releases, key=lambda r: (r.get("prerelease", False), r.get("published_at", ""),))
+        for rel in sorted_releases:
+            tag = rel["tag"]
+            tag_num = tag.lstrip("v")
+            is_current = (current_ver == tag_num)
+            is_local = tag in local_map
+            has_asset = bool(rel.get("download_url"))
+            is_prerelease = rel.get("prerelease", False)
+
+            if is_current:
+                row_bg = "#1a4a2a"
+                border_color = "#2a6a3a"
+            elif is_prerelease:
+                row_bg = "#1a1a10"
+                border_color = "#2a2a1a"
+            elif is_local:
+                row_bg = "#161616"
+                border_color = "#222"
+            else:
+                row_bg = "#111"
+                border_color = "#1a1a1a"
+
+            card = QFrame()
+            card.setStyleSheet(
+                f"background-color: {row_bg}; border: 1px solid {border_color}; border-radius: 0px;"
+            )
+            card_layout = QHBoxLayout(card)
+            card_layout.setContentsMargins(10, 5, 10, 5)
+            card_layout.setSpacing(6)
+
+            ver_color = "#4CAF50" if is_current else (COLOR_TEXT if is_local else COLOR_DIM)
+            ver_label = QLabel(tag)
+            ver_label.setFixedWidth(100)
+            ver_font_size = "10pt" if is_current else "9pt"
+            ver_label.setStyleSheet(f"font-family: Consolas; font-size: {ver_font_size}; font-weight: bold; color: {ver_color}; border: none;")
+            card_layout.addWidget(ver_label)
+
+            date_label = QLabel(rel.get("published_at", ""))
+            date_label.setFixedWidth(90)
+            date_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_DIM}; border: none;")
+            card_layout.addWidget(date_label)
+
+            status_label = QLabel("")
+            status_label.setFixedWidth(100)
+            if is_current:
+                status_label.setText("● 当前版本")
+                status_label.setStyleSheet(f"font-size: 8pt; color: #4CAF50; border: none; font-weight: bold;")
+            elif is_prerelease and is_local:
+                size_text = f" {local_map[tag]['size_mb']}MB"
+                status_label.setText(f"🧪 预发布{size_text}")
+                status_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_ORANGE}; border: none;")
+            elif is_prerelease and has_asset:
+                status_label.setText("🧪 预发布")
+                status_label.setStyleSheet(f"font-size: 8pt; color: #888; border: none;")
+            elif is_prerelease:
+                status_label.setText("🧪 预发布")
+                status_label.setStyleSheet(f"font-size: 8pt; color: #666; border: none;")
+            elif is_local:
+                size_text = f" {local_map[tag]['size_mb']}MB"
+                status_label.setText(f"📦 已下载{size_text}")
+                status_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_ORANGE}; border: none;")
+            elif has_asset:
+                status_label.setText("🆕 可下载")
+                status_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_BLUE_LIGHT}; border: none;")
+            else:
+                status_label.setText("—")
+                status_label.setStyleSheet(f"font-size: 8pt; color: #555; border: none;")
+            card_layout.addWidget(status_label)
+
+            action_frame = QFrame()
+            action_frame.setFixedWidth(140)
+            action_frame.setStyleSheet(f"background-color: {row_bg}; border: none;")
+            action_layout = QHBoxLayout(action_frame)
+            action_layout.setContentsMargins(0, 0, 0, 0)
+            action_layout.setSpacing(4)
+
+            btn_style_blue = (
+                f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; border: none; border-radius: 3px; "
+                f"font-size: 8pt; font-weight: bold; padding: 2px 8px; }}"
+                f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
+            )
+            btn_style_red = (
+                f"QPushButton {{ background-color: {COLOR_RED}; color: #fff; border: none; border-radius: 3px; "
+                f"font-size: 8pt; font-weight: bold; padding: 2px 8px; }}"
+                f"QPushButton:hover {{ background-color: {COLOR_RED_LIGHT}; }}"
+            )
+            btn_style_green = (
+                f"QPushButton {{ background-color: {COLOR_GREEN}; color: #fff; border: none; border-radius: 3px; "
+                f"font-size: 8pt; font-weight: bold; padding: 2px 8px; }}"
+                f"QPushButton:hover {{ background-color: #5CBF72; }}"
+            )
+
+            if is_local and not is_current:
+                switch_btn = QPushButton("🔄 切换")
+                switch_btn.setFixedSize(60, 22)
+                switch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                switch_btn.setStyleSheet(btn_style_green)
+                kernel_path = local_map[tag]["path"]
+                switch_btn.clicked.connect(lambda checked, p=kernel_path, t=tag: self._on_switch_kernel(p, t))
+                action_layout.addWidget(switch_btn)
+
+            if not is_local and has_asset:
+                dl_btn = QPushButton("📥 下载")
+                dl_btn.setFixedSize(60, 22)
+                dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                dl_btn.setStyleSheet(btn_style_blue)
+                dl_btn.clicked.connect(lambda checked, r=rel: self._on_download_kernel(r))
+                action_layout.addWidget(dl_btn)
+
+            if is_local and not is_current:
+                del_btn = QPushButton("🗑")
+                del_btn.setFixedSize(26, 22)
+                del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                del_btn.setStyleSheet(btn_style_red)
+                kernel_path = local_map[tag]["path"]
+                del_btn.clicked.connect(lambda checked, p=kernel_path: self._on_delete_kernel(p))
+                action_layout.addWidget(del_btn)
+
+            action_layout.addStretch()
+            card_layout.addWidget(action_frame)
+
+            self._kernel_scroll_layout.insertWidget(self._kernel_scroll_layout.count() - 1, card)
+
+    def _on_download_kernel(self, release_info):
+        tag = release_info.get("tag", "")
+        download_url = release_info.get("download_url", "")
+        asset_name = release_info.get("asset_name", "")
+        if not download_url:
+            QMessageBox.warning(self, "提示", "该版本无可用下载链接")
+            return
+        if not self.quick_dir:
+            return
+        if hasattr(self, '_kernel_dl_worker') and self._kernel_dl_worker and self._kernel_dl_worker.isRunning():
+            QMessageBox.information(self, "提示", "已有下载任务进行中")
+            return
+        self.kernel_status.setText(f"正在下载 mihomo {tag}...")
+        self.kernel_status.setStyleSheet(f"color: {COLOR_ORANGE};")
+        self._kernel_dl_worker = KernelDownloadWorker(self.quick_dir, tag, download_url, asset_name)
+        self._kernel_dl_worker.progress.connect(lambda t: (
+            self.kernel_status.setText(t),
+            self.kernel_status.setStyleSheet(f"color: {COLOR_ORANGE};")
+        ))
+        self._kernel_dl_worker.finished.connect(self._on_kernel_download_finished)
+        self._kernel_dl_worker.start()
+
+    def _on_kernel_download_finished(self, ok, msg, path):
+        if ok:
+            self.kernel_status.setText(msg)
+            self.kernel_status.setStyleSheet(f"color: {COLOR_GREEN};")
+            if path and os.path.isfile(path):
+                reply = QMessageBox.question(
+                    self, "下载完成",
+                    f"{msg}\n\n是否立即切换到该版本？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    tag = ""
+                    m = re.search(r'mihomo_(v?[\d.]+)\.exe', os.path.basename(path))
+                    if m:
+                        tag = m.group(1)
+                        if not tag.startswith("v"):
+                            tag = "v" + tag
+                    self._on_switch_kernel(path, tag)
+            self._on_check_kernel_btn()
+        else:
+            self.kernel_status.setText(msg)
+            self.kernel_status.setStyleSheet("color: #FF6B80;")
+
+    def _on_switch_kernel(self, kernel_path, tag):
+        if not os.path.isfile(kernel_path):
+            QMessageBox.critical(self, "错误", f"内核文件不存在:\n{kernel_path}")
             return
         was_running = is_proxy_running()
         if was_running:
             stop_quick()
             time.sleep(0.5)
-        self.update_status.setText("正在检查内核更新...")
-        self.update_status.setStyleSheet(f"color: {COLOR_ORANGE};")
-        self._kernel_worker = KernelUpdateWorker(self.quick_dir)
-        self._kernel_worker.progress.connect(lambda t: (
-            self.update_status.setText(t),
-            self.update_status.setStyleSheet(f"color: {COLOR_ORANGE};")
-        ))
-        self._kernel_worker.finished.connect(lambda ok, msg: self._on_kernel_update_finished(ok, msg, was_running))
-        self._kernel_worker.start()
 
-    def _on_kernel_update_finished(self, ok, msg, was_running):
-        self.update_status.setText(msg)
-        self.update_status.setStyleSheet(f"color: {COLOR_GREEN};" if ok else "color: #FF6B80;")
-        if ok:
+        current_exe = os.path.join(self.quick_dir, "quick.exe")
+        backup_path = current_exe + ".bak"
+        tag_num = tag.lstrip("v")
+
+        try:
+            if os.path.isfile(backup_path):
+                os.remove(backup_path)
+            if os.path.isfile(current_exe):
+                os.rename(current_exe, backup_path)
+            shutil.copy2(kernel_path, current_exe)
+            try:
+                os.remove(backup_path)
+            except Exception:
+                pass
+            ver_file = os.path.join(self.quick_dir, "_kernel_version.txt")
+            try:
+                with open(ver_file, "w", encoding="utf-8") as f:
+                    f.write(tag_num)
+            except Exception:
+                pass
+            self.kernel_current_label.setText(f"当前版本: v{tag_num}")
+            self.kernel_current_label.setStyleSheet(f"font-size: 9pt; color: {COLOR_GREEN}; font-weight: bold;")
             self.svc_kernel_label.setText(f"内核: {self._get_quick_version() or '未知'}")
+            self.kernel_status.setText(f"已切换到 mihomo {tag}")
+            self.kernel_status.setStyleSheet(f"color: {COLOR_GREEN};")
             if was_running and self.settings.get("proxy_enabled", False):
                 self._on_start()
-        else:
-            if was_running and self.settings.get("proxy_enabled", False):
-                start_quick(self.quick_dir)
+            self._on_check_kernel_btn()
+        except PermissionError:
+            bat_path = current_exe + "_replace.bat"
+            new_exe_src = kernel_path
+            with open(bat_path, "w", encoding="gbk") as f:
+                f.write("@echo off\n")
+                f.write("chcp 65001 >nul 2>&1\n")
+                f.write("timeout /t 3 /nobreak >nul\n")
+                f.write(f'del /f /q "{current_exe}" 2>nul\n')
+                f.write(f'copy /y "{new_exe_src}" "{current_exe}" >nul\n')
+                f.write(f'if exist "{backup_path}" del /f /q "{backup_path}" 2>nul\n')
+                f.write('del /f /q "%~f0" 2>nul\n')
+            subprocess.Popen(
+                f'cmd /c "{bat_path}"',
+                shell=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                cwd=os.path.dirname(current_exe),
+            )
+            ver_file = os.path.join(self.quick_dir, "_kernel_version.txt")
+            try:
+                with open(ver_file, "w", encoding="utf-8") as f:
+                    f.write(tag_num)
+            except Exception:
+                pass
+            self.kernel_current_label.setText(f"当前版本: v{tag_num}")
+            self.kernel_current_label.setStyleSheet(f"font-size: 9pt; color: {COLOR_GREEN}; font-weight: bold;")
+            self.svc_kernel_label.setText(f"内核: mihomo v{tag_num}")
+            self.kernel_status.setText(f"已切换到 mihomo {tag}（将在后台完成替换）")
+            self.kernel_status.setStyleSheet(f"color: {COLOR_GREEN};")
+
+    def _on_delete_kernel(self, kernel_path):
+        tag = ""
+        m = re.search(r'mihomo_(v?[\d.]+)\.exe', os.path.basename(kernel_path))
+        if m:
+            tag = m.group(1)
+            if not tag.startswith("v"):
+                tag = "v" + tag
+        reply = QMessageBox.question(
+            self, "确认删除",
+            f"确定要删除 mihomo {tag} 内核文件吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                os.remove(kernel_path)
+                self.kernel_status.setText(f"已删除 mihomo {tag}")
+                self.kernel_status.setStyleSheet(f"color: {COLOR_DIM};")
+                self._on_check_kernel_btn()
+            except Exception as e:
+                self.kernel_status.setText(f"删除失败: {e}")
+                self.kernel_status.setStyleSheet("color: #FF6B80;")
 
     def closeEvent(self, event):
         self._stop_auto_line_timer()
