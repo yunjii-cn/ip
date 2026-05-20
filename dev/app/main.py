@@ -23,7 +23,7 @@ from datetime import datetime, date
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QStackedWidget, QFrame,
+    QLabel, QPushButton, QStackedWidget, QFrame, QDialog,
     QMessageBox, QListWidget,
     QListWidgetItem, QTextEdit, QComboBox, QSpinBox, QSizePolicy,
     QSplashScreen, QScrollArea, QLineEdit, QStyle
@@ -1993,6 +1993,7 @@ class MainWindow(QMainWindow):
         if saved_port:
             PROXY_PORT = int(saved_port)
         _update_proxy_url()
+        self._auto_download_kernel = False
         self.quick_dir = self._resolve_quick_dir()
         self.current_line = self.settings.get("current_line", "")
         self.line_results = {}
@@ -2028,6 +2029,9 @@ class MainWindow(QMainWindow):
         if self.settings.get("proxy_enabled", False) and self.settings.get("auto_start", True) and self.quick_dir:
             QTimer.singleShot(500, self._on_start)
 
+        if self._auto_download_kernel and self.quick_dir:
+            QTimer.singleShot(800, self._auto_download_latest_kernel)
+
         QTimer.singleShot(1000, self._startup_download_config)
 
         QTimer.singleShot(300, self._load_kernel_versions_cache)
@@ -2054,8 +2058,13 @@ class MainWindow(QMainWindow):
             log.info(f"自动检测到内核路径: {auto}")
             return auto
 
-        log.warning("未找到代理内核，请手动选择内核目录")
-        return None
+        quick_dir = os.path.join(get_app_dir(), "Quick")
+        os.makedirs(quick_dir, exist_ok=True)
+        self.settings["quick_dir_path"] = quick_dir
+        save_settings(self.settings)
+        log.info(f"首次运行，创建内核目录: {quick_dir}")
+        self._auto_download_kernel = True
+        return quick_dir
 
     def _set_icon(self):
         if hasattr(sys, '_MEIPASS'):
@@ -2912,15 +2921,18 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        tab_bar = QFrame()
-        tab_bar.setStyleSheet(f"background-color: #1e1e1e; border: none;")
-        tab_bar.setFixedHeight(48)
-        tab_layout = QHBoxLayout(tab_bar)
-        tab_layout.setContentsMargins(10, 7, 10, 7)
-        tab_layout.setSpacing(4)
+        header_frame = QFrame()
+        header_frame.setStyleSheet(f"background-color: #1a1a1a; border: none; border-bottom: 1px solid #2a2a2a;")
+        header_frame.setFixedHeight(84)
+        header_layout = QVBoxLayout(header_frame)
+        header_layout.setContentsMargins(12, 6, 12, 6)
+        header_layout.setSpacing(4)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(6)
 
         self._ver_tab_stable_btn = QPushButton("📦 EXE稳定版")
-        self._ver_tab_stable_btn.setFixedSize(140, 34)
+        self._ver_tab_stable_btn.setFixedSize(130, 30)
         self._ver_tab_stable_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._ver_tab_stable_btn.setStyleSheet(
             f"QPushButton {{ background-color: {COLOR_RED}; color: #FFFFFF; border: none; border-radius: 6px; "
@@ -2928,22 +2940,44 @@ class MainWindow(QMainWindow):
             f"QPushButton:hover {{ background-color: {COLOR_RED_LIGHT}; }}"
         )
         self._ver_tab_stable_btn.clicked.connect(lambda: self._switch_ver_tab("stable"))
-        tab_layout.addWidget(self._ver_tab_stable_btn)
+        row1.addWidget(self._ver_tab_stable_btn)
 
         self._ver_tab_git_btn = QPushButton("🔧 Git开发版")
-        self._ver_tab_git_btn.setFixedSize(140, 34)
+        self._ver_tab_git_btn.setFixedSize(130, 30)
         self._ver_tab_git_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._ver_tab_git_btn.setStyleSheet(
-            f"QPushButton {{ background-color: #444; color: #888; border: none; border-radius: 6px; "
+            f"QPushButton {{ background-color: #333; color: #888; border: none; border-radius: 6px; "
             f"font-size: 9pt; font-weight: bold; }}"
-            f"QPushButton:hover {{ background-color: {COLOR_RED}; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_RED}; color: #fff; }}"
         )
         self._ver_tab_git_btn.clicked.connect(lambda: self._switch_ver_tab("git"))
-        tab_layout.addWidget(self._ver_tab_git_btn)
+        row1.addWidget(self._ver_tab_git_btn)
 
-        tab_layout.addStretch()
+        row1.addStretch()
 
-        tab_layout.addWidget(_make_help_btn(
+        btn_about = QPushButton("关于")
+        btn_about.setFixedSize(50, 26)
+        btn_about.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_about.setStyleSheet(
+            f"QPushButton {{ background-color: transparent; color: #888; border: 1px solid #444; border-radius: 6px; "
+            f"font-size: 8pt; font-weight: bold; }}"
+            f"QPushButton:hover {{ background-color: #333; color: #fff; border-color: #666; }}"
+        )
+        btn_about.clicked.connect(self._show_about)
+        row1.addWidget(btn_about)
+
+        header_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+
+        self._ver_status_label = QLabel("")
+        self._ver_status_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_DIM}; border: none;")
+        row2.addWidget(self._ver_status_label)
+
+        row2.addStretch()
+
+        row2.addWidget(_make_help_btn(
             "软件版本管理",
             "软件更新说明",
             "【EXE稳定版】\n"
@@ -2960,12 +2994,19 @@ class MainWindow(QMainWindow):
             "下载完成后可选择立即切换。"
         ))
 
-        self._ver_status_label = QLabel("")
-        self._ver_status_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_DIM}; border: none;")
-        tab_layout.addWidget(self._ver_status_label)
+        self._ver_expand_btn = QPushButton("📋 收起详情")
+        self._ver_expand_btn.setFixedSize(96, 26)
+        self._ver_expand_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._ver_expand_btn.setStyleSheet(
+            f"QPushButton {{ background-color: #333; color: #ccc; border: 1px solid #444; border-radius: 6px; "
+            f"font-size: 8pt; font-weight: bold; }}"
+            f"QPushButton:hover {{ background-color: #444; color: #fff; border-color: #555; }}"
+        )
+        self._ver_expand_btn.clicked.connect(self._toggle_expand_all)
+        row2.addWidget(self._ver_expand_btn)
 
         btn_check_remote = QPushButton("🔄 检查更新")
-        btn_check_remote.setFixedSize(100, 30)
+        btn_check_remote.setFixedSize(96, 26)
         btn_check_remote.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_check_remote.setStyleSheet(
             f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; border: none; border-radius: 6px; "
@@ -2973,20 +3014,11 @@ class MainWindow(QMainWindow):
             f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
         )
         btn_check_remote.clicked.connect(self._check_remote_versions)
-        tab_layout.addWidget(btn_check_remote)
+        row2.addWidget(btn_check_remote)
 
-        self._ver_expand_btn = QPushButton("📋 收起详情")
-        self._ver_expand_btn.setFixedSize(100, 30)
-        self._ver_expand_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._ver_expand_btn.setStyleSheet(
-            f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; border: none; border-radius: 6px; "
-            f"font-size: 8pt; font-weight: bold; }}"
-            f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
-        )
-        self._ver_expand_btn.clicked.connect(self._toggle_expand_all)
-        tab_layout.addWidget(self._ver_expand_btn)
+        header_layout.addLayout(row2)
 
-        layout.addWidget(tab_bar)
+        layout.addWidget(header_frame)
 
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
@@ -2998,8 +3030,8 @@ class MainWindow(QMainWindow):
         )
         self._ver_scroll_content = QWidget()
         self._ver_scroll_layout = QVBoxLayout(self._ver_scroll_content)
-        self._ver_scroll_layout.setContentsMargins(10, 6, 10, 6)
-        self._ver_scroll_layout.setSpacing(4)
+        self._ver_scroll_layout.setContentsMargins(12, 8, 12, 8)
+        self._ver_scroll_layout.setSpacing(6)
         self._ver_scroll_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         scroll_area.setWidget(self._ver_scroll_content)
         layout.addWidget(scroll_area, stretch=1)
@@ -3911,9 +3943,9 @@ class MainWindow(QMainWindow):
             f"QPushButton:hover {{ background-color: {COLOR_RED_LIGHT}; }}"
         )
         inactive_style = (
-            f"QPushButton {{ background-color: #444; color: #888; border: none; border-radius: 6px; "
+            f"QPushButton {{ background-color: #333; color: #888; border: none; border-radius: 6px; "
             f"font-size: 9pt; font-weight: bold; }}"
-            f"QPushButton:hover {{ background-color: {COLOR_RED}; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_RED}; color: #fff; }}"
         )
         if tab == "stable":
             self._ver_tab_stable_btn.setStyleSheet(active_style)
@@ -3940,22 +3972,83 @@ class MainWindow(QMainWindow):
         else:
             self._render_git_tab()
 
+    def _show_about(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("关于")
+        dlg.setFixedSize(420, 380)
+        dlg.setStyleSheet(f"background-color: {COLOR_BG}; color: {COLOR_TEXT};")
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(10)
+
+        title = QLabel("云集智能网联代理专家")
+        title.setStyleSheet(f"font-size: 16pt; font-weight: bold; color: {COLOR_RED}; border: none;")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        ver_label = QLabel(f"版本 {VERSION}")
+        ver_label.setStyleSheet(f"font-size: 10pt; color: {COLOR_DIM}; border: none;")
+        ver_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(ver_label)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("background-color: #333; border: none; max-height: 1px;")
+        layout.addWidget(sep)
+
+        info = QLabel(
+            "基于 Clash 内核的网络代理管理工具\n\n"
+            "• 一键开启/关闭系统代理\n"
+            "• 多线路自动检测与切换\n"
+            "• 全局代理 / 指定浏览器代理\n"
+            "• 软件内版本更新与切换\n\n"
+            "开源协议: GPL-3.0\n"
+            "版权所有 © 2026 云集智能 (yunjii)"
+        )
+        info.setStyleSheet(f"font-size: 9pt; color: {COLOR_TEXT}; border: none; line-height: 1.6;")
+        layout.addWidget(info)
+
+        link = QLabel('<a href="https://github.com/yunjii-cn/ip" style="color: #4a9eff;">github.com/yunjii-cn/ip</a>')
+        link.setStyleSheet("font-size: 9pt; border: none;")
+        link.setOpenExternalLinks(True)
+        link.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(link)
+
+        layout.addStretch()
+
+        btn_close = QPushButton("确定")
+        btn_close.setFixedSize(80, 32)
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.setStyleSheet(
+            f"QPushButton {{ background-color: {COLOR_RED}; color: #fff; border: none; border-radius: 6px; "
+            f"font-size: 9pt; font-weight: bold; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_RED_LIGHT}; }}"
+        )
+        btn_close.clicked.connect(dlg.accept)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_row.addWidget(btn_close)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        dlg.exec()
+
     def _toggle_expand_all(self):
         self._ver_expanded = not self._ver_expanded
         if self._ver_expand_btn is not None:
             if self._ver_expanded:
                 self._ver_expand_btn.setText("📋 收起详情")
                 self._ver_expand_btn.setStyleSheet(
-                    f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; border: none; border-radius: 6px; "
+                    f"QPushButton {{ background-color: #333; color: #ccc; border: 1px solid #444; border-radius: 6px; "
                     f"font-size: 8pt; font-weight: bold; }}"
-                    f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
+                    f"QPushButton:hover {{ background-color: #444; color: #fff; border-color: #555; }}"
                 )
             else:
                 self._ver_expand_btn.setText("📋 展开详情")
                 self._ver_expand_btn.setStyleSheet(
-                    f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; border: none; border-radius: 6px; "
+                    f"QPushButton {{ background-color: #333; color: #ccc; border: 1px solid #444; border-radius: 6px; "
                     f"font-size: 8pt; font-weight: bold; }}"
-                    f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
+                    f"QPushButton:hover {{ background-color: #444; color: #fff; border-color: #555; }}"
                 )
         self._render_active_tab()
 
@@ -3963,9 +4056,9 @@ class MainWindow(QMainWindow):
         current_v = next((v for v in self._ver_stable_data if v["version"] == self._ver_current_version), None)
 
         info_frame = QFrame()
-        info_frame.setStyleSheet(f"background-color: #1a4a2a; border: 1px solid #2a6a3a; border-radius: 6px;")
+        info_frame.setStyleSheet(f"background-color: #1a4a2a; border: 1px solid #2a6a3a; border-radius: 8px;")
         info_layout = QVBoxLayout(info_frame)
-        info_layout.setContentsMargins(12, 8, 12, 8)
+        info_layout.setContentsMargins(14, 10, 14, 10)
         info_layout.setSpacing(4)
 
         info_row = QHBoxLayout()
@@ -3978,10 +4071,10 @@ class MainWindow(QMainWindow):
         info_row.addWidget(info_label, stretch=1)
 
         self._ver_info_expand_btn = QPushButton("▶ 详情")
-        self._ver_info_expand_btn.setFixedSize(60, 22)
+        self._ver_info_expand_btn.setFixedSize(64, 24)
         self._ver_info_expand_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._ver_info_expand_btn.setStyleSheet(
-            f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; border: none; border-radius: 3px; "
+            f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; border: none; border-radius: 4px; "
             f"font-size: 8pt; font-weight: bold; }}"
             f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
         )
@@ -3997,7 +4090,7 @@ class MainWindow(QMainWindow):
                     desc_text += f"等{len(changes)}项"
                 desc_label = QLabel(desc_text)
                 desc_label.setWordWrap(True)
-                desc_label.setStyleSheet(f"font-size: 8pt; color: #EEEEEE; border: none;")
+                desc_label.setStyleSheet(f"font-size: 9pt; color: #ccc; border: none;")
                 info_layout.addWidget(desc_label)
 
             meta_parts = []
@@ -4009,7 +4102,7 @@ class MainWindow(QMainWindow):
                 meta_parts.append(f"🔗 {git_commit[:8]}")
             if meta_parts:
                 meta_label = QLabel("  ".join(meta_parts))
-                meta_label.setStyleSheet(f"font-family: Consolas; font-size: 8pt; color: #EEEEEE; border: none;")
+                meta_label.setStyleSheet(f"font-family: Consolas; font-size: 8pt; color: #aaa; border: none;")
                 info_layout.addWidget(meta_label)
         else:
             local_versions = self._get_local_version_history()
@@ -4022,7 +4115,7 @@ class MainWindow(QMainWindow):
                         desc_text += f"等{len(changes)}项"
                     desc_label = QLabel(desc_text)
                     desc_label.setWordWrap(True)
-                    desc_label.setStyleSheet(f"font-size: 8pt; color: #EEEEEE; border: none;")
+                    desc_label.setStyleSheet(f"font-size: 9pt; color: #ccc; border: none;")
                     info_layout.addWidget(desc_label)
 
                 meta_parts = []
@@ -4034,7 +4127,7 @@ class MainWindow(QMainWindow):
                     meta_parts.append(f"🔗 {git_commit[:8]}")
                 if meta_parts:
                     meta_label = QLabel("  ".join(meta_parts))
-                    meta_label.setStyleSheet(f"font-family: Consolas; font-size: 8pt; color: #EEEEEE; border: none;")
+                    meta_label.setStyleSheet(f"font-family: Consolas; font-size: 8pt; color: #aaa; border: none;")
                     info_layout.addWidget(meta_label)
 
         self._ver_info_detail_frame = None
@@ -4059,33 +4152,33 @@ class MainWindow(QMainWindow):
             return
 
         detail = QFrame()
-        detail.setStyleSheet("background-color: #1a4a2a; border: 1px solid #2a6a3a; border-radius: 4px;")
+        detail.setStyleSheet("background-color: #1a4a2a; border: 1px solid #2a6a3a; border-radius: 8px;")
         detail_layout = QVBoxLayout(detail)
-        detail_layout.setContentsMargins(12, 6, 12, 6)
-        detail_layout.setSpacing(2)
+        detail_layout.setContentsMargins(14, 8, 14, 8)
+        detail_layout.setSpacing(3)
 
         changes = current_v.get("changes", [])
         if changes:
             for ch in changes:
                 lbl = QLabel(f"· {ch}")
                 lbl.setWordWrap(True)
-                lbl.setStyleSheet(f"font-size: 8pt; color: #EEEEEE; border: none;")
+                lbl.setStyleSheet(f"font-size: 9pt; color: #ccc; border: none;")
                 detail_layout.addWidget(lbl)
         else:
             lbl = QLabel("暂无修改记录")
-            lbl.setStyleSheet(f"font-size: 8pt; color: #EEEEEE; border: none;")
+            lbl.setStyleSheet(f"font-size: 9pt; color: {COLOR_DIM}; border: none;")
             detail_layout.addWidget(lbl)
 
         git_commit = current_v.get("git_commit", "")
         if git_commit:
             lbl = QLabel(f"🔗 commit: {git_commit}")
-            lbl.setStyleSheet(f"font-family: Consolas; font-size: 8pt; color: #EEEEEE; border: none;")
+            lbl.setStyleSheet(f"font-family: Consolas; font-size: 9pt; color: #aaa; border: none;")
             detail_layout.addWidget(lbl)
 
         build_time = current_v.get("build_time", current_v.get("date", ""))
         if build_time:
             lbl = QLabel(f"🕐 构建时间: {build_time}")
-            lbl.setStyleSheet(f"font-size: 8pt; color: #EEEEEE; border: none;")
+            lbl.setStyleSheet(f"font-size: 9pt; color: #aaa; border: none;")
             detail_layout.addWidget(lbl)
 
         self._ver_info_detail_frame = detail
@@ -4096,7 +4189,7 @@ class MainWindow(QMainWindow):
 
     def _render_git_tab(self):
         git_header = QFrame()
-        git_header.setStyleSheet(f"background-color: {COLOR_BG}; border: none;")
+        git_header.setStyleSheet(f"background-color: transparent; border: none;")
         git_header_layout = QHBoxLayout(git_header)
         git_header_layout.setContentsMargins(4, 6, 4, 2)
         git_title = QLabel("🔧 远程仓库开发动态")
@@ -4107,9 +4200,9 @@ class MainWindow(QMainWindow):
         refresh_btn.setFixedSize(60, 24)
         refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         refresh_btn.setStyleSheet(
-            f"QPushButton {{ background-color: #2a2a2a; color: #EEEEEE; border: none; border-radius: 4px; "
+            f"QPushButton {{ background-color: #333; color: #ccc; border: 1px solid #444; border-radius: 4px; "
             f"font-size: 9pt; }}"
-            f"QPushButton:hover {{ background-color: #3a3a3a; }}"
+            f"QPushButton:hover {{ background-color: #444; color: #fff; border-color: #555; }}"
         )
         refresh_btn.clicked.connect(self._refresh_git_history)
         git_header_layout.addWidget(refresh_btn)
@@ -4130,34 +4223,34 @@ class MainWindow(QMainWindow):
             detail_widget.deleteLater()
             toggle_btn = card.findChild(QPushButton, "_toggle_btn")
             if toggle_btn:
-                toggle_btn.setText("▶")
+                toggle_btn.setText("详情")
             return
 
-        card_bg = card.property("card_bg") or "#161616"
+        card_bg = card.property("card_bg") or "#1a1a1a"
         detail = QFrame()
         detail.setObjectName("_detail")
-        detail.setStyleSheet(f"background-color: {card_bg}; border: none;")
+        detail.setStyleSheet(f"background-color: transparent; border: none;")
         detail_layout = QVBoxLayout(detail)
         left_margin = 140 if card_type == "stable" else 10
-        detail_layout.setContentsMargins(left_margin, 0, 10, 6)
-        detail_layout.setSpacing(2)
+        detail_layout.setContentsMargins(left_margin, 0, 12, 8)
+        detail_layout.setSpacing(3)
 
         if card_type == "stable":
             git_commit = data.get("git_commit", "")
             if git_commit:
                 lbl = QLabel(f"🔗 commit: {git_commit}")
-                lbl.setStyleSheet(f"font-family: Consolas; font-size: 9pt; color: #EEEEEE; border: none;")
+                lbl.setStyleSheet(f"font-family: Consolas; font-size: 9pt; color: #aaa; border: none;")
                 detail_layout.addWidget(lbl)
             changes = data.get("changes", [])
             if changes:
                 for ch in changes:
                     lbl = QLabel(f"· {ch}")
                     lbl.setWordWrap(True)
-                    lbl.setStyleSheet(f"font-size: 8pt; color: #EEEEEE; border: none;")
+                    lbl.setStyleSheet(f"font-size: 9pt; color: #bbb; border: none;")
                     detail_layout.addWidget(lbl)
             else:
                 lbl = QLabel("暂无修改记录")
-                lbl.setStyleSheet(f"font-size: 8pt; color: #EEEEEE; border: none;")
+                lbl.setStyleSheet(f"font-size: 9pt; color: {COLOR_DIM}; border: none;")
                 detail_layout.addWidget(lbl)
         else:
             message = data.get("message", "")
@@ -4167,12 +4260,12 @@ class MainWindow(QMainWindow):
                 if line:
                     lbl = QLabel(f"· {line}")
                     lbl.setWordWrap(True)
-                    lbl.setStyleSheet(f"font-size: 8pt; color: #EEEEEE; border: none;")
+                    lbl.setStyleSheet(f"font-size: 9pt; color: #bbb; border: none;")
                     detail_layout.addWidget(lbl)
             author = data.get("author", "")
             if author:
                 lbl2 = QLabel(f"👤 {author}")
-                lbl2.setStyleSheet(f"font-size: 9pt; color: #EEEEEE; border: none;")
+                lbl2.setStyleSheet(f"font-size: 9pt; color: #aaa; border: none;")
                 detail_layout.addWidget(lbl2)
 
         card_layout = card.layout()
@@ -4180,7 +4273,7 @@ class MainWindow(QMainWindow):
 
         toggle_btn = card.findChild(QPushButton, "_toggle_btn")
         if toggle_btn:
-            toggle_btn.setText("▼")
+            toggle_btn.setText("收起")
 
     def _render_stable_versions(self, all_versions, current_version):
         if not all_versions:
@@ -4193,16 +4286,16 @@ class MainWindow(QMainWindow):
         expanded = self._ver_expanded
 
         header_row = QFrame()
-        header_row.setStyleSheet("background-color: #1a1a1a; border: none; border-bottom: 1px solid #2a2a2a;")
+        header_row.setStyleSheet("background-color: transparent; border: none; border-bottom: 1px solid #333;")
         header_layout = QHBoxLayout(header_row)
-        header_layout.setContentsMargins(10, 5, 10, 5)
+        header_layout.setContentsMargins(12, 4, 12, 4)
         header_layout.setSpacing(0)
 
-        for text, width, stretch in [("版本", 130, 0), ("描述", 0, 1), ("状态", 100, 0), ("操作", 120, 0)]:
+        for text, width, stretch in [("版本", 130, 0), ("描述", 0, 1), ("状态", 100, 0), ("操作", 130, 0)]:
             lbl = QLabel(text)
             if width > 0:
                 lbl.setFixedWidth(width)
-            lbl.setStyleSheet("font-size: 8pt; color: #FFFFFF; border: none; font-weight: bold;")
+            lbl.setStyleSheet("font-size: 8pt; color: #666; border: none; font-weight: bold;")
             header_layout.addWidget(lbl, stretch=stretch)
 
         self._ver_scroll_layout.addWidget(header_row)
@@ -4232,29 +4325,29 @@ class MainWindow(QMainWindow):
                 row_bg = "#1a4a2a"
                 border_color = "#2a6a3a"
             elif is_remote_new:
-                row_bg = "#161620"
-                border_color = "#1f3a4f"
+                row_bg = "#141428"
+                border_color = "#1f3a5f"
             elif is_available:
-                row_bg = "#161616"
-                border_color = "#222"
+                row_bg = "#1a1a1a"
+                border_color = "#2d2d2d"
             else:
-                row_bg = "#111"
-                border_color = "#1a1a1a"
+                row_bg = "#141414"
+                border_color = "#222"
 
             card = QFrame()
             card.setProperty("card_bg", row_bg)
             card.setStyleSheet(
-                f"background-color: {row_bg}; border: 1px solid {border_color}; border-radius: 0px;"
+                f"background-color: {row_bg}; border: 1px solid {border_color}; border-radius: 8px;"
             )
             card_layout = QVBoxLayout(card)
             card_layout.setContentsMargins(0, 0, 0, 0)
             card_layout.setSpacing(0)
 
             row = QFrame()
-            row.setStyleSheet(f"background-color: {row_bg}; border: none;")
+            row.setStyleSheet(f"background-color: transparent; border: none;")
             row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(10, 5, 10, 5)
-            row_layout.setSpacing(6)
+            row_layout.setContentsMargins(12, 8, 12, 8)
+            row_layout.setSpacing(8)
 
             ver_color = "#4CAF50" if is_current else ("#42A5F5" if is_remote_new else (COLOR_TEXT if is_available else COLOR_DIM))
             ver_label = QLabel(f"v{ver}")
@@ -4276,8 +4369,8 @@ class MainWindow(QMainWindow):
 
             desc_label = QLabel(desc_text if desc_text else "暂无描述")
             desc_label.setWordWrap(True)
-            desc_color = "#EEEEEE"
-            desc_label.setStyleSheet(f"font-size: 8pt; color: {desc_color}; border: none;")
+            desc_color = "#ccc" if desc_text else COLOR_DIM
+            desc_label.setStyleSheet(f"font-size: 9pt; color: {desc_color}; border: none;")
             row_layout.addWidget(desc_label, stretch=1)
 
             status_label = QLabel("")
@@ -4294,31 +4387,31 @@ class MainWindow(QMainWindow):
                 status_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_ORANGE}; border: none;")
             else:
                 status_label.setText("—")
-                status_label.setStyleSheet(f"font-size: 8pt; color: #EEEEEE; border: none;")
+                status_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_DIM}; border: none;")
             row_layout.addWidget(status_label)
 
             action_frame = QFrame()
-            action_frame.setFixedWidth(120)
-            action_frame.setStyleSheet(f"background-color: {row_bg}; border: none;")
+            action_frame.setFixedWidth(130)
+            action_frame.setStyleSheet(f"background-color: transparent; border: none;")
             action_layout = QHBoxLayout(action_frame)
             action_layout.setContentsMargins(0, 0, 0, 0)
             action_layout.setSpacing(4)
 
             btn_style_blue = (
-                f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; border: none; border-radius: 3px; "
-                f"font-size: 8pt; font-weight: bold; padding: 2px 8px; }}"
+                f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; border: none; border-radius: 4px; "
+                f"font-size: 8pt; font-weight: bold; padding: 3px 10px; }}"
                 f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
             )
 
             btn_style_red = (
-                f"QPushButton {{ background-color: {COLOR_RED}; color: #fff; border: none; border-radius: 3px; "
-                f"font-size: 8pt; font-weight: bold; padding: 2px 8px; }}"
+                f"QPushButton {{ background-color: {COLOR_RED}; color: #fff; border: none; border-radius: 4px; "
+                f"font-size: 8pt; font-weight: bold; padding: 3px 10px; }}"
                 f"QPushButton:hover {{ background-color: {COLOR_RED_LIGHT}; }}"
             )
 
             if is_available and exe_info and not is_current:
                 switch_btn = QPushButton("🔄 切换")
-                switch_btn.setFixedSize(60, 22)
+                switch_btn.setFixedSize(64, 24)
                 switch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 switch_btn.setStyleSheet(btn_style_red)
                 exe_path = exe_info["path"]
@@ -4327,7 +4420,7 @@ class MainWindow(QMainWindow):
                 action_layout.addWidget(switch_btn)
             elif is_remote_new:
                 dl_btn = QPushButton("📥 下载")
-                dl_btn.setFixedSize(60, 22)
+                dl_btn.setFixedSize(64, 24)
                 dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 dl_btn.setStyleSheet(btn_style_blue)
                 rinfo = v.get("remote_info")
@@ -4336,15 +4429,15 @@ class MainWindow(QMainWindow):
 
             has_detail = bool(changes) or bool(v.get("git_commit", ""))
             if has_detail:
-                toggle_text = "▼" if expanded else "▶"
+                toggle_text = "收起" if expanded else "详情"
                 toggle_btn = QPushButton(toggle_text)
                 toggle_btn.setObjectName("_toggle_btn")
-                toggle_btn.setFixedSize(24, 22)
+                toggle_btn.setFixedSize(40, 24)
                 toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 toggle_btn.setStyleSheet(
-                    f"QPushButton {{ background-color: {row_bg}; color: #EEEEEE; border: none; border-radius: 3px; "
+                    f"QPushButton {{ background-color: transparent; color: #999; border: 1px solid #444; border-radius: 4px; "
                     f"font-size: 8pt; }}"
-                    f"QPushButton:hover {{ background-color: #2a2a2a; }}"
+                    f"QPushButton:hover {{ background-color: #2a2a2a; color: #fff; border-color: #666; }}"
                 )
                 v_data = v
                 toggle_btn.clicked.connect(lambda checked, c=card, d=v_data: self._toggle_card_detail(c, d, "stable"))
@@ -4358,26 +4451,26 @@ class MainWindow(QMainWindow):
             if expanded and has_detail:
                 detail = QFrame()
                 detail.setObjectName("_detail")
-                detail.setStyleSheet(f"background-color: {row_bg}; border: none;")
+                detail.setStyleSheet(f"background-color: transparent; border: none;")
                 detail_layout = QVBoxLayout(detail)
-                detail_layout.setContentsMargins(140, 0, 10, 6)
-                detail_layout.setSpacing(2)
+                detail_layout.setContentsMargins(140, 0, 12, 8)
+                detail_layout.setSpacing(3)
 
                 git_commit = v.get("git_commit", "")
                 if git_commit:
                     lbl = QLabel(f"🔗 commit: {git_commit}")
-                    lbl.setStyleSheet(f"font-family: Consolas; font-size: 9pt; color: #EEEEEE; border: none;")
+                    lbl.setStyleSheet(f"font-family: Consolas; font-size: 9pt; color: #aaa; border: none;")
                     detail_layout.addWidget(lbl)
 
                 if changes:
                     for ch in changes:
                         lbl = QLabel(f"· {ch}")
                         lbl.setWordWrap(True)
-                        lbl.setStyleSheet(f"font-size: 8pt; color: #EEEEEE; border: none;")
+                        lbl.setStyleSheet(f"font-size: 9pt; color: #bbb; border: none;")
                         detail_layout.addWidget(lbl)
                 else:
                     lbl = QLabel("暂无修改记录")
-                    lbl.setStyleSheet(f"font-size: 8pt; color: #EEEEEE; border: none;")
+                    lbl.setStyleSheet(f"font-size: 9pt; color: {COLOR_DIM}; border: none;")
                     detail_layout.addWidget(lbl)
 
                 card_layout.addWidget(detail)
@@ -4397,16 +4490,16 @@ class MainWindow(QMainWindow):
         exe_versions = {e["version"]: e for e in stable_exes}
 
         header_row = QFrame()
-        header_row.setStyleSheet("background-color: #1a1a1a; border: none; border-bottom: 1px solid #2a2a2a;")
+        header_row.setStyleSheet("background-color: transparent; border: none; border-bottom: 1px solid #333;")
         header_layout = QHBoxLayout(header_row)
-        header_layout.setContentsMargins(10, 5, 10, 5)
+        header_layout.setContentsMargins(12, 4, 12, 4)
         header_layout.setSpacing(0)
 
-        for text, width, stretch in [("版本", 130, 0), ("描述", 0, 1), ("状态", 100, 0), ("操作", 120, 0)]:
+        for text, width, stretch in [("版本", 130, 0), ("描述", 0, 1), ("状态", 100, 0), ("操作", 130, 0)]:
             lbl = QLabel(text)
             if width > 0:
                 lbl.setFixedWidth(width)
-            lbl.setStyleSheet("font-size: 8pt; color: #FFFFFF; border: none; font-weight: bold;")
+            lbl.setStyleSheet("font-size: 8pt; color: #666; border: none; font-weight: bold;")
             header_layout.addWidget(lbl, stretch=stretch)
 
         self._ver_scroll_layout.addWidget(header_row)
@@ -4428,23 +4521,23 @@ class MainWindow(QMainWindow):
                     matched_exe = exe
                     break
 
-            row_bg = "#161616"
-            border_color = "#2a2a2a"
+            row_bg = "#1a1a1a"
+            border_color = "#2d2d2d"
 
             card = QFrame()
             card.setProperty("card_bg", row_bg)
             card.setStyleSheet(
-                f"background-color: {row_bg}; border: 1px solid {border_color}; border-radius: 0px;"
+                f"background-color: {row_bg}; border: 1px solid {border_color}; border-radius: 8px;"
             )
             card_layout = QVBoxLayout(card)
             card_layout.setContentsMargins(0, 0, 0, 0)
             card_layout.setSpacing(0)
 
             row = QFrame()
-            row.setStyleSheet(f"background-color: {row_bg}; border: none;")
+            row.setStyleSheet(f"background-color: transparent; border: none;")
             row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(10, 5, 10, 5)
-            row_layout.setSpacing(6)
+            row_layout.setContentsMargins(12, 8, 12, 8)
+            row_layout.setSpacing(8)
 
             ver_label = QLabel(sha)
             ver_label.setFixedWidth(130)
@@ -4457,42 +4550,42 @@ class MainWindow(QMainWindow):
 
             desc_label = QLabel(desc_text if desc_text else "暂无描述")
             desc_label.setWordWrap(True)
-            desc_color = "#EEEEEE"
-            desc_label.setStyleSheet(f"font-size: 8pt; color: {desc_color}; border: none;")
+            desc_color = "#ccc" if desc_text else COLOR_DIM
+            desc_label.setStyleSheet(f"font-size: 9pt; color: {desc_color}; border: none;")
             row_layout.addWidget(desc_label, stretch=1)
 
             status_label = QLabel("")
             status_label.setFixedWidth(100)
             if date_str:
                 status_label.setText(f"📅 {date_str}")
-                status_label.setStyleSheet(f"font-size: 8pt; color: #EEEEEE; border: none;")
+                status_label.setStyleSheet(f"font-size: 8pt; color: #aaa; border: none;")
             else:
                 status_label.setText("—")
-                status_label.setStyleSheet(f"font-size: 8pt; color: #EEEEEE; border: none;")
+                status_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_DIM}; border: none;")
             row_layout.addWidget(status_label)
 
             action_frame = QFrame()
-            action_frame.setFixedWidth(120)
-            action_frame.setStyleSheet(f"background-color: {row_bg}; border: none;")
+            action_frame.setFixedWidth(130)
+            action_frame.setStyleSheet(f"background-color: transparent; border: none;")
             action_layout = QHBoxLayout(action_frame)
             action_layout.setContentsMargins(0, 0, 0, 0)
             action_layout.setSpacing(4)
 
             btn_style_blue = (
-                f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; border: none; border-radius: 3px; "
-                f"font-size: 8pt; font-weight: bold; padding: 2px 8px; }}"
+                f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; border: none; border-radius: 4px; "
+                f"font-size: 8pt; font-weight: bold; padding: 3px 10px; }}"
                 f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
             )
 
             btn_style_red = (
-                f"QPushButton {{ background-color: {COLOR_RED}; color: #fff; border: none; border-radius: 3px; "
-                f"font-size: 8pt; font-weight: bold; padding: 2px 8px; }}"
+                f"QPushButton {{ background-color: {COLOR_RED}; color: #fff; border: none; border-radius: 4px; "
+                f"font-size: 8pt; font-weight: bold; padding: 3px 10px; }}"
                 f"QPushButton:hover {{ background-color: {COLOR_RED_LIGHT}; }}"
             )
 
             if matched_exe:
                 switch_btn = QPushButton("🔄 切换")
-                switch_btn.setFixedSize(60, 22)
+                switch_btn.setFixedSize(64, 24)
                 switch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 switch_btn.setStyleSheet(btn_style_red)
                 exe_path = matched_exe["path"]
@@ -4501,15 +4594,15 @@ class MainWindow(QMainWindow):
 
             has_detail = len(message.split("\n")) > 1 or bool(author)
             if has_detail:
-                toggle_text = "▼" if expanded else "▶"
+                toggle_text = "收起" if expanded else "详情"
                 toggle_btn = QPushButton(toggle_text)
                 toggle_btn.setObjectName("_toggle_btn")
-                toggle_btn.setFixedSize(24, 22)
+                toggle_btn.setFixedSize(40, 24)
                 toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 toggle_btn.setStyleSheet(
-                    f"QPushButton {{ background-color: {row_bg}; color: #EEEEEE; border: none; border-radius: 3px; "
+                    f"QPushButton {{ background-color: transparent; color: #999; border: 1px solid #444; border-radius: 4px; "
                     f"font-size: 8pt; }}"
-                    f"QPushButton:hover {{ background-color: #2a2a2a; }}"
+                    f"QPushButton:hover {{ background-color: #2a2a2a; color: #fff; border-color: #666; }}"
                 )
                 toggle_btn.clicked.connect(lambda checked, c=card, d=commit: self._toggle_card_detail(c, d, "git"))
                 action_layout.addWidget(toggle_btn)
@@ -4522,10 +4615,10 @@ class MainWindow(QMainWindow):
             if expanded and has_detail:
                 detail = QFrame()
                 detail.setObjectName("_detail")
-                detail.setStyleSheet(f"background-color: {row_bg}; border: none;")
+                detail.setStyleSheet(f"background-color: transparent; border: none;")
                 detail_layout = QVBoxLayout(detail)
-                detail_layout.setContentsMargins(140, 0, 10, 6)
-                detail_layout.setSpacing(2)
+                detail_layout.setContentsMargins(140, 0, 12, 8)
+                detail_layout.setSpacing(3)
 
                 msg_lines = message.split("\n") if message else []
                 for line in msg_lines:
@@ -4533,12 +4626,12 @@ class MainWindow(QMainWindow):
                     if line:
                         lbl = QLabel(f"· {line}")
                         lbl.setWordWrap(True)
-                        lbl.setStyleSheet(f"font-size: 8pt; color: #EEEEEE; border: none;")
+                        lbl.setStyleSheet(f"font-size: 9pt; color: #bbb; border: none;")
                         detail_layout.addWidget(lbl)
 
                 if author:
                     lbl2 = QLabel(f"👤 {author}")
-                    lbl2.setStyleSheet(f"font-size: 8pt; color: #EEEEEE; border: none;")
+                    lbl2.setStyleSheet(f"font-size: 9pt; color: #aaa; border: none;")
                     detail_layout.addWidget(lbl2)
 
                 card_layout.addWidget(detail)
@@ -5267,6 +5360,63 @@ class MainWindow(QMainWindow):
             card_layout.addWidget(action_frame)
 
             self._kernel_scroll_layout.insertWidget(self._kernel_scroll_layout.count() - 1, card)
+
+    def _auto_download_latest_kernel(self):
+        if not self.quick_dir:
+            return
+        self.kernel_status.setText("首次运行，正在获取最新内核...")
+        self.kernel_status.setStyleSheet(f"color: {COLOR_ORANGE};")
+        self._auto_kernel_ver_worker = KernelVersionWorker(self.quick_dir)
+        self._auto_kernel_ver_worker.progress.connect(lambda t: (
+            self.kernel_status.setText(t),
+            self.kernel_status.setStyleSheet(f"color: {COLOR_ORANGE};")
+        ))
+        self._auto_kernel_ver_worker.finished.connect(self._on_auto_kernel_versions_fetched)
+        self._auto_kernel_ver_worker.start()
+
+    def _on_auto_kernel_versions_fetched(self, releases, current_ver):
+        if not releases:
+            self.kernel_status.setText("自动下载内核失败，请手动检查更新")
+            self.kernel_status.setStyleSheet("color: #FF6B80;")
+            return
+        stable = [r for r in releases if not r.get("is_prerelease", False)]
+        target = stable[0] if stable else (releases[0] if releases else None)
+        if not target:
+            self.kernel_status.setText("未找到可用内核版本")
+            self.kernel_status.setStyleSheet("color: #FF6B80;")
+            return
+        tag = target.get("tag", "")
+        download_url = target.get("download_url", "")
+        asset_name = target.get("asset_name", "")
+        if not download_url:
+            self.kernel_status.setText("内核下载链接不可用")
+            self.kernel_status.setStyleSheet("color: #FF6B80;")
+            return
+        self.kernel_status.setText(f"正在下载内核 mihomo {tag}...")
+        self.kernel_status.setStyleSheet(f"color: {COLOR_ORANGE};")
+        self._kernel_dl_worker = KernelDownloadWorker(self.quick_dir, tag, download_url, asset_name)
+        self._kernel_dl_worker.progress.connect(lambda t: (
+            self.kernel_status.setText(t),
+            self.kernel_status.setStyleSheet(f"color: {COLOR_ORANGE};")
+        ))
+        self._kernel_dl_worker.finished.connect(self._on_auto_kernel_download_finished)
+        self._kernel_dl_worker.start()
+
+    def _on_auto_kernel_download_finished(self, ok, msg, path):
+        if ok and path and os.path.isfile(path):
+            tag = ""
+            m = re.search(r'mihomo_(v?[\d.]+)\.exe', os.path.basename(path))
+            if m:
+                tag = m.group(1)
+                if not tag.startswith("v"):
+                    tag = "v" + tag
+            self._on_switch_kernel(path, tag)
+            self.kernel_status.setText("内核下载完成，代理服务已就绪")
+            self.kernel_status.setStyleSheet(f"color: {COLOR_GREEN};")
+            self.svc_kernel_label.setText(f"内核: {self._get_quick_version() or '未知'}")
+        else:
+            self.kernel_status.setText(f"内核下载失败: {msg}")
+            self.kernel_status.setStyleSheet("color: #FF6B80;")
 
     def _on_download_kernel(self, release_info):
         tag = release_info.get("tag", "")

@@ -336,6 +336,10 @@ When working on this project, follow these rules:
 - GitHub Release 上传 EXE + ZIP（无空间限制）
 - Gitee Release 只上传 EXE（1GB空间限制，自动清理旧版本）
 - 发布前确保 `dev/app/.gitee_token` 和 `dev/app/.github_token` 已配置
+- **版本描述是必填流程**：发布前必须更新 `dev/app/version_history.json`，添加版本号、日期和变更列表
+  - release.py 会自动读取 version_history.json 作为 Release 描述
+  - 如果 version_history.json 中没有当前版本的记录，Release 将无描述
+  - 格式：`{"version": "2026.05.20.2223", "date": "2026-05-20", "changes": ["新增关于弹窗", "修复版本切换问题"]}`
 
 ### Git提交规范
 - 只提交公开文件：`README.md`、`docs/`、`ver/version.json`
@@ -346,7 +350,13 @@ When working on this project, follow these rules:
 ### 版本切换规范
 - 版本切换使用 Windows 硬链接（mklink /H），不使用文件复制
 - 路径定位依赖 `.yunji.lock` 标记文件，不要删除此文件
-- 版本切换通过生成 `_switch_version.bat` 批处理完成
+- 版本切换通过新EXE启动后自动完成（利用 `_kill_old_instances()` 机制）
+- 切换流程：新EXE启动 → 杀旧进程 → 删除旧硬链接 → 创建新硬链接 → 删除原始下载文件（通过 `--cleanup` 参数）
+
+### 关于弹窗规范
+- 关于信息通过弹窗（QDialog）展示，不单独作为导航栏目
+- 入口按钮位于软件更新页面的顶部工具栏右侧（圆形 ℹ 按钮）
+- 弹窗内容：软件名称、版本号、功能简介、开源协议、GitHub链接
 
 ### 自部署规范
 - EXE首次运行时自动检测环境，无需安装器
