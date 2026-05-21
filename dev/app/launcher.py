@@ -4,6 +4,8 @@ import ctypes
 import ctypes.wintypes
 import time
 
+BRAND_NAME = "云集智能网联代理专家"
+
 if sys.platform == 'win32' and getattr(sys, 'frozen', False):
     class _NullWriter:
         def write(self, *args, **kwargs):
@@ -16,6 +18,25 @@ if sys.platform == 'win32' and getattr(sys, 'frozen', False):
     sys.stderr = _NullWriter()
 
 
+def _verify_brand():
+    if sys.platform != 'win32' or not getattr(sys, 'frozen', False):
+        return
+    exe_name = os.path.basename(sys.executable)
+    if BRAND_NAME not in exe_name:
+        import ctypes
+        correct_name = f"{BRAND_NAME}.exe"
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            f"可执行文件名已被修改，无法运行。\n\n当前文件名: {exe_name}\n正确文件名: {correct_name}\n\n请将文件名改回「{correct_name}」后重试。",
+            "品牌校验失败",
+            0x10
+        )
+        sys.exit(1)
+
+
+_verify_brand()
+
+
 def _kill_old_instances():
     if sys.platform != 'win32' or not getattr(sys, 'frozen', False):
         return
@@ -24,7 +45,7 @@ def _kill_old_instances():
     my_name = os.path.basename(my_exe)
     my_pid = ctypes.windll.kernel32.GetCurrentProcessId()
 
-    base_prefix = "云集智能网联代理专家"
+    base_prefix = BRAND_NAME
 
     kernel32 = ctypes.windll.kernel32
 

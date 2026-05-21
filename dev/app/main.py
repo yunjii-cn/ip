@@ -13,7 +13,6 @@ import time
 import threading
 import urllib.request
 import subprocess
-import glob
 import re
 import ctypes
 import queue
@@ -60,7 +59,8 @@ def _load_repo_token(filename):
 
 GITEE_TOKEN = _load_repo_token(".gitee_token")
 GITHUB_TOKEN = _load_repo_token(".github_token")
-APP_NAME = f"云集智能网联代理专家 v{VERSION}"
+BRAND_NAME = "云集智能网联代理专家"
+APP_NAME = f"{BRAND_NAME} v{VERSION}"
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = 7890
 PROXY_URL = f"{PROXY_HOST}:{PROXY_PORT}"
@@ -443,10 +443,16 @@ if not getattr(sys, 'frozen', False):
 
 
 def _self_deploy(exe_dir):
-    base_name = "云集智能网联代理专家"
+    base_name = BRAND_NAME
+    src_exe = os.path.abspath(sys.executable)
+    exe_basename = os.path.basename(src_exe)
+    if base_name not in exe_basename:
+        correct_name = f"{base_name}-v{VERSION}.exe"
+        QMessageBox.critical(None, "品牌校验失败",
+            f"可执行文件名已被修改，无法运行。\n\n当前文件名: {exe_basename}\n正确文件名: {correct_name}\n\n请将文件名改回「{correct_name}」后重试。")
+        sys.exit(1)
     deploy_dir = os.path.join(exe_dir, base_name)
     already_deployed = os.path.isdir(deploy_dir) and os.path.isfile(os.path.join(deploy_dir, ".yunji.lock"))
-    src_exe = os.path.abspath(sys.executable)
 
     if already_deployed:
         entry_exe = os.path.join(deploy_dir, f"{base_name}.exe")
@@ -514,42 +520,12 @@ def get_app_dir():
 
 
 def find_quick_dir():
-    base_dir = get_base_dir()
-
     builtin_quick = os.path.join(get_app_dir(), "Quick")
     if os.path.isdir(builtin_quick) and os.path.isfile(os.path.join(builtin_quick, "quick.exe")):
         return builtin_quick
-
     saved = load_settings().get("quick_dir_path", "")
     if saved and os.path.isdir(saved) and os.path.isfile(os.path.join(saved, "quick.exe")):
         return saved
-
-    search_dirs = [base_dir, os.path.dirname(base_dir)]
-    parent = os.path.dirname(base_dir)
-    if parent:
-        grandparent = os.path.dirname(parent)
-        if grandparent and grandparent != parent:
-            search_dirs.append(grandparent)
-
-    for search in search_dirs:
-        if not search or not os.path.isdir(search):
-            continue
-        for pattern in ["*Quick*", "*quick*", "*Quick"]:
-            for d in glob.glob(os.path.join(search, pattern)):
-                if os.path.isdir(d) and os.path.isfile(os.path.join(d, "quick.exe")):
-                    return d
-        for root, dirs, files in os.walk(search):
-            depth = root.replace(search, "").count(os.sep)
-            if depth > 2:
-                continue
-            if "quick.exe" in [f.lower() for f in files]:
-                return root
-            for d in dirs:
-                if d.lower() == "quick":
-                    qd = os.path.join(root, d)
-                    if os.path.isfile(os.path.join(qd, "quick.exe")):
-                        return qd
-
     return None
 
 
@@ -760,10 +736,11 @@ def test_direct_latency(timeout=NODE_TEST_TIMEOUT):
         return float('inf')
 
 
-def download_config(url, timeout=NODE_TEST_TIMEOUT):
+def download_config(url, timeout=8):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     if is_proxy_running():
         try:
             proxy_handler = urllib.request.ProxyHandler({
@@ -774,14 +751,30 @@ def download_config(url, timeout=NODE_TEST_TIMEOUT):
                 urllib.request.HTTPSHandler(context=ctx),
                 proxy_handler,
             )
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with opener.open(req, timeout=timeout) as resp:
                 return resp.read()
         except Exception:
             pass
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-        return resp.read()
+    try:
+        with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
+            return resp.read()
+    except Exception:
+        pass
+    try:
+        proxy_handler = urllib.request.ProxyHandler({
+            'http': f'http://127.0.0.1:7890',
+            'https': f'http://127.0.0.1:7890',
+        })
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ctx),
+            proxy_handler,
+        )
+        req2 = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with opener.open(req2, timeout=5) as resp:
+            return resp.read()
+    except Exception:
+        pass
+    raise urllib.error.URLError("所有下载方式均失败")
 
 
 def download_all_configs():
@@ -807,7 +800,7 @@ def download_all_configs():
         t.start()
         threads.append(t)
     for t in threads:
-        t.join(timeout=NODE_TEST_TIMEOUT + 5)
+        t.join(timeout=30)
     return [(n, d) for n, d in results if d is not None]
 
 
@@ -1076,53 +1069,190 @@ class DownloadWorker(QThread):
     progress = pyqtSignal(int, int)
     finished = pyqtSignal(bool, str, str)
 
-    def __init__(self, url, save_path):
+    MIRROR_PREFIXES = [
+        "https://gh-proxy.com/",
+        "https://ghproxy.net/",
+        "https://ghproxy.homeboyc.cn/",
+        "https://ghfast.top/",
+        "https://mirror.ghproxy.com/",
+    ]
+
+    def __init__(self, urls, save_path):
         super().__init__()
-        self.url = url
+        self.urls = urls if isinstance(urls, list) else [urls]
         self.save_path = save_path
+        self._paused = False
+        self._cancelled = False
+
+    def _build_opener(self, proxy_url=None):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        if proxy_url:
+            try:
+                proxy_handler = urllib.request.ProxyHandler({
+                    'http': proxy_url,
+                    'https': proxy_url,
+                })
+                opener = urllib.request.build_opener(
+                    urllib.request.HTTPSHandler(context=ctx),
+                    proxy_handler,
+                )
+                return opener, ctx
+            except Exception:
+                pass
+        elif is_proxy_running():
+            try:
+                proxy_handler = urllib.request.ProxyHandler({
+                    'http': f'http://{PROXY_URL}',
+                    'https': f'http://{PROXY_URL}',
+                })
+                opener = urllib.request.build_opener(
+                    urllib.request.HTTPSHandler(context=ctx),
+                    proxy_handler,
+                )
+                return opener, ctx
+            except Exception:
+                pass
+        return None, ctx
+
+    def _download(self, url, timeout=120, proxy_url=None):
+        opener, ctx = self._build_opener(proxy_url=proxy_url)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        if opener:
+            resp = opener.open(req, timeout=timeout)
+        else:
+            resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        return resp
 
     def run(self):
-        try:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            req = urllib.request.Request(self.url, headers={"User-Agent": "Mozilla/5.0"})
+        tmp_path = self.save_path + ".downloading"
+        last_err = None
+        for url in self.urls:
+            is_github = "github.com" in url
+            is_gitee = "gitee.com" in url
+            if is_github:
+                for prefix in self.MIRROR_PREFIXES:
+                    try:
+                        mirror_url = prefix + url
+                        resp = self._download(mirror_url)
+                        if self._save(resp, tmp_path):
+                            return
+                    except Exception:
+                        if os.path.isfile(tmp_path):
+                            os.remove(tmp_path)
+                        continue
             if is_proxy_running():
                 try:
-                    proxy_handler = urllib.request.ProxyHandler({
-                        'http': f'http://{PROXY_URL}',
-                        'https': f'http://{PROXY_URL}',
-                    })
-                    opener = urllib.request.build_opener(
-                        urllib.request.HTTPSHandler(context=ctx),
-                        proxy_handler,
-                    )
-                    resp = opener.open(req, timeout=60)
-                except Exception:
-                    resp = urllib.request.urlopen(req, timeout=60, context=ctx)
-            else:
-                resp = urllib.request.urlopen(req, timeout=60, context=ctx)
-            total = int(resp.headers.get("Content-Length", 0))
-            tmp_path = self.save_path + ".downloading"
-            downloaded = 0
-            with open(tmp_path, "wb") as f:
-                while True:
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    self.progress.emit(downloaded, total)
-            resp.close()
-            if os.path.isfile(self.save_path):
-                os.remove(self.save_path)
-            os.rename(tmp_path, self.save_path)
-            self.finished.emit(True, "下载完成", self.save_path)
-        except Exception as e:
-            tmp_path = self.save_path + ".downloading"
-            if os.path.isfile(tmp_path):
-                os.remove(tmp_path)
-            self.finished.emit(False, f"下载失败: {e}", "")
+                    resp = self._download(url)
+                    if self._save(resp, tmp_path):
+                        return
+                except urllib.error.HTTPError as http_err:
+                    if http_err.code == 404:
+                        last_err = "该版本暂无下载资源（Release不存在）"
+                        continue
+                    if http_err.code == 403:
+                        if os.path.isfile(tmp_path):
+                            os.remove(tmp_path)
+                        continue
+                    last_err = f"下载失败(HTTP {http_err.code})"
+                    if os.path.isfile(tmp_path):
+                        os.remove(tmp_path)
+                    continue
+                except Exception as e:
+                    if os.path.isfile(tmp_path):
+                        os.remove(tmp_path)
+            sys_enabled, sys_server = get_system_proxy()
+            if sys_enabled and sys_server and not is_proxy_running():
+                proxy_url = sys_server
+                if not proxy_url.startswith("http://") and not proxy_url.startswith("https://"):
+                    proxy_url = f"http://{proxy_url}"
+                try:
+                    resp = self._download(url, proxy_url=proxy_url)
+                    if self._save(resp, tmp_path):
+                        return
+                except urllib.error.HTTPError as http_err:
+                    if http_err.code == 404:
+                        last_err = "该版本暂无下载资源（Release不存在）"
+                        continue
+                    if http_err.code == 403:
+                        if os.path.isfile(tmp_path):
+                            os.remove(tmp_path)
+                        continue
+                    last_err = f"下载失败(HTTP {http_err.code})"
+                    if os.path.isfile(tmp_path):
+                        os.remove(tmp_path)
+                    continue
+                except Exception as e:
+                    if os.path.isfile(tmp_path):
+                        os.remove(tmp_path)
+            try:
+                resp = self._download(url)
+                if self._save(resp, tmp_path):
+                    return
+            except urllib.error.HTTPError as http_err:
+                if http_err.code == 404:
+                    last_err = "该版本暂无下载资源（Release不存在）"
+                    continue
+                if http_err.code == 403:
+                    last_err = "下载被拒绝(403)"
+                    if os.path.isfile(tmp_path):
+                        os.remove(tmp_path)
+                    continue
+                last_err = f"下载失败(HTTP {http_err.code})"
+                if os.path.isfile(tmp_path):
+                    os.remove(tmp_path)
+                continue
+            except Exception as e:
+                last_err = str(e)[:80]
+                if os.path.isfile(tmp_path):
+                    os.remove(tmp_path)
+                continue
+        if os.path.isfile(tmp_path):
+            os.remove(tmp_path)
+        self.finished.emit(False, f"下载失败: {last_err or '所有下载方式均失败'}", "")
+
+    def _save(self, resp, tmp_path):
+        total = int(resp.headers.get("Content-Length", 0))
+        downloaded = 0
+        with open(tmp_path, "wb") as f:
+            while True:
+                if self._cancelled:
+                    resp.close()
+                    if os.path.isfile(tmp_path):
+                        os.remove(tmp_path)
+                    self.finished.emit(False, "下载已取消", "")
+                    return False
+                while self._paused and not self._cancelled:
+                    self.msleep(200)
+                if self._cancelled:
+                    resp.close()
+                    if os.path.isfile(tmp_path):
+                        os.remove(tmp_path)
+                    self.finished.emit(False, "下载已取消", "")
+                    return False
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+                self.progress.emit(downloaded, total)
+        resp.close()
+        if os.path.isfile(self.save_path):
+            os.remove(self.save_path)
+        os.rename(tmp_path, self.save_path)
+        self.finished.emit(True, "下载完成", self.save_path)
+        return True
+
+    def pause(self):
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
+
+    def cancel(self):
+        self._cancelled = True
+        self._paused = False
 
 
 class KernelVersionWorker(QThread):
@@ -1531,7 +1661,13 @@ class ServiceWorker(QThread):
                 return
             log.warning("未下载到新配置，使用本地已有配置")
         self.progress.emit("正在启动代理内核...")
-        start_quick(quick_dir)
+        quick_exe = os.path.join(quick_dir, "quick.exe")
+        if not os.path.isfile(quick_exe):
+            self.finished.emit(False, "代理内核不存在，请先更新代理内核")
+            return
+        if not start_quick(quick_dir):
+            self.finished.emit(False, "代理内核启动失败")
+            return
         if not wait_for_proxy(timeout=15):
             self.finished.emit(False, "代理内核启动失败")
             return
@@ -1554,6 +1690,10 @@ class ServiceWorker(QThread):
         quick_dir = self.kwargs.get("quick_dir")
         if not quick_dir:
             self.finished.emit(False, "未找到内核目录")
+            return
+        quick_exe = os.path.join(quick_dir, "quick.exe")
+        if not os.path.isfile(quick_exe):
+            self.finished.emit(False, "代理内核不存在，请先更新代理内核")
             return
 
         original_config = None
@@ -1796,15 +1936,9 @@ class SplashScreen(QSplashScreen):
     def set_progress(self, value, message=""):
         if message:
             self._message = message
-        anim = QPropertyAnimation(self, b"progress")
-        anim.setDuration(150)
-        anim.setStartValue(self._progress)
-        anim.setEndValue(value)
-        anim.start()
-        self._anim = anim
-        if message:
-            self._message = message
-            self.repaint()
+        self._progress = value
+        self.repaint()
+        QApplication.processEvents()
 
     def drawContents(self, painter):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1818,7 +1952,7 @@ class SplashScreen(QSplashScreen):
 
         painter.setPen(QColor(COLOR_TEXT))
         painter.setFont(QFont("Microsoft YaHei", 18, QFont.Weight.Bold))
-        title = "云集智能网联代理专家"
+        title = BRAND_NAME
         fm = painter.fontMetrics()
         painter.drawText((w - fm.horizontalAdvance(title)) // 2, 150, title)
 
@@ -2039,30 +2173,23 @@ class MainWindow(QMainWindow):
         if self._splash:
             self._splash.set_progress(1.0, "加载完成！")
             QTimer.singleShot(200, self._finish_splash)
+        else:
+            self.show()
+            QTimer.singleShot(500, self._force_foreground)
 
     def _resolve_quick_dir(self):
-        builtin = os.path.join(get_app_dir(), "Quick")
-        if os.path.isdir(builtin) and os.path.isfile(os.path.join(builtin, "quick.exe")):
-            log.info(f"使用内置内核路径: {builtin}")
-            return builtin
-
+        quick_dir = os.path.join(get_app_dir(), "Quick")
+        if os.path.isfile(os.path.join(quick_dir, "quick.exe")):
+            log.info(f"内核目录: {quick_dir}")
+            return quick_dir
         saved = self.settings.get("quick_dir_path", "")
         if saved and os.path.isfile(os.path.join(saved, "quick.exe")):
             log.info(f"使用保存的内核路径: {saved}")
             return saved
-
-        auto = find_quick_dir()
-        if auto:
-            self.settings["quick_dir_path"] = auto
-            save_settings(self.settings)
-            log.info(f"自动检测到内核路径: {auto}")
-            return auto
-
-        quick_dir = os.path.join(get_app_dir(), "Quick")
         os.makedirs(quick_dir, exist_ok=True)
         self.settings["quick_dir_path"] = quick_dir
         save_settings(self.settings)
-        log.info(f"首次运行，创建内核目录: {quick_dir}")
+        log.info(f"内核目录已创建，等待下载内核: {quick_dir}")
         self._auto_download_kernel = True
         return quick_dir
 
@@ -2923,40 +3050,13 @@ class MainWindow(QMainWindow):
 
         header_frame = QFrame()
         header_frame.setStyleSheet(f"background-color: #1a1a1a; border: none; border-bottom: 1px solid #2a2a2a;")
-        header_frame.setFixedHeight(84)
-        header_layout = QVBoxLayout(header_frame)
+        header_frame.setFixedHeight(44)
+        header_layout = QHBoxLayout(header_frame)
         header_layout.setContentsMargins(12, 6, 12, 6)
-        header_layout.setSpacing(4)
-
-        row1 = QHBoxLayout()
-        row1.setSpacing(6)
-
-        self._ver_tab_stable_btn = QPushButton("📦 EXE稳定版")
-        self._ver_tab_stable_btn.setFixedSize(130, 30)
-        self._ver_tab_stable_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._ver_tab_stable_btn.setStyleSheet(
-            f"QPushButton {{ background-color: {COLOR_RED}; color: #FFFFFF; border: none; border-radius: 6px; "
-            f"font-size: 9pt; font-weight: bold; }}"
-            f"QPushButton:hover {{ background-color: {COLOR_RED_LIGHT}; }}"
-        )
-        self._ver_tab_stable_btn.clicked.connect(lambda: self._switch_ver_tab("stable"))
-        row1.addWidget(self._ver_tab_stable_btn)
-
-        self._ver_tab_git_btn = QPushButton("🔧 Git开发版")
-        self._ver_tab_git_btn.setFixedSize(130, 30)
-        self._ver_tab_git_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._ver_tab_git_btn.setStyleSheet(
-            f"QPushButton {{ background-color: #333; color: #888; border: none; border-radius: 6px; "
-            f"font-size: 9pt; font-weight: bold; }}"
-            f"QPushButton:hover {{ background-color: {COLOR_RED}; color: #fff; }}"
-        )
-        self._ver_tab_git_btn.clicked.connect(lambda: self._switch_ver_tab("git"))
-        row1.addWidget(self._ver_tab_git_btn)
-
-        row1.addStretch()
+        header_layout.setSpacing(6)
 
         btn_about = QPushButton("关于")
-        btn_about.setFixedSize(50, 26)
+        btn_about.setFixedSize(50, 30)
         btn_about.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_about.setStyleSheet(
             f"QPushButton {{ background-color: transparent; color: #888; border: 1px solid #444; border-radius: 6px; "
@@ -2964,26 +3064,41 @@ class MainWindow(QMainWindow):
             f"QPushButton:hover {{ background-color: #333; color: #fff; border-color: #666; }}"
         )
         btn_about.clicked.connect(self._show_about)
-        row1.addWidget(btn_about)
+        header_layout.addWidget(btn_about)
 
-        header_layout.addLayout(row1)
+        self._ver_tab_stable_btn = QPushButton("软件版本")
+        self._ver_tab_stable_btn.setFixedSize(110, 30)
+        self._ver_tab_stable_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._ver_tab_stable_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {COLOR_RED}; color: #FFFFFF; border: none; border-radius: 6px; "
+            f"font-size: 9pt; font-weight: bold; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_RED_LIGHT}; }}"
+        )
+        self._ver_tab_stable_btn.clicked.connect(lambda: self._switch_ver_tab("stable"))
+        header_layout.addWidget(self._ver_tab_stable_btn)
 
-        row2 = QHBoxLayout()
-        row2.setSpacing(6)
+        self._ver_tab_git_btn = QPushButton("开发动态")
+        self._ver_tab_git_btn.setFixedSize(110, 30)
+        self._ver_tab_git_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._ver_tab_git_btn.setStyleSheet(
+            f"QPushButton {{ background-color: #333; color: #888; border: none; border-radius: 6px; "
+            f"font-size: 9pt; font-weight: bold; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_RED}; color: #fff; }}"
+        )
+        self._ver_tab_git_btn.clicked.connect(lambda: self._switch_ver_tab("git"))
+        header_layout.addWidget(self._ver_tab_git_btn)
 
         self._ver_status_label = QLabel("")
         self._ver_status_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_DIM}; border: none;")
-        row2.addWidget(self._ver_status_label)
+        header_layout.addWidget(self._ver_status_label, stretch=1)
 
-        row2.addStretch()
-
-        row2.addWidget(_make_help_btn(
+        header_layout.addWidget(_make_help_btn(
             "软件版本管理",
             "软件更新说明",
-            "【EXE稳定版】\n"
+            "【软件版本】\n"
             "显示已发布正式版本的列表，可切换、下载和查看更新内容。\n"
             "绿色标记为当前使用的版本。\n\n"
-            "【Git开发版】\n"
+            "【开发动态】\n"
             "显示远程仓库的开发提交记录，仅开发者可见。\n"
             "需要本地有源码环境才能切换到开发版。\n\n"
             "【切换版本】\n"
@@ -2994,8 +3109,8 @@ class MainWindow(QMainWindow):
             "下载完成后可选择立即切换。"
         ))
 
-        self._ver_expand_btn = QPushButton("📋 收起详情")
-        self._ver_expand_btn.setFixedSize(96, 26)
+        self._ver_expand_btn = QPushButton("列表模式")
+        self._ver_expand_btn.setFixedSize(80, 26)
         self._ver_expand_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._ver_expand_btn.setStyleSheet(
             f"QPushButton {{ background-color: #333; color: #ccc; border: 1px solid #444; border-radius: 6px; "
@@ -3003,10 +3118,10 @@ class MainWindow(QMainWindow):
             f"QPushButton:hover {{ background-color: #444; color: #fff; border-color: #555; }}"
         )
         self._ver_expand_btn.clicked.connect(self._toggle_expand_all)
-        row2.addWidget(self._ver_expand_btn)
+        header_layout.addWidget(self._ver_expand_btn)
 
-        btn_check_remote = QPushButton("🔄 检查更新")
-        btn_check_remote.setFixedSize(96, 26)
+        btn_check_remote = QPushButton("检查更新")
+        btn_check_remote.setFixedSize(80, 26)
         btn_check_remote.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_check_remote.setStyleSheet(
             f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; border: none; border-radius: 6px; "
@@ -3014,9 +3129,7 @@ class MainWindow(QMainWindow):
             f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
         )
         btn_check_remote.clicked.connect(self._check_remote_versions)
-        row2.addWidget(btn_check_remote)
-
-        header_layout.addLayout(row2)
+        header_layout.addWidget(btn_check_remote)
 
         layout.addWidget(header_frame)
 
@@ -3041,7 +3154,7 @@ class MainWindow(QMainWindow):
         self._ver_current_version = VERSION
         self._ver_active_tab = "stable"
         self._ver_info_text = "点击「检查远程更新」查看最新版本"
-        self._ver_expanded = True
+        self._ver_display_mode = "detail"
         self._latest_version = ""
         self._latest_info = None
 
@@ -3975,49 +4088,174 @@ class MainWindow(QMainWindow):
     def _show_about(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("关于")
-        dlg.setFixedSize(420, 380)
-        dlg.setStyleSheet(f"background-color: {COLOR_BG}; color: {COLOR_TEXT};")
+        dlg.setFixedSize(500, 640)
+        dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowType.FramelessWindowHint)
+        dlg._drag_pos = None
+        def _dlg_mouse_press(event):
+            if event.button() == Qt.MouseButton.LeftButton:
+                dlg._drag_pos = event.globalPosition().toPoint() - dlg.pos()
+        def _dlg_mouse_move(event):
+            if dlg._drag_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
+                dlg.move(event.globalPosition().toPoint() - dlg._drag_pos)
+        def _dlg_mouse_release(event):
+            dlg._drag_pos = None
+        dlg.mousePressEvent = _dlg_mouse_press
+        dlg.mouseMoveEvent = _dlg_mouse_move
+        dlg.mouseReleaseEvent = _dlg_mouse_release
+        dlg.setStyleSheet(f"background-color: {COLOR_BG}; color: {COLOR_TEXT}; border-radius: 12px;")
         layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(10)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        title = QLabel("云集智能网联代理专家")
-        title.setStyleSheet(f"font-size: 16pt; font-weight: bold; color: {COLOR_RED}; border: none;")
+        header = QFrame()
+        header.setStyleSheet(f"background-color: #111111; border: none; border-top-left-radius: 12px; border-top-right-radius: 12px;")
+        header_layout = QVBoxLayout(header)
+        header_layout.setContentsMargins(24, 18, 24, 14)
+        header_layout.setSpacing(4)
+
+        icon_path = ""
+        if hasattr(sys, '_MEIPASS'):
+            icon_path = os.path.join(sys._MEIPASS, "icon.png")
+        else:
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
+        if os.path.isfile(icon_path):
+            icon_pixmap = QPixmap(icon_path)
+            if not icon_pixmap.isNull():
+                icon_scaled = icon_pixmap.scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                icon_label = QLabel()
+                icon_label.setPixmap(icon_scaled)
+                icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                header_layout.addWidget(icon_label)
+
+        title = QLabel(BRAND_NAME)
+        title.setStyleSheet("font-size: 17pt; font-weight: bold; color: #FFFFFF; border: none;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title)
+        header_layout.addWidget(title)
 
-        ver_label = QLabel(f"版本 {VERSION}")
-        ver_label.setStyleSheet(f"font-size: 10pt; color: {COLOR_DIM}; border: none;")
+        subtitle = QLabel("一键智能代理 · 多线路自动切换 · 深色极简设计")
+        subtitle.setStyleSheet("font-size: 9pt; color: rgba(255,255,255,0.75); border: none;")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        header_layout.addWidget(subtitle)
+
+        ver_label = QLabel(f"v{VERSION}")
+        ver_label.setStyleSheet("font-size: 8pt; color: rgba(255,255,255,0.5); border: none;")
         ver_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(ver_label)
+        header_layout.addWidget(ver_label)
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("background-color: #333; border: none; max-height: 1px;")
-        layout.addWidget(sep)
+        layout.addWidget(header)
 
-        info = QLabel(
-            "基于 Clash 内核的网络代理管理工具\n\n"
-            "• 一键开启/关闭系统代理\n"
-            "• 多线路自动检测与切换\n"
-            "• 全局代理 / 指定浏览器代理\n"
-            "• 软件内版本更新与切换\n\n"
-            "开源协议: GPL-3.0\n"
-            "版权所有 © 2026 云集智能 (yunjii)"
+        body = QFrame()
+        body.setStyleSheet(f"background-color: {COLOR_BG}; border: none;")
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(16, 12, 16, 10)
+        body_layout.setSpacing(8)
+
+        desc_frame = QFrame()
+        desc_frame.setStyleSheet("background-color: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px;")
+        desc_layout = QVBoxLayout(desc_frame)
+        desc_layout.setContentsMargins(14, 10, 14, 10)
+        desc_layout.setSpacing(4)
+
+        desc_text = QLabel(
+            "基于 Clash (mihomo) 内核的 Windows 网络代理管理工具，零配置开箱即用。"
+            "支持多线路智能切换、定时优化、浏览器代理，内置版本管理与自动更新。"
+            "采用 Windows 硬链接实现多版本共存与秒级切换，GitHub/Gitee 双源并行分发确保下载稳定。"
+            "EXE 自部署机制让新用户双击即可使用，首次运行自动下载最新代理内核。"
         )
-        info.setStyleSheet(f"font-size: 9pt; color: {COLOR_TEXT}; border: none; line-height: 1.6;")
-        layout.addWidget(info)
+        desc_text.setWordWrap(True)
+        desc_text.setStyleSheet("font-size: 9pt; color: #bbb; border: none;")
+        desc_layout.addWidget(desc_text)
+        body_layout.addWidget(desc_frame)
 
-        link = QLabel('<a href="https://github.com/yunjii-cn/ip" style="color: #4a9eff;">github.com/yunjii-cn/ip</a>')
-        link.setStyleSheet("font-size: 9pt; border: none;")
-        link.setOpenExternalLinks(True)
-        link.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(link)
+        features_frame = QFrame()
+        features_frame.setStyleSheet("background-color: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px;")
+        features_layout = QVBoxLayout(features_frame)
+        features_layout.setContentsMargins(14, 10, 14, 10)
+        features_layout.setSpacing(6)
 
-        layout.addStretch()
+        features_header = QLabel("核心功能")
+        features_header.setStyleSheet(f"font-size: 9pt; font-weight: bold; color: {COLOR_RED}; border: none;")
+        features_layout.addWidget(features_header)
 
-        btn_close = QPushButton("确定")
-        btn_close.setFixedSize(80, 32)
+        feature_items = [
+            ("一键启停", "开关代理只需一键，自动配置系统代理，支持全局代理与指定浏览器代理两种模式"),
+            ("多线路智能切换", "并行测速自动选择最快线路，定时检测线路质量，网络波动时自动切换至最优节点"),
+            ("定时优化", "可配置定时检测间隔，持续监控线路质量，确保始终使用最佳线路"),
+            ("浏览器代理", "自动检测系统已安装浏览器，支持全局代理或仅对指定浏览器启用代理"),
+            ("版本管理", "内置软件更新检查与下载，多版本共存，硬链接秒级切换，双源并行下载"),
+            ("深色主题", "暗黑界面红色点缀，圆角卡片式布局，护眼专业，信息层次清晰"),
+        ]
+        for name, desc_text in feature_items:
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            name_label = QLabel(name)
+            name_label.setFixedWidth(90)
+            name_label.setStyleSheet(f"font-size: 9pt; font-weight: bold; color: {COLOR_TEXT}; border: none;")
+            row.addWidget(name_label)
+            desc_label = QLabel(desc_text)
+            desc_label.setWordWrap(True)
+            desc_label.setStyleSheet("font-size: 8pt; color: #888; border: none;")
+            row.addWidget(desc_label, stretch=1)
+            features_layout.addLayout(row)
+
+        body_layout.addWidget(features_frame)
+
+        tech_frame = QFrame()
+        tech_frame.setStyleSheet("background-color: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px;")
+        tech_layout = QVBoxLayout(tech_frame)
+        tech_layout.setContentsMargins(14, 8, 14, 8)
+        tech_layout.setSpacing(4)
+
+        tech_row1 = QHBoxLayout()
+        tech_row1.setSpacing(6)
+        for label, value in [("内核", "Clash (mihomo)"), ("框架", "PyQt6"), ("协议", "GPL-3.0"), ("平台", "Windows")]:
+            lbl = QLabel(f"{label}:")
+            lbl.setStyleSheet(f"font-size: 8pt; color: {COLOR_DIM}; border: none;")
+            tech_row1.addWidget(lbl)
+            val = QLabel(value)
+            val.setStyleSheet("font-size: 8pt; color: #bbb; border: none; font-weight: bold;")
+            tech_row1.addWidget(val)
+        tech_row1.addStretch()
+        tech_layout.addLayout(tech_row1)
+
+        arch_label = QLabel("架构: 硬链接版本切换 · 双源并行分发 · EXE 自部署 · 自动下载内核")
+        arch_label.setStyleSheet(f"font-size: 8pt; color: #666; border: none;")
+        tech_layout.addWidget(arch_label)
+
+        body_layout.addWidget(tech_frame)
+
+        body_layout.addStretch()
+
+        bottom_frame = QFrame()
+        bottom_frame.setStyleSheet("background-color: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px;")
+        bottom_layout = QVBoxLayout(bottom_frame)
+        bottom_layout.setContentsMargins(14, 8, 14, 8)
+        bottom_layout.setSpacing(6)
+
+        copyright_label = QLabel("Copyright © 2026 云集智能 (yunjii). All rights reserved.")
+        copyright_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_DIM}; border: none;")
+        copyright_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bottom_layout.addWidget(copyright_label)
+
+        link_row = QHBoxLayout()
+        link_row.setSpacing(4)
+        link_row.addStretch()
+        for text, url in [("官方网站", "https://yunjii.cn"), ("GitHub", "https://github.com/yunjii-cn/ip"), ("Gitee", "https://gitee.com/yunjii/ip"), ("问题反馈", "https://github.com/yunjii-cn/ip/issues")]:
+            link = QLabel(f'<a href="{url}" style="color: #4a9eff; text-decoration: none; font-size: 9pt;">{text}</a>')
+            link.setStyleSheet("border: none;")
+            link.setOpenExternalLinks(True)
+            link_row.addWidget(link)
+            if text != "问题反馈":
+                sep = QLabel("|")
+                sep.setStyleSheet(f"font-size: 8pt; color: #333; border: none;")
+                link_row.addWidget(sep)
+        link_row.addStretch()
+        bottom_layout.addLayout(link_row)
+
+        body_layout.addWidget(bottom_frame)
+
+        btn_close = QPushButton("关闭")
+        btn_close.setFixedSize(80, 30)
         btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_close.setStyleSheet(
             f"QPushButton {{ background-color: {COLOR_RED}; color: #fff; border: none; border-radius: 6px; "
@@ -4029,170 +4267,32 @@ class MainWindow(QMainWindow):
         btn_row.addStretch()
         btn_row.addWidget(btn_close)
         btn_row.addStretch()
-        layout.addLayout(btn_row)
+        body_layout.addLayout(btn_row)
+
+        layout.addWidget(body, stretch=1)
 
         dlg.exec()
 
     def _toggle_expand_all(self):
-        self._ver_expanded = not self._ver_expanded
-        if self._ver_expand_btn is not None:
-            if self._ver_expanded:
-                self._ver_expand_btn.setText("📋 收起详情")
-                self._ver_expand_btn.setStyleSheet(
-                    f"QPushButton {{ background-color: #333; color: #ccc; border: 1px solid #444; border-radius: 6px; "
-                    f"font-size: 8pt; font-weight: bold; }}"
-                    f"QPushButton:hover {{ background-color: #444; color: #fff; border-color: #555; }}"
-                )
-            else:
-                self._ver_expand_btn.setText("📋 展开详情")
-                self._ver_expand_btn.setStyleSheet(
-                    f"QPushButton {{ background-color: #333; color: #ccc; border: 1px solid #444; border-radius: 6px; "
-                    f"font-size: 8pt; font-weight: bold; }}"
-                    f"QPushButton:hover {{ background-color: #444; color: #fff; border-color: #555; }}"
-                )
+        if self._ver_display_mode == "list":
+            self._ver_display_mode = "detail"
+            if self._ver_expand_btn is not None:
+                self._ver_expand_btn.setText("列表模式")
+        else:
+            self._ver_display_mode = "list"
+            if self._ver_expand_btn is not None:
+                self._ver_expand_btn.setText("详情模式")
         self._render_active_tab()
 
     def _render_stable_tab(self):
-        current_v = next((v for v in self._ver_stable_data if v["version"] == self._ver_current_version), None)
-
-        info_frame = QFrame()
-        info_frame.setStyleSheet(f"background-color: #1a4a2a; border: 1px solid #2a6a3a; border-radius: 8px;")
-        info_layout = QVBoxLayout(info_frame)
-        info_layout.setContentsMargins(14, 10, 14, 10)
-        info_layout.setSpacing(4)
-
-        info_row = QHBoxLayout()
-        info_row.setSpacing(8)
-
-        ver_info_text = f"v{self._ver_current_version}  {self._ver_info_text}"
-        info_label = QLabel(ver_info_text)
-        info_label.setWordWrap(True)
-        info_label.setStyleSheet(f"font-size: 11pt; font-weight: bold; color: #FFFFFF; border: none;")
-        info_row.addWidget(info_label, stretch=1)
-
-        self._ver_info_expand_btn = QPushButton("▶ 详情")
-        self._ver_info_expand_btn.setFixedSize(64, 24)
-        self._ver_info_expand_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._ver_info_expand_btn.setStyleSheet(
-            f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; border: none; border-radius: 4px; "
-            f"font-size: 8pt; font-weight: bold; }}"
-            f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
-        )
-        self._ver_info_expand_btn.clicked.connect(self._toggle_current_version_detail)
-        info_row.addWidget(self._ver_info_expand_btn)
-        info_layout.addLayout(info_row)
-
-        if current_v:
-            changes = current_v.get("changes", [])
-            if changes:
-                desc_text = "、".join(changes[:3])
-                if len(changes) > 3:
-                    desc_text += f"等{len(changes)}项"
-                desc_label = QLabel(desc_text)
-                desc_label.setWordWrap(True)
-                desc_label.setStyleSheet(f"font-size: 9pt; color: #ccc; border: none;")
-                info_layout.addWidget(desc_label)
-
-            meta_parts = []
-            build_time = current_v.get("build_time", "")
-            if build_time:
-                meta_parts.append(f"🕐 {build_time[:16]}")
-            git_commit = current_v.get("git_commit", "")
-            if git_commit:
-                meta_parts.append(f"🔗 {git_commit[:8]}")
-            if meta_parts:
-                meta_label = QLabel("  ".join(meta_parts))
-                meta_label.setStyleSheet(f"font-family: Consolas; font-size: 8pt; color: #aaa; border: none;")
-                info_layout.addWidget(meta_label)
-        else:
-            local_versions = self._get_local_version_history()
-            latest_local = local_versions[0] if local_versions else None
-            if latest_local:
-                changes = latest_local.get("changes", [])
-                if changes:
-                    desc_text = "、".join(changes[:3])
-                    if len(changes) > 3:
-                        desc_text += f"等{len(changes)}项"
-                    desc_label = QLabel(desc_text)
-                    desc_label.setWordWrap(True)
-                    desc_label.setStyleSheet(f"font-size: 9pt; color: #ccc; border: none;")
-                    info_layout.addWidget(desc_label)
-
-                meta_parts = []
-                build_time = latest_local.get("build_time", latest_local.get("date", ""))
-                if build_time:
-                    meta_parts.append(f"🕐 {build_time[:16]}")
-                git_commit = latest_local.get("git_commit", "")
-                if git_commit:
-                    meta_parts.append(f"🔗 {git_commit[:8]}")
-                if meta_parts:
-                    meta_label = QLabel("  ".join(meta_parts))
-                    meta_label.setStyleSheet(f"font-family: Consolas; font-size: 8pt; color: #aaa; border: none;")
-                    info_layout.addWidget(meta_label)
-
-        self._ver_info_detail_frame = None
-
-        self._ver_scroll_layout.addWidget(info_frame)
-
         self._render_stable_versions(self._ver_stable_data, self._ver_current_version)
-
-    def _toggle_current_version_detail(self):
-        if self._ver_info_detail_frame is not None:
-            self._ver_info_detail_frame.deleteLater()
-            self._ver_info_detail_frame = None
-            if self._ver_info_expand_btn:
-                self._ver_info_expand_btn.setText("▶ 详情")
-            return
-
-        current_v = next((v for v in self._ver_stable_data if v["version"] == self._ver_current_version), None)
-        if not current_v:
-            local_versions = self._get_local_version_history()
-            current_v = local_versions[0] if local_versions else None
-        if not current_v:
-            return
-
-        detail = QFrame()
-        detail.setStyleSheet("background-color: #1a4a2a; border: 1px solid #2a6a3a; border-radius: 8px;")
-        detail_layout = QVBoxLayout(detail)
-        detail_layout.setContentsMargins(14, 8, 14, 8)
-        detail_layout.setSpacing(3)
-
-        changes = current_v.get("changes", [])
-        if changes:
-            for ch in changes:
-                lbl = QLabel(f"· {ch}")
-                lbl.setWordWrap(True)
-                lbl.setStyleSheet(f"font-size: 9pt; color: #ccc; border: none;")
-                detail_layout.addWidget(lbl)
-        else:
-            lbl = QLabel("暂无修改记录")
-            lbl.setStyleSheet(f"font-size: 9pt; color: {COLOR_DIM}; border: none;")
-            detail_layout.addWidget(lbl)
-
-        git_commit = current_v.get("git_commit", "")
-        if git_commit:
-            lbl = QLabel(f"🔗 commit: {git_commit}")
-            lbl.setStyleSheet(f"font-family: Consolas; font-size: 9pt; color: #aaa; border: none;")
-            detail_layout.addWidget(lbl)
-
-        build_time = current_v.get("build_time", current_v.get("date", ""))
-        if build_time:
-            lbl = QLabel(f"🕐 构建时间: {build_time}")
-            lbl.setStyleSheet(f"font-size: 9pt; color: #aaa; border: none;")
-            detail_layout.addWidget(lbl)
-
-        self._ver_info_detail_frame = detail
-        self._ver_scroll_layout.insertWidget(1, detail)
-
-        if self._ver_info_expand_btn:
-            self._ver_info_expand_btn.setText("▼ 详情")
 
     def _render_git_tab(self):
         git_header = QFrame()
         git_header.setStyleSheet(f"background-color: transparent; border: none;")
         git_header_layout = QHBoxLayout(git_header)
         git_header_layout.setContentsMargins(4, 6, 4, 2)
-        git_title = QLabel("🔧 远程仓库开发动态")
+        git_title = QLabel("🔧 Git版本历史")
         git_title.setStyleSheet(f"font-size: 9pt; font-weight: bold; color: {COLOR_BLUE_LIGHT}; border: none;")
         git_header_layout.addWidget(git_title)
         git_header_layout.addStretch()
@@ -4221,30 +4321,25 @@ class MainWindow(QMainWindow):
         detail_widget = card.findChild(QWidget, "_detail")
         if detail_widget is not None:
             detail_widget.deleteLater()
-            toggle_btn = card.findChild(QPushButton, "_toggle_btn")
-            if toggle_btn:
-                toggle_btn.setText("详情")
             return
 
-        card_bg = card.property("card_bg") or "#1a1a1a"
         detail = QFrame()
         detail.setObjectName("_detail")
-        detail.setStyleSheet(f"background-color: transparent; border: none;")
+        detail.setStyleSheet("background-color: #111; border: none; border-top: 1px solid #2a2a2a;")
         detail_layout = QVBoxLayout(detail)
-        left_margin = 140 if card_type == "stable" else 10
-        detail_layout.setContentsMargins(left_margin, 0, 12, 8)
+        detail_layout.setContentsMargins(36, 6, 12, 8)
         detail_layout.setSpacing(3)
 
         if card_type == "stable":
             git_commit = data.get("git_commit", "")
             if git_commit:
-                lbl = QLabel(f"🔗 commit: {git_commit}")
+                lbl = QLabel(f"commit: {git_commit}")
                 lbl.setStyleSheet(f"font-family: Consolas; font-size: 9pt; color: #aaa; border: none;")
                 detail_layout.addWidget(lbl)
             changes = data.get("changes", [])
             if changes:
-                for ch in changes:
-                    lbl = QLabel(f"· {ch}")
+                for idx, ch in enumerate(changes, 1):
+                    lbl = QLabel(f"{idx}. {ch}")
                     lbl.setWordWrap(True)
                     lbl.setStyleSheet(f"font-size: 9pt; color: #bbb; border: none;")
                     detail_layout.addWidget(lbl)
@@ -4255,50 +4350,122 @@ class MainWindow(QMainWindow):
         else:
             message = data.get("message", "")
             msg_lines = message.split("\n") if message else []
-            for line in msg_lines:
+            for idx, line in enumerate(msg_lines, 1):
                 line = line.strip()
                 if line:
-                    lbl = QLabel(f"· {line}")
+                    lbl = QLabel(f"{idx}. {line}")
                     lbl.setWordWrap(True)
                     lbl.setStyleSheet(f"font-size: 9pt; color: #bbb; border: none;")
                     detail_layout.addWidget(lbl)
             author = data.get("author", "")
             if author:
-                lbl2 = QLabel(f"👤 {author}")
+                lbl2 = QLabel(f"author: {author}")
                 lbl2.setStyleSheet(f"font-size: 9pt; color: #aaa; border: none;")
                 detail_layout.addWidget(lbl2)
 
         card_layout = card.layout()
         card_layout.addWidget(detail)
 
-        toggle_btn = card.findChild(QPushButton, "_toggle_btn")
-        if toggle_btn:
-            toggle_btn.setText("收起")
+    def _toggle_current_card_detail(self, card, changes):
+        detail_widget = card.findChild(QWidget, "_detail")
+        if detail_widget is not None:
+            detail_widget.deleteLater()
+            return
+
+        detail = QFrame()
+        detail.setObjectName("_detail")
+        detail.setStyleSheet("background-color: #0d2d1a; border: none; border-top: 1px solid #1a4a2a;")
+        detail_layout = QVBoxLayout(detail)
+        detail_layout.setContentsMargins(36, 6, 12, 8)
+        detail_layout.setSpacing(3)
+
+        if changes:
+            for idx, ch in enumerate(changes, 1):
+                lbl = QLabel(f"{idx}. {ch}")
+                lbl.setWordWrap(True)
+                lbl.setStyleSheet("font-size: 9pt; color: #8a8; border: none;")
+                detail_layout.addWidget(lbl)
+        else:
+            lbl = QLabel("暂无修改记录")
+            lbl.setStyleSheet(f"font-size: 9pt; color: {COLOR_DIM}; border: none;")
+            detail_layout.addWidget(lbl)
+
+        card_layout = card.layout()
+        card_layout.addWidget(detail)
 
     def _render_stable_versions(self, all_versions, current_version):
+        self._ver_all_versions = all_versions
+        is_detail = self._ver_display_mode == "detail"
+
+        current_in_list = any(v["version"] == current_version for v in all_versions)
+        if not current_in_list and current_version:
+            current_changes = []
+            vh_path = os.path.join(get_app_dir(), "version_history.json")
+            if os.path.isfile(vh_path):
+                try:
+                    with open(vh_path, "r", encoding="utf-8") as f:
+                        vh = json.load(f)
+                    for entry in vh:
+                        if entry.get("version") == current_version:
+                            current_changes = entry.get("changes", [])
+                            break
+                except Exception:
+                    pass
+
+            card = QFrame()
+            card.setStyleSheet("background-color: #1a4a2a; border: 1px solid #2a6a3a; border-radius: 8px;")
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(0, 0, 0, 0)
+            card_layout.setSpacing(0)
+
+            row = QFrame()
+            row.setStyleSheet("background-color: transparent; border: none;")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(12, 8, 12, 8)
+            row_layout.setSpacing(8)
+
+            ver_label = QLabel(f"v{current_version}")
+            ver_label.setStyleSheet(f"font-family: Consolas; font-size: 11pt; font-weight: bold; color: #4CAF50; border: none;")
+            row_layout.addWidget(ver_label)
+
+            row_layout.addStretch(1)
+
+            status_label = QLabel("● 使用中")
+            status_label.setFixedWidth(90)
+            status_label.setStyleSheet(f"font-size: 8pt; color: #4CAF50; border: none; font-weight: bold;")
+            row_layout.addWidget(status_label)
+
+            card_layout.addWidget(row)
+
+            has_detail = bool(current_changes)
+            if has_detail:
+                row.setCursor(Qt.CursorShape.PointingHandCursor)
+                row.mousePressEvent = lambda event, c=card, ch=current_changes: self._toggle_current_card_detail(c, ch)
+
+            if is_detail and has_detail:
+                detail = QFrame()
+                detail.setObjectName("_detail")
+                detail.setStyleSheet("background-color: #0d2d1a; border: none; border-top: 1px solid #1a4a2a;")
+                detail_layout = QVBoxLayout(detail)
+                detail_layout.setContentsMargins(36, 6, 12, 8)
+                detail_layout.setSpacing(3)
+                for idx, ch in enumerate(current_changes, 1):
+                    lbl = QLabel(f"{idx}. {ch}")
+                    lbl.setWordWrap(True)
+                    lbl.setStyleSheet("font-size: 9pt; color: #8a8; border: none;")
+                    detail_layout.addWidget(lbl)
+                card_layout.addWidget(detail)
+
+            self._ver_scroll_layout.addWidget(card)
+
         if not all_versions:
-            lbl = QLabel("暂无稳定版本")
+            lbl = QLabel("暂无版本信息")
             lbl.setStyleSheet(f"font-size: 9pt; color: {COLOR_DIM}; border: none;")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._ver_scroll_layout.addWidget(lbl)
             return
 
-        expanded = self._ver_expanded
-
-        header_row = QFrame()
-        header_row.setStyleSheet("background-color: transparent; border: none; border-bottom: 1px solid #333;")
-        header_layout = QHBoxLayout(header_row)
-        header_layout.setContentsMargins(12, 4, 12, 4)
-        header_layout.setSpacing(0)
-
-        for text, width, stretch in [("版本", 130, 0), ("描述", 0, 1), ("状态", 100, 0), ("操作", 130, 0)]:
-            lbl = QLabel(text)
-            if width > 0:
-                lbl.setFixedWidth(width)
-            lbl.setStyleSheet("font-size: 8pt; color: #666; border: none; font-weight: bold;")
-            header_layout.addWidget(lbl, stretch=stretch)
-
-        self._ver_scroll_layout.addWidget(header_row)
+        is_detail = self._ver_display_mode == "detail"
 
         current_v = None
         other_versions = []
@@ -4325,8 +4492,8 @@ class MainWindow(QMainWindow):
                 row_bg = "#1a4a2a"
                 border_color = "#2a6a3a"
             elif is_remote_new:
-                row_bg = "#141428"
-                border_color = "#1f3a5f"
+                row_bg = "#1a1a1a"
+                border_color = "#333"
             elif is_available:
                 row_bg = "#1a1a1a"
                 border_color = "#2d2d2d"
@@ -4349,122 +4516,97 @@ class MainWindow(QMainWindow):
             row_layout.setContentsMargins(12, 8, 12, 8)
             row_layout.setSpacing(8)
 
-            ver_color = "#4CAF50" if is_current else ("#42A5F5" if is_remote_new else (COLOR_TEXT if is_available else COLOR_DIM))
+            ver_color = "#4CAF50" if is_current else (COLOR_TEXT if (is_remote_new or is_available) else COLOR_DIM)
             ver_label = QLabel(f"v{ver}")
-            ver_label.setFixedWidth(130)
-            ver_font_size = "11pt" if is_current else "9pt"
-            ver_label.setStyleSheet(f"font-family: Consolas; font-size: {ver_font_size}; font-weight: bold; color: {ver_color}; border: none;")
+            ver_label.setStyleSheet(f"font-family: Consolas; font-size: 11pt; font-weight: bold; color: {ver_color}; border: none;")
             row_layout.addWidget(ver_label)
 
-            desc_text = ""
-            if changes:
-                if expanded:
-                    desc_text = "、".join(changes)
-                else:
-                    desc_text = "、".join(changes[:2])
-                    if len(changes) > 2:
-                        desc_text += f"等{len(changes)}项"
-                    if len(desc_text) > 40:
-                        desc_text = desc_text[:37] + "..."
-
-            desc_label = QLabel(desc_text if desc_text else "暂无描述")
-            desc_label.setWordWrap(True)
-            desc_color = "#ccc" if desc_text else COLOR_DIM
-            desc_label.setStyleSheet(f"font-size: 9pt; color: {desc_color}; border: none;")
-            row_layout.addWidget(desc_label, stretch=1)
+            row_layout.addStretch(1)
 
             status_label = QLabel("")
-            status_label.setFixedWidth(100)
+            status_label.setFixedWidth(90)
             if is_current:
                 status_label.setText("● 当前版本")
                 status_label.setStyleSheet(f"font-size: 8pt; color: #4CAF50; border: none; font-weight: bold;")
             elif is_remote_new:
-                status_label.setText("🆕 远程新版")
+                status_label.setText("远程新版")
                 status_label.setStyleSheet(f"font-size: 8pt; color: #42A5F5; border: none;")
             elif is_available and exe_info:
                 size_text = f" {exe_info.get('size_mb', '')}MB" if exe_info.get("size_mb") else ""
-                status_label.setText(f"📦 稳定版{size_text}")
+                status_label.setText(f"已下载{size_text}")
                 status_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_ORANGE}; border: none;")
+            elif v.get("remote_info", {}).get("filename"):
+                status_label.setText("可下载")
+                status_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_BLUE_LIGHT}; border: none;")
             else:
-                status_label.setText("—")
+                status_label.setText("未提供")
                 status_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_DIM}; border: none;")
             row_layout.addWidget(status_label)
 
-            action_frame = QFrame()
-            action_frame.setFixedWidth(130)
-            action_frame.setStyleSheet(f"background-color: transparent; border: none;")
-            action_layout = QHBoxLayout(action_frame)
-            action_layout.setContentsMargins(0, 0, 0, 0)
-            action_layout.setSpacing(4)
-
             btn_style_blue = (
                 f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; border: none; border-radius: 4px; "
-                f"font-size: 8pt; font-weight: bold; padding: 3px 10px; }}"
+                f"font-size: 8pt; font-weight: bold; padding: 3px 8px; }}"
                 f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
             )
 
             btn_style_red = (
                 f"QPushButton {{ background-color: {COLOR_RED}; color: #fff; border: none; border-radius: 4px; "
-                f"font-size: 8pt; font-weight: bold; padding: 3px 10px; }}"
+                f"font-size: 8pt; font-weight: bold; padding: 3px 8px; }}"
                 f"QPushButton:hover {{ background-color: {COLOR_RED_LIGHT}; }}"
             )
 
             if is_available and exe_info and not is_current:
-                switch_btn = QPushButton("🔄 切换")
-                switch_btn.setFixedSize(64, 24)
+                switch_btn = QPushButton("切换")
+                switch_btn.setFixedSize(50, 24)
                 switch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 switch_btn.setStyleSheet(btn_style_red)
                 exe_path = exe_info["path"]
                 git_commit = v.get("git_commit", "")
                 switch_btn.clicked.connect(lambda checked, p=exe_path, gc=git_commit: self._switch_to_exe(p, gc))
-                action_layout.addWidget(switch_btn)
-            elif is_remote_new:
-                dl_btn = QPushButton("📥 下载")
-                dl_btn.setFixedSize(64, 24)
+                row_layout.addWidget(switch_btn)
+            elif is_remote_new or (v.get("remote_info", {}).get("filename") and not is_available):
+                dl_btn = QPushButton("下载")
+                dl_btn.setFixedSize(50, 24)
                 dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                dl_btn.setStyleSheet(btn_style_blue)
+                dl_btn.setStyleSheet(btn_style_red)
                 rinfo = v.get("remote_info")
                 dl_btn.clicked.connect(lambda checked, ri=rinfo: self._on_download_version(ri))
-                action_layout.addWidget(dl_btn)
-
-            has_detail = bool(changes) or bool(v.get("git_commit", ""))
-            if has_detail:
-                toggle_text = "收起" if expanded else "详情"
-                toggle_btn = QPushButton(toggle_text)
-                toggle_btn.setObjectName("_toggle_btn")
-                toggle_btn.setFixedSize(40, 24)
-                toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                toggle_btn.setStyleSheet(
-                    f"QPushButton {{ background-color: transparent; color: #999; border: 1px solid #444; border-radius: 4px; "
-                    f"font-size: 8pt; }}"
-                    f"QPushButton:hover {{ background-color: #2a2a2a; color: #fff; border-color: #666; }}"
-                )
-                v_data = v
-                toggle_btn.clicked.connect(lambda checked, c=card, d=v_data: self._toggle_card_detail(c, d, "stable"))
-                action_layout.addWidget(toggle_btn)
-
-            action_layout.addStretch()
-            row_layout.addWidget(action_frame)
+                row_layout.addWidget(dl_btn)
+                cancel_btn = QPushButton("取消")
+                cancel_btn.setFixedSize(50, 24)
+                cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                cancel_btn.setStyleSheet(btn_style_red)
+                cancel_btn.hide()
+                cancel_btn.clicked.connect(self._on_cancel_download)
+                row_layout.addWidget(cancel_btn)
+                v["_dl_btn"] = dl_btn
+                v["_cancel_btn"] = cancel_btn
 
             card_layout.addWidget(row)
 
-            if expanded and has_detail:
+            has_detail = bool(changes) or bool(v.get("git_commit", ""))
+            if has_detail:
+                v_data = v
+                row.setCursor(Qt.CursorShape.PointingHandCursor)
+                row.mousePressEvent = lambda event, c=card, d=v_data: self._toggle_card_detail(c, d, "stable")
+
+            if is_detail and has_detail:
                 detail = QFrame()
                 detail.setObjectName("_detail")
-                detail.setStyleSheet(f"background-color: transparent; border: none;")
+                detail.setStyleSheet("background-color: #111; border: none; border-top: 1px solid #2a2a2a;")
                 detail_layout = QVBoxLayout(detail)
-                detail_layout.setContentsMargins(140, 0, 12, 8)
+                detail_layout.setContentsMargins(36, 6, 12, 8)
                 detail_layout.setSpacing(3)
 
                 git_commit = v.get("git_commit", "")
                 if git_commit:
-                    lbl = QLabel(f"🔗 commit: {git_commit}")
+                    lbl = QLabel(f"commit: {git_commit}")
                     lbl.setStyleSheet(f"font-family: Consolas; font-size: 9pt; color: #aaa; border: none;")
                     detail_layout.addWidget(lbl)
 
                 if changes:
-                    for ch in changes:
-                        lbl = QLabel(f"· {ch}")
+                    for idx, ch in enumerate(changes, 1):
+                        lbl = QLabel(f"{idx}. {ch}")
                         lbl.setWordWrap(True)
                         lbl.setStyleSheet(f"font-size: 9pt; color: #bbb; border: none;")
                         detail_layout.addWidget(lbl)
@@ -4480,29 +4622,14 @@ class MainWindow(QMainWindow):
     def _render_git_history(self, commits):
         if not commits:
             lbl = QLabel("暂无开发动态")
-            lbl.setStyleSheet(f"font-size: 9pt; color: #EEEEEE; border: none;")
+            lbl.setStyleSheet(f"font-size: 9pt; color: {COLOR_DIM}; border: none;")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._ver_scroll_layout.addWidget(lbl)
             return
 
-        expanded = self._ver_expanded
+        is_detail = self._ver_display_mode == "detail"
         stable_exes = self._list_stable_exes()
         exe_versions = {e["version"]: e for e in stable_exes}
-
-        header_row = QFrame()
-        header_row.setStyleSheet("background-color: transparent; border: none; border-bottom: 1px solid #333;")
-        header_layout = QHBoxLayout(header_row)
-        header_layout.setContentsMargins(12, 4, 12, 4)
-        header_layout.setSpacing(0)
-
-        for text, width, stretch in [("版本", 130, 0), ("描述", 0, 1), ("状态", 100, 0), ("操作", 130, 0)]:
-            lbl = QLabel(text)
-            if width > 0:
-                lbl.setFixedWidth(width)
-            lbl.setStyleSheet("font-size: 8pt; color: #666; border: none; font-weight: bold;")
-            header_layout.addWidget(lbl, stretch=stretch)
-
-        self._ver_scroll_layout.addWidget(header_row)
 
         for commit in commits:
             sha = commit.get("sha", "")[:8]
@@ -4540,84 +4667,61 @@ class MainWindow(QMainWindow):
             row_layout.setSpacing(8)
 
             ver_label = QLabel(sha)
-            ver_label.setFixedWidth(130)
+            ver_label.setFixedWidth(120)
             ver_label.setStyleSheet(f"font-family: Consolas; font-size: 9pt; font-weight: bold; color: #42A5F5; border: none;")
             row_layout.addWidget(ver_label)
 
             desc_text = msg_first_line
-            if not expanded and len(desc_text) > 40:
+            if not is_detail and len(desc_text) > 40:
                 desc_text = desc_text[:37] + "..."
 
             desc_label = QLabel(desc_text if desc_text else "暂无描述")
-            desc_label.setWordWrap(True)
+            if not is_detail:
+                desc_label.setWordWrap(False)
+            else:
+                desc_label.setWordWrap(True)
             desc_color = "#ccc" if desc_text else COLOR_DIM
             desc_label.setStyleSheet(f"font-size: 9pt; color: {desc_color}; border: none;")
             row_layout.addWidget(desc_label, stretch=1)
 
             status_label = QLabel("")
-            status_label.setFixedWidth(100)
+            status_label.setFixedWidth(90)
             if date_str:
-                status_label.setText(f"📅 {date_str}")
+                status_label.setText(date_str)
                 status_label.setStyleSheet(f"font-size: 8pt; color: #aaa; border: none;")
             else:
                 status_label.setText("—")
                 status_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_DIM}; border: none;")
             row_layout.addWidget(status_label)
 
-            action_frame = QFrame()
-            action_frame.setFixedWidth(130)
-            action_frame.setStyleSheet(f"background-color: transparent; border: none;")
-            action_layout = QHBoxLayout(action_frame)
-            action_layout.setContentsMargins(0, 0, 0, 0)
-            action_layout.setSpacing(4)
-
-            btn_style_blue = (
-                f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; border: none; border-radius: 4px; "
-                f"font-size: 8pt; font-weight: bold; padding: 3px 10px; }}"
-                f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
-            )
-
             btn_style_red = (
                 f"QPushButton {{ background-color: {COLOR_RED}; color: #fff; border: none; border-radius: 4px; "
-                f"font-size: 8pt; font-weight: bold; padding: 3px 10px; }}"
+                f"font-size: 8pt; font-weight: bold; padding: 3px 8px; }}"
                 f"QPushButton:hover {{ background-color: {COLOR_RED_LIGHT}; }}"
             )
 
             if matched_exe:
-                switch_btn = QPushButton("🔄 切换")
-                switch_btn.setFixedSize(64, 24)
+                switch_btn = QPushButton("切换")
+                switch_btn.setFixedSize(50, 24)
                 switch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 switch_btn.setStyleSheet(btn_style_red)
                 exe_path = matched_exe["path"]
                 switch_btn.clicked.connect(lambda checked, p=exe_path: self._switch_to_exe(p, ""))
-                action_layout.addWidget(switch_btn)
-
-            has_detail = len(message.split("\n")) > 1 or bool(author)
-            if has_detail:
-                toggle_text = "收起" if expanded else "详情"
-                toggle_btn = QPushButton(toggle_text)
-                toggle_btn.setObjectName("_toggle_btn")
-                toggle_btn.setFixedSize(40, 24)
-                toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                toggle_btn.setStyleSheet(
-                    f"QPushButton {{ background-color: transparent; color: #999; border: 1px solid #444; border-radius: 4px; "
-                    f"font-size: 8pt; }}"
-                    f"QPushButton:hover {{ background-color: #2a2a2a; color: #fff; border-color: #666; }}"
-                )
-                toggle_btn.clicked.connect(lambda checked, c=card, d=commit: self._toggle_card_detail(c, d, "git"))
-                action_layout.addWidget(toggle_btn)
-
-            action_layout.addStretch()
-            row_layout.addWidget(action_frame)
+                row_layout.addWidget(switch_btn)
 
             card_layout.addWidget(row)
 
-            if expanded and has_detail:
+            has_detail = len(message.split("\n")) > 1 or bool(author)
+            if has_detail:
+                row.setCursor(Qt.CursorShape.PointingHandCursor)
+                row.mousePressEvent = lambda event, c=card, d=commit: self._toggle_card_detail(c, d, "git")
+
+            if is_detail and has_detail:
                 detail = QFrame()
                 detail.setObjectName("_detail")
-                detail.setStyleSheet(f"background-color: transparent; border: none;")
+                detail.setStyleSheet("background-color: #111; border: none; border-top: 1px solid #2a2a2a;")
                 detail_layout = QVBoxLayout(detail)
-                detail_layout.setContentsMargins(140, 0, 12, 8)
+                detail_layout.setContentsMargins(132, 6, 12, 8)
                 detail_layout.setSpacing(3)
 
                 msg_lines = message.split("\n") if message else []
@@ -4630,7 +4734,7 @@ class MainWindow(QMainWindow):
                         detail_layout.addWidget(lbl)
 
                 if author:
-                    lbl2 = QLabel(f"👤 {author}")
+                    lbl2 = QLabel(f"author: {author}")
                     lbl2.setStyleSheet(f"font-size: 9pt; color: #aaa; border: none;")
                     detail_layout.addWidget(lbl2)
 
@@ -4717,7 +4821,7 @@ class MainWindow(QMainWindow):
             return []
         exes = []
         for f in os.listdir(ver_dir):
-            if f.endswith(".exe") and "云集智能网联代理专家" in f:
+            if f.endswith(".exe") and BRAND_NAME in f:
                 path = os.path.join(ver_dir, f)
                 m = re.search(r'v(\d+\.\d+\.\d+\.\d+)', f)
                 ver = m.group(1) if m else "unknown"
@@ -4745,7 +4849,7 @@ class MainWindow(QMainWindow):
         if self._ver_status_label is not None:
             count = len(self._ver_stable_data)
             hist = len(self._ver_git_data)
-            self._ver_status_label.setText(f"稳定版 {count} 个 | 版本历史 {hist} 条")
+            self._ver_status_label.setText(f"版本 {count} 个 | 版本历史 {hist} 条")
 
     def _load_all_versions(self):
         if self._ver_status_label is not None:
@@ -4923,7 +5027,7 @@ class MainWindow(QMainWindow):
                     if not ver_num or ver_num in seen:
                         continue
                     seen.add(ver_num)
-                    is_new = (ver_num != current_version and ver_num not in exe_versions)
+                    is_new = (ver_num != current_version and ver_num not in exe_versions and bool(rinfo.get("filename")))
                     all_versions.append({
                         "version": ver_num,
                         "name": rinfo.get("name", f"v{ver_num}"),
@@ -5000,16 +5104,35 @@ class MainWindow(QMainWindow):
         if os.path.isfile(save_path):
             self._switch_to_exe(save_path, remote_info.get("git_commit", ""))
             return
-        url = f"https://gitee.com/{GITEE_REPO}/releases/download/v{remote_info.get('version', '')}/{filename}"
-        source = getattr(self, '_ver_source', 'gitee')
-        if source == "github":
-            url = f"https://github.com/{GITHUB_REPO}/releases/download/v{remote_info.get('version', '')}/{filename}"
+        ver = remote_info.get('version', '')
+        urls = []
+        github_filename = re.sub(r'[^\x00-\x7F]+', '', filename)
+        if not github_filename:
+            github_filename = f"YunjiIP-v{ver}.exe"
+        urls.append(f"https://github.com/{GITHUB_REPO}/releases/download/v{ver}/{urllib.parse.quote(github_filename)}")
+        gitee_url = f"https://gitee.com/{GITEE_REPO}/releases/download/v{ver}/{urllib.parse.quote(filename)}"
+        if GITEE_TOKEN:
+            gitee_url += f"?access_token={GITEE_TOKEN}"
+        urls.append(gitee_url)
         if hasattr(self, '_download_worker') and self._download_worker is not None and self._download_worker.isRunning():
-            QMessageBox.information(self, "提示", "已有下载任务进行中")
-            return
-        self._download_worker = DownloadWorker(url, save_path)
+            if hasattr(self, '_download_paused') and self._download_paused:
+                self._download_paused = False
+                self._set_dl_btn_state(True, remote_info)
+                self._download_worker.resume()
+                return
+            else:
+                self._download_paused = True
+                self._set_dl_btn_state(False, remote_info)
+                if self._ver_status_label is not None:
+                    self._ver_status_label.setText("下载已暂停")
+                self._download_worker.pause()
+                return
+        self._download_paused = False
+        self._downloading_version = ver
+        self._download_worker = DownloadWorker(urls, save_path)
         self._download_worker.progress.connect(self._on_download_progress)
         self._download_worker.finished.connect(self._on_download_finished)
+        self._set_dl_btn_state(True, remote_info)
         if self._ver_status_label is not None:
             self._ver_status_label.setText("正在下载 0%...")
         self._download_worker.start()
@@ -5026,6 +5149,9 @@ class MainWindow(QMainWindow):
                 self._ver_status_label.setText(f"正在下载 {mb_d:.1f} MB")
 
     def _on_download_finished(self, ok, msg, path):
+        self._set_dl_btn_state(False)
+        self._download_paused = False
+        self._downloading_version = None
         if self._ver_status_label is not None:
             self._ver_status_label.setText(msg if ok else f"下载失败")
         if ok and path:
@@ -5038,6 +5164,51 @@ class MainWindow(QMainWindow):
                 self._switch_to_exe(path)
         elif not ok:
             QMessageBox.warning(self, "下载失败", msg)
+
+    def _set_dl_btn_state(self, downloading, remote_info=None):
+        if not hasattr(self, '_ver_all_versions'):
+            return
+        target_ver = None
+        if remote_info:
+            target_ver = remote_info.get("version", "")
+        elif hasattr(self, '_downloading_version'):
+            target_ver = self._downloading_version
+        for v in self._ver_all_versions:
+            dl_btn = v.get("_dl_btn")
+            cancel_btn = v.get("_cancel_btn")
+            if dl_btn is None:
+                continue
+            v_ver = v.get("remote_info", {}).get("version", "") if v.get("remote_info") else ""
+            is_target = (target_ver and v_ver == target_ver)
+            if downloading and is_target:
+                dl_btn.setText("暂停")
+                try:
+                    dl_btn.clicked.disconnect()
+                except Exception:
+                    pass
+                dl_btn.clicked.connect(lambda checked: self._on_download_version(v.get("remote_info")))
+                if cancel_btn:
+                    cancel_btn.show()
+            elif not downloading and is_target:
+                dl_btn.setText("下载")
+                try:
+                    dl_btn.clicked.disconnect()
+                except Exception:
+                    pass
+                rinfo = v.get("remote_info")
+                dl_btn.clicked.connect(lambda checked, ri=rinfo: self._on_download_version(ri))
+                if cancel_btn:
+                    cancel_btn.hide()
+
+    def _on_cancel_download(self):
+        if hasattr(self, '_download_worker') and self._download_worker is not None and self._download_worker.isRunning():
+            self._download_worker.cancel()
+            self._download_worker.wait(3000)
+        self._set_dl_btn_state(False)
+        self._download_paused = False
+        self._downloading_version = None
+        if self._ver_status_label is not None:
+            self._ver_status_label.setText("下载已取消")
 
     def _switch_to_exe(self, exe_path, git_commit=""):
         if not os.path.exists(exe_path):
@@ -5071,15 +5242,16 @@ class MainWindow(QMainWindow):
         with open(settings_path, "w", encoding="utf-8") as f:
             json.dump(settings, f, ensure_ascii=False, indent=2)
 
-        stub_path = os.path.join(dev_dir, "云集智能网联代理专家.exe")
+        stub_path = os.path.join(dev_dir, f"{BRAND_NAME}.exe")
         my_pid = os.getpid()
 
         bat_path = os.path.join(dev_dir, "_switch_version.bat")
-        with open(bat_path, "w", encoding="gbk") as f:
+        with open(bat_path, "w", encoding="utf-8") as f:
             f.write("@echo off\n")
             f.write("chcp 65001 >nul 2>&1\n")
             f.write(f"set MY_PID={my_pid}\n")
             f.write(f"set STUB_EXE={stub_path}\n")
+            f.write(f"set TARGET_EXE={target_in_ver}\n")
             f.write("set MAX_WAIT=30\n")
             f.write("set WAITED=0\n")
             f.write(":wait_loop\n")
@@ -5094,10 +5266,12 @@ class MainWindow(QMainWindow):
             f.write("        goto wait_loop\n")
             f.write("    )\n")
             f.write(")\n")
+            f.write("if exist \"%STUB_EXE%\" del /f /q \"%STUB_EXE%\"\n")
+            f.write("mklink /H \"%STUB_EXE%\" \"%TARGET_EXE%\" >nul 2>&1\n")
             f.write("if exist \"%STUB_EXE%\" (\n")
             f.write("    start \"\" \"%STUB_EXE%\"\n")
             f.write(") else (\n")
-            f.write(f"    start \"\" \"{target_in_ver}\"\n")
+            f.write("    start \"\" \"%TARGET_EXE%\"\n")
             f.write(")\n")
             f.write("del /f /q \"%~f0\"\n")
 
@@ -5114,6 +5288,9 @@ class MainWindow(QMainWindow):
 
     def _on_download_update(self):
         if not hasattr(self, '_latest_info') or not self._latest_info:
+            return
+        if not self._latest_info.get("filename"):
+            QMessageBox.warning(self, "提示", "该版本暂无下载资源")
             return
         self._on_download_version(self._latest_info)
 
@@ -5238,7 +5415,9 @@ class MainWindow(QMainWindow):
             header_layout.addWidget(lbl, stretch=stretch)
         self._kernel_scroll_layout.insertWidget(0, header_row)
 
-        sorted_releases = sorted(releases, key=lambda r: (r.get("prerelease", False), r.get("published_at", ""),))
+        stable_rels = sorted([r for r in releases if not r.get("prerelease", False)], key=lambda r: r.get("published_at", ""), reverse=True)
+        pre_rels = sorted([r for r in releases if r.get("prerelease", False)], key=lambda r: r.get("published_at", ""), reverse=True)
+        sorted_releases = stable_rels + pre_rels
         for rel in sorted_releases:
             tag = rel["tag"]
             tag_num = tag.lstrip("v")
@@ -5329,6 +5508,16 @@ class MainWindow(QMainWindow):
                 f"font-size: 8pt; font-weight: bold; padding: 2px 8px; }}"
                 f"QPushButton:hover {{ background-color: #5CBF72; }}"
             )
+
+            if is_current:
+                using_label = QLabel("使用中")
+                using_label.setFixedSize(50, 22)
+                using_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                using_label.setStyleSheet(
+                    f"background-color: #2a5a3a; color: #4CAF50; border: 1px solid #3a7a4a; border-radius: 3px; "
+                    f"font-size: 8pt; font-weight: bold;"
+                )
+                action_layout.addWidget(using_label)
 
             if is_local and not is_current:
                 switch_btn = QPushButton("🔄 切换")
@@ -5503,7 +5692,7 @@ class MainWindow(QMainWindow):
         except PermissionError:
             bat_path = current_exe + "_replace.bat"
             new_exe_src = kernel_path
-            with open(bat_path, "w", encoding="gbk") as f:
+            with open(bat_path, "w", encoding="utf-8") as f:
                 f.write("@echo off\n")
                 f.write("chcp 65001 >nul 2>&1\n")
                 f.write("timeout /t 3 /nobreak >nul\n")
@@ -5563,6 +5752,26 @@ class MainWindow(QMainWindow):
             self.show()
             self._splash.finish(self)
             self._splash = None
+        self._force_foreground()
+
+    def _force_foreground(self):
+        try:
+            import ctypes
+            hwnd = int(self.winId())
+            ctypes.windll.user32.ShowWindow(hwnd, 9)
+            foreground = ctypes.windll.user32.GetForegroundWindow()
+            if foreground != hwnd:
+                fg_tid = ctypes.windll.user32.GetWindowThreadProcessId(foreground, None)
+                my_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+                ctypes.windll.user32.AttachThreadInput(my_tid, fg_tid, True)
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+                ctypes.windll.user32.AttachThreadInput(my_tid, fg_tid, False)
+            ctypes.windll.user32.BringWindowToTop(hwnd)
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            self.raise_()
+            self.activateWindow()
 
 def _global_exception_handler(exc_type, exc_value, exc_tb):
     import traceback
