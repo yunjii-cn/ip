@@ -24,9 +24,10 @@ description: "云集智能网联代理专家项目开发规范。Invoke when wor
 │ # ========== 公开仓库（Git管理） ==========
 ├── README.md                   # 项目说明（公开）
 ├── LICENSE                     # GPL-3.0 协议（公开）
+├── project.json                # 项目配置（单一数据源：路径、命名、仓库）
 ├── docs/                       # 文档（公开）
 │   └── 开发指南.md
-├── ver/                        # 版本信息（公开）
+├── release/                    # 版本信息（公开）
 │   └── version.json            # 版本元数据（不含EXE）
 ├── .gitignore                  # Git忽略配置
 │
@@ -85,8 +86,8 @@ description: "云集智能网联代理专家项目开发规范。Invoke when wor
 ┌─────────────────────────────────────────────────────────┐
 │  2.5 稳定化（手动）                                      │
 │     将 dev/dist/云集智能网联代理专家-v版本号.exe           │
-│       移入 dev/ver/                                      │
-│     重建硬链接 dev/云集智能网联代理专家.exe → ver中EXE     │
+│       移入 dev/ver/
+│     重建硬链接 dev/云集智能网联代理专家.exe → ver中EXE
 │     （dist/ 中的EXE仅供测试，ver/ 才是正式稳定版）         │
 └──────────────────────┬──────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────┐
@@ -225,7 +226,7 @@ dev/
 | **README.md** | ✅ | ✅ | 项目说明 |
 | **LICENSE** | ✅ | ✅ | GPL-3.0协议 |
 | **docs/** | ✅ | ✅ | 开发文档 |
-| **ver/version.json** | ✅ | ✅ | 版本元数据 |
+| **release/version.json** | ✅ | ✅ | 版本元数据 |
 | **dev/app/** | ❌ | ❌ | 核心源码，仅本地 |
 | **dev/dist/*.exe** | ❌ | ❌ | 测试输出EXE，不入仓库 |
 | **dev/ver/*.exe** | ❌ | ❌ | 稳定版EXE，通过Release分发 |
@@ -246,7 +247,7 @@ dev/
 
 | 仓库 | 平台 | 可见性 | 内容 | 角色 |
 |------|------|--------|------|------|
-| **GitHub** | github.com/yunjii-cn/ip | 公开 | README、LICENSE、docs、ver/version.json | **主仓库** |
+| **GitHub** | github.com/yunjii-cn/ip | 公开 | README、LICENSE、docs、release/version.json | **主仓库** |
 | **Gitee** | gitee.com/yunjii/ip | 私有 | 自动镜像GitHub内容 | 备用镜像 |
 
 **工作方式**：
@@ -263,7 +264,7 @@ dev/
 | 内容 | 公开方式 | 说明 |
 |------|---------|------|
 | README.md / LICENSE | GitHub 仓库公开 | 项目介绍和协议 |
-| ver/version.json | GitHub 仓库公开 | 版本元数据（供软件更新检查） |
+| release/version.json | GitHub 仓库公开 | 版本元数据（供软件更新检查） |
 | docs/ | GitHub 仓库公开 | 开发文档 |
 | EXE文件 | GitHub/Gitee Releases | 用户下载，非仓库存储 |
 | dev/app/ 源码 | **不公开** | 核心代码仅本地保留 |
@@ -275,8 +276,8 @@ dev/
 
 | 优先级 | 来源 | URL方式 | 需要Token | 说明 |
 |--------|------|---------|-----------|------|
-| 并行 | Gitee | `gitee.com/api/v5/repos/yunjii/ip/contents/ver/version.json` | 视仓库可见性 | 国内直连 |
-| 并行 | GitHub | `raw.githubusercontent.com/yunjii-cn/ip/main/ver/version.json` | ❌ | 需代理 |
+| 并行 | Gitee | `gitee.com/api/v5/repos/yunjii/ip/contents/release/version.json` | 视仓库可见性 | 国内直连 |
+| 并行 | GitHub | `raw.githubusercontent.com/yunjii-cn/ip/main/release/version.json` | ❌ | 需代理 |
 
 下载EXE时根据版本检查的来源自动选择对应的 Releases。
 
@@ -340,6 +341,50 @@ python build/build.py
 | GitHub Releases | 版本分发（主） |
 | Gitee Releases | 版本分发（备用） |
 
+## 代理内核管理
+
+### 内核自动下载
+
+首次运行时自动检测代理内核，若缺失则自动下载最新稳定版。首页实时显示内核状态和下载进度：
+
+| 状态 | 首页文案 | 颜色 | 进度条 |
+|------|---------|------|--------|
+| 就绪 | ✅ 代理内核已启用 | 绿色 | 隐藏 |
+| 初始化 | ⏳ 获取新版代理内核... | 蓝橙色 | 隐藏 |
+| 获取信息 | ⏳ 获取代理内核信息... | 蓝橙色 | 隐藏 |
+| 下载中 | ⏳ 下载代理内核 vX.X.X... | 蓝橙色 | 显示，实时百分比 |
+| 失败 | ⚠ 代理内核下载失败，请在代理设置中获取更新 | 红色 | 隐藏 |
+| 缺失 | ⚠ 代理内核缺失，点击修复 | 红色 | 隐藏 |
+
+核心方法：`_set_home_kernel_status(state, text)` 统一更新首页状态，`_on_home_kernel_download_percent(pct)` 更新进度条。
+
+### 内核版本规则
+
+mihomo 内核有两种版本类型，**预览版数字可能大于稳定版但不代表更新**：
+
+| 类型 | 示例 | 说明 |
+|------|------|------|
+| 稳定版 | v1.19.25 | 经过测试的正式版本，默认只显示此类 |
+| 预览版（Alpha） | 1.26.3 | 不稳定，需手动开启预览版开关 |
+
+预览版开关（`ToggleSwitch("预览版")`）位于代理内核页面，默认关闭。自动下载始终选择最新稳定版。
+
+### 内核下载策略
+
+`KernelDownloadWorker` 按优先级尝试：GitHub加速镜像 → 本地代理直连 → 系统代理直连 → GitHub直连。
+
+## project.json 单一数据源
+
+所有路径、命名、仓库信息由 `project.json` 统一驱动。代码通过 `_load_project_config()` 读取，具备三级回退：
+
+1. EXE模式 → PyInstaller 捆绑的 project.json
+2. 源码模式 → 项目根目录的 project.json
+3. 读取失败 → 内嵌 `_DEFAULTS` 默认值（零兼容代码）
+
+修改目录结构只需编辑 `project.json`，无需改动代码。构建时通过 `--add-data=project.json;.` 打包进 EXE。
+
+> 详细技术设计见 `docs/架构说明.md`
+
 ## 开发规范指令
 
 When working on this project, follow these rules:
@@ -349,6 +394,9 @@ When working on this project, follow these rules:
 - 主程序入口为 `launcher.py`（杀旧进程），核心逻辑在 `main.py`
 - GUI 基于 PyQt6，遵循 PyQt6 的信号槽机制和布局规范
 - 代码中不得硬编码任何令牌或密钥，从配置文件读取
+- **项目配置单一数据源**：所有路径、命名、仓库信息由 `project.json` 驱动，代码中不硬编码这些值
+- 修改目录结构或命名时，只需编辑 `project.json`，无需改动代码
+- `project.json` 在构建时通过 `--add-data` 打包进 EXE，运行时自动读取
 
 ### 构建规范
 - 构建命令：`python build/build.py`
@@ -369,7 +417,7 @@ When working on this project, follow these rules:
   - 格式：`{"version": "2026.05.20.2223", "date": "2026-05-20", "changes": ["新增关于弹窗", "修复版本切换问题"]}`
 
 ### Git提交规范
-- 只提交公开文件：`README.md`、`docs/`、`ver/version.json`
+- 只提交公开文件：`README.md`、`docs/`、`release/version.json`
 - 不提交私有文件：`dev/app/`、`build/`、`dev/ver/*.exe`
 - 提交信息格式：`v版本号: 修改描述`
 - 推送到 GitHub，Gitee 自动镜像
@@ -395,3 +443,11 @@ When working on this project, follow these rules:
 - 令牌文件（`.gitee_token`、`.github_token`）不入 Git
 - 源码中不得硬编码任何令牌或密钥
 - 遵守 GPL-3.0 协议，禁止闭源商业使用，禁止移除版权声明
+
+### 代理内核规范
+- 内核是软件能否正常工作的硬指标，首页必须显示内核状态
+- 首次启动自动下载内核时，首页显示"⏳ 获取新版代理内核..."而非"⚠ 内核缺失"，避免用户恐慌
+- 下载过程中必须显示进度条，让用户知道这是正常初始化流程
+- 内核状态通过 `_set_home_kernel_status(state, text)` 统一管理，不要直接操作 UI 组件
+- 自动下载始终选择最新稳定版，不受预览版开关影响
+- mihomo 预览版数字可能大于稳定版，但稳定版才是经过测试的版本

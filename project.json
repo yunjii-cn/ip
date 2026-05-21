@@ -1,0 +1,18 @@
+{
+    "brand_name": "云集智能网联代理专家",
+    "repos": {
+        "github": "yunjii-cn/ip",
+        "gitee": "yunjii/ip",
+        "mihomo": "MetaCubeX/mihomo"
+    },
+    "paths": {
+        "version_json": "release/version.json",
+        "dev": "dev",
+        "app": "app",
+        "ver": "ver",
+        "dist": "dist",
+        "build": "build",
+        "release": "release",
+        "lock_file": ".yunji.lock"
+    }
+}

@@ -25,15 +25,59 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QStackedWidget, QFrame, QDialog,
     QMessageBox, QListWidget,
     QListWidgetItem, QTextEdit, QComboBox, QSpinBox, QSizePolicy,
-    QSplashScreen, QScrollArea, QLineEdit, QStyle
+    QSplashScreen, QScrollArea, QLineEdit, QStyle, QProgressBar
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QPoint, QPropertyAnimation, QEasingCurve, pyqtProperty, QRectF, QMetaObject, Q_ARG
 from PyQt6.QtGui import QPixmap, QIcon, QFont, QColor, QPainter, QPen, QFontMetrics, QPalette, QLinearGradient, QTextOption
 
-VERSION = datetime.now().strftime("%Y.%m.%d.%H%M")
-GITHUB_REPO = "yunjii-cn/ip"
-GITEE_REPO = "yunjii/ip"
-MIHOMO_REPO = "MetaCubeX/mihomo"
+def _load_project_config():
+    _DEFAULTS = {
+        "brand_name": "云集智能网联代理专家",
+        "version_format": "%Y.%m.%d.%H%M",
+        "repos": {
+            "github": "yunjii-cn/ip",
+            "gitee": "yunjii/ip",
+            "mihomo": "MetaCubeX/mihomo"
+        },
+        "paths": {
+            "version_json": "release/version.json",
+            "dev": "dev",
+            "app": "app",
+            "ver": "ver",
+            "dist": "dist",
+            "build": "build",
+            "release": "release",
+            "lock_file": ".yunji.lock"
+        }
+    }
+
+    def _deep_merge(base, override):
+        result = dict(base)
+        for k, v in override.items():
+            if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+                result[k] = _deep_merge(result[k], v)
+            else:
+                result[k] = v
+        return result
+
+    for search_path in [
+        os.path.join(getattr(sys, '_MEIPASS', ''), 'project.json'),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'project.json'),
+    ]:
+        try:
+            with open(search_path, 'r', encoding='utf-8') as f:
+                return _deep_merge(_DEFAULTS, json.load(f))
+        except Exception:
+            continue
+    return _DEFAULTS
+
+_CFG = _load_project_config()
+
+VERSION = datetime.now().strftime(_CFG["version_format"])
+GITHUB_REPO = _CFG["repos"]["github"]
+GITEE_REPO = _CFG["repos"]["gitee"]
+MIHOMO_REPO = _CFG["repos"]["mihomo"]
+VERSION_JSON_PATH = _CFG["paths"]["version_json"]
 
 
 def _load_repo_token(filename):
@@ -59,7 +103,7 @@ def _load_repo_token(filename):
 
 GITEE_TOKEN = _load_repo_token(".gitee_token")
 GITHUB_TOKEN = _load_repo_token(".github_token")
-BRAND_NAME = "云集智能网联代理专家"
+BRAND_NAME = _CFG["brand_name"]
 APP_NAME = f"{BRAND_NAME} v{VERSION}"
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = 7890
@@ -452,7 +496,7 @@ def _self_deploy(exe_dir):
             f"可执行文件名已被修改，无法运行。\n\n当前文件名: {exe_basename}\n正确文件名: {correct_name}\n\n请将文件名改回「{correct_name}」后重试。")
         sys.exit(1)
     deploy_dir = os.path.join(exe_dir, base_name)
-    already_deployed = os.path.isdir(deploy_dir) and os.path.isfile(os.path.join(deploy_dir, ".yunji.lock"))
+    already_deployed = os.path.isdir(deploy_dir) and os.path.isfile(os.path.join(deploy_dir, _CFG["paths"]["lock_file"]))
 
     if already_deployed:
         entry_exe = os.path.join(deploy_dir, f"{base_name}.exe")
@@ -463,12 +507,12 @@ def _self_deploy(exe_dir):
 
     os.makedirs(deploy_dir, exist_ok=True)
 
-    ver_dir = os.path.join(deploy_dir, "ver")
+    ver_dir = os.path.join(deploy_dir, _CFG["paths"]["ver"])
     os.makedirs(ver_dir, exist_ok=True)
-    app_dir = os.path.join(deploy_dir, "app")
+    app_dir = os.path.join(deploy_dir, _CFG["paths"]["app"])
     os.makedirs(app_dir, exist_ok=True)
 
-    lock_path = os.path.join(deploy_dir, ".yunji.lock")
+    lock_path = os.path.join(deploy_dir, _CFG["paths"]["lock_file"])
     with open(lock_path, "w", encoding="utf-8") as f:
         f.write("yunji")
 
@@ -499,7 +543,7 @@ def _find_dev_dir():
     if getattr(sys, 'frozen', False):
         d = os.path.dirname(os.path.abspath(sys.executable))
         for _ in range(5):
-            if os.path.isfile(os.path.join(d, ".yunji.lock")) or os.path.isdir(os.path.join(d, "app")):
+            if os.path.isfile(os.path.join(d, _CFG["paths"]["lock_file"])) or os.path.isdir(os.path.join(d, _CFG["paths"]["app"])):
                 return d
             parent = os.path.dirname(d)
             if parent == d:
@@ -514,7 +558,7 @@ def get_base_dir():
 
 
 def get_app_dir():
-    d = os.path.join(get_base_dir(), "app")
+    d = os.path.join(get_base_dir(), _CFG["paths"]["app"])
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -1432,6 +1476,7 @@ class KernelVersionWorker(QThread):
 
 class KernelDownloadWorker(QThread):
     progress = pyqtSignal(str)
+    download_percent = pyqtSignal(int)
     finished = pyqtSignal(bool, str, str)
 
     MIRROR_PREFIXES = [
@@ -1504,6 +1549,7 @@ class KernelDownloadWorker(QThread):
                     if total > 0:
                         pct = int(downloaded * 100 / total)
                         self.progress.emit(f"正在下载 {pct}% ({downloaded // 1024 // 1024}/{total // 1024 // 1024} MB)")
+                        self.download_percent.emit(pct)
 
     def run(self):
         try:
@@ -2118,6 +2164,7 @@ class MainWindow(QMainWindow):
         self.settings = load_settings()
         self._version_data_ready.connect(self._on_version_data_ready)
         self._kernel_versions_ready.connect(self._on_kernel_versions_ready)
+        self._show_prerelease_kernels = False
 
         global PROXY_HOST, PROXY_PORT
         saved_host = self.settings.get("proxy_host", PROXY_HOST)
@@ -2390,10 +2437,53 @@ class MainWindow(QMainWindow):
         sep2.setStyleSheet("color: #333; font-size: 8pt;")
         si_layout.addWidget(sep2)
 
-        self.svc_kernel_label = QLabel(f"内核: {self._get_quick_version() or '未知'}")
-        self.svc_kernel_label.setObjectName("dim")
+        self.svc_kernel_label = QLabel(f"内核: {self._get_quick_version() or '未安装'}")
         self.svc_kernel_label.setStyleSheet("font-size: 8pt;")
+        if self._get_quick_version():
+            self.svc_kernel_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_GREEN};")
+        else:
+            self.svc_kernel_label.setStyleSheet(f"font-size: 8pt; color: #FF6B80; font-weight: bold;")
         si_layout.addWidget(self.svc_kernel_label)
+
+        self.svc_kernel_status = QLabel("")
+        self.svc_kernel_status.setFixedHeight(20)
+        self.svc_kernel_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if self._get_quick_version():
+            self.svc_kernel_status.setText("✅ 代理内核已启用")
+            self.svc_kernel_status.setStyleSheet(
+                f"background-color: #1a3a2a; color: {COLOR_GREEN}; border: 1px solid #2a5a3a; "
+                f"border-radius: 3px; font-size: 7pt; font-weight: bold; padding: 1px 6px;"
+            )
+        elif self._auto_download_kernel:
+            self.svc_kernel_status.setText("⏳ 获取新版代理内核...")
+            self.svc_kernel_status.setStyleSheet(
+                f"background-color: #1a2a3a; color: {COLOR_ORANGE}; border: 1px solid #2a3a5a; "
+                f"border-radius: 3px; font-size: 7pt; font-weight: bold; padding: 1px 6px;"
+            )
+        else:
+            self.svc_kernel_status.setText("⚠ 代理内核缺失，点击修复")
+            self.svc_kernel_status.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.svc_kernel_status.setStyleSheet(
+                f"background-color: #3a1a1a; color: #FF6B80; border: 1px solid #5a2a2a; "
+                f"border-radius: 3px; font-size: 7pt; font-weight: bold; padding: 1px 6px;"
+            )
+            self.svc_kernel_status.mousePressEvent = lambda e: self._on_nav_clicked(1)
+        si_layout.addWidget(self.svc_kernel_status)
+
+        self.svc_kernel_progress = QProgressBar()
+        self.svc_kernel_progress.setFixedHeight(14)
+        self.svc_kernel_progress.setFixedWidth(120)
+        self.svc_kernel_progress.setTextVisible(True)
+        self.svc_kernel_progress.setFormat("%p%")
+        self.svc_kernel_progress.setRange(0, 100)
+        self.svc_kernel_progress.setValue(0)
+        self.svc_kernel_progress.setStyleSheet(
+            f"QProgressBar {{ background-color: #1a2a3a; border: 1px solid #2a3a5a; border-radius: 3px; "
+            f"font-size: 6pt; color: {COLOR_ORANGE}; text-align: center; }}"
+            f"QProgressBar::chunk {{ background-color: {COLOR_ORANGE}; border-radius: 2px; }}"
+        )
+        self.svc_kernel_progress.hide()
+        si_layout.addWidget(self.svc_kernel_progress)
 
         si_layout.addStretch()
 
@@ -2969,6 +3059,10 @@ class MainWindow(QMainWindow):
         self.kernel_latest_label = QLabel("")
         self.kernel_latest_label.setStyleSheet(f"font-size: 9pt; color: {COLOR_DIM};")
         kernel_info_row.addWidget(self.kernel_latest_label)
+        self._prerelease_toggle = ToggleSwitch("预览版", default=False)
+        self._prerelease_toggle.setFixedWidth(100)
+        self._prerelease_toggle.toggled.connect(self._on_prerelease_toggle)
+        kernel_info_row.addWidget(self._prerelease_toggle)
         kernel_info_row.addStretch()
 
         self.btn_check_kernel = QPushButton("🔄 检查更新")
@@ -3253,10 +3347,81 @@ class MainWindow(QMainWindow):
         scrollbar.setValue(scrollbar.maximum())
 
     def _update_kernel_status(self):
+        has_kernel = bool(self._get_quick_version())
+        if has_kernel:
+            self._set_home_kernel_status("ready")
+        elif self._auto_download_kernel:
+            self._set_home_kernel_status("initializing", "⏳ 获取新版代理内核...")
+        else:
+            self._set_home_kernel_status("missing")
         if self.quick_dir:
             log.info(f"代理内核已就绪: {self.quick_dir}")
         else:
             log.warning("未找到代理内核")
+
+    def _set_home_kernel_status(self, state, text=None):
+        if hasattr(self, 'svc_kernel_label'):
+            ver = self._get_quick_version() or '未安装'
+            self.svc_kernel_label.setText(f"内核: {ver}")
+            if state == "ready":
+                self.svc_kernel_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_GREEN};")
+            else:
+                self.svc_kernel_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_ORANGE}; font-weight: bold;")
+        if not hasattr(self, 'svc_kernel_status'):
+            return
+        if state == "ready":
+            self.svc_kernel_status.setText("✅ 代理内核已启用")
+            self.svc_kernel_status.setStyleSheet(
+                f"background-color: #1a3a2a; color: {COLOR_GREEN}; border: 1px solid #2a5a3a; "
+                f"border-radius: 3px; font-size: 7pt; font-weight: bold; padding: 1px 6px;"
+            )
+            self.svc_kernel_status.setCursor(Qt.CursorShape.ArrowCursor)
+            self.svc_kernel_status.mousePressEvent = None
+            if hasattr(self, 'svc_kernel_progress'):
+                self.svc_kernel_progress.hide()
+        elif state == "initializing":
+            self.svc_kernel_status.setText(text or "⏳ 获取新版代理内核...")
+            self.svc_kernel_status.setStyleSheet(
+                f"background-color: #1a2a3a; color: {COLOR_ORANGE}; border: 1px solid #2a3a5a; "
+                f"border-radius: 3px; font-size: 7pt; font-weight: bold; padding: 1px 6px;"
+            )
+            self.svc_kernel_status.setCursor(Qt.CursorShape.ArrowCursor)
+            self.svc_kernel_status.mousePressEvent = None
+        elif state == "downloading":
+            self.svc_kernel_status.setText(text or "⏳ 下载代理内核...")
+            self.svc_kernel_status.setStyleSheet(
+                f"background-color: #1a2a3a; color: {COLOR_ORANGE}; border: 1px solid #2a3a5a; "
+                f"border-radius: 3px; font-size: 7pt; font-weight: bold; padding: 1px 6px;"
+            )
+            self.svc_kernel_status.setCursor(Qt.CursorShape.ArrowCursor)
+            self.svc_kernel_status.mousePressEvent = None
+            if hasattr(self, 'svc_kernel_progress'):
+                self.svc_kernel_progress.setValue(0)
+                self.svc_kernel_progress.show()
+        elif state == "failed":
+            self.svc_kernel_status.setText(text or "⚠ 代理内核缺失，点击修复")
+            self.svc_kernel_status.setStyleSheet(
+                f"background-color: #3a1a1a; color: #FF6B80; border: 1px solid #5a2a2a; "
+                f"border-radius: 3px; font-size: 7pt; font-weight: bold; padding: 1px 6px;"
+            )
+            self.svc_kernel_status.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.svc_kernel_status.mousePressEvent = lambda e: self._on_nav_clicked(1)
+            if hasattr(self, 'svc_kernel_progress'):
+                self.svc_kernel_progress.hide()
+        else:
+            self.svc_kernel_status.setText("⚠ 代理内核缺失，点击修复")
+            self.svc_kernel_status.setStyleSheet(
+                f"background-color: #3a1a1a; color: #FF6B80; border: 1px solid #5a2a2a; "
+                f"border-radius: 3px; font-size: 7pt; font-weight: bold; padding: 1px 6px;"
+            )
+            self.svc_kernel_status.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.svc_kernel_status.mousePressEvent = lambda e: self._on_nav_clicked(1)
+            if hasattr(self, 'svc_kernel_progress'):
+                self.svc_kernel_progress.hide()
+
+    def _on_home_kernel_download_percent(self, pct):
+        if hasattr(self, 'svc_kernel_progress') and self.svc_kernel_progress.isVisible():
+            self.svc_kernel_progress.setValue(pct)
 
     def _update_status(self, running):
         if running:
@@ -4816,7 +4981,7 @@ class MainWindow(QMainWindow):
 
     def _list_stable_exes(self):
         dev_dir = self._get_dev_dir()
-        ver_dir = os.path.join(dev_dir, "ver")
+        ver_dir = os.path.join(dev_dir, _CFG["paths"]["ver"])
         if not os.path.isdir(ver_dir):
             return []
         exes = []
@@ -4832,17 +4997,26 @@ class MainWindow(QMainWindow):
 
     def _get_local_version_history(self):
         dev_dir = self._get_dev_dir()
-        path = os.path.join(dev_dir, "app", "version_history.json")
-        if not os.path.exists(path):
-            return []
+        path = os.path.join(dev_dir, _CFG["paths"]["app"], "version_history.json")
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return data
+            except Exception:
+                pass
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                return data
-            return []
+            base = sys._MEIPASS
+            bundled = os.path.join(base, "version_history.json")
+            if os.path.exists(bundled):
+                with open(bundled, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return data
         except Exception:
-            return []
+            pass
+        return []
 
     def _on_version_data_ready(self):
         self._render_active_tab()
@@ -4944,48 +5118,61 @@ class MainWindow(QMainWindow):
                 )
                 return opener.open(req, timeout=timeout)
 
+            _fallback_paths = [VERSION_JSON_PATH]
+            fallback_dir = os.path.dirname(VERSION_JSON_PATH)
+            if fallback_dir != "ver":
+                _fallback_paths.append(VERSION_JSON_PATH.replace(fallback_dir, "ver", 1))
+
             result = [None, None]
 
             def try_gitee():
-                try:
-                    gitee_url = f"https://gitee.com/api/v5/repos/{GITEE_REPO}/contents/ver/version.json?ref=main"
-                    if GITEE_TOKEN:
-                        gitee_url += f"&access_token={GITEE_TOKEN}"
-                    req = urllib.request.Request(gitee_url, headers={"User-Agent": "Mozilla/5.0"})
-                    with _urlopen_with_proxy(req, timeout=6) as resp:
-                        raw = resp.read().decode()
-                    api_data = json.loads(raw)
-                    if isinstance(api_data, list):
-                        file_data = api_data[0] if api_data else {}
-                    else:
-                        file_data = api_data
-                    import base64
-                    content_b64 = file_data.get("content", "")
-                    result[0] = (json.loads(base64.b64decode(content_b64).decode("utf-8")), "gitee")
-                except Exception:
-                    result[0] = (None, None)
+                for vj_path in _fallback_paths:
+                    try:
+                        gitee_url = f"https://gitee.com/api/v5/repos/{GITEE_REPO}/contents/{vj_path}?ref=main"
+                        if GITEE_TOKEN:
+                            gitee_url += f"&access_token={GITEE_TOKEN}"
+                        req = urllib.request.Request(gitee_url, headers={"User-Agent": "Mozilla/5.0"})
+                        with _urlopen_with_proxy(req, timeout=6) as resp:
+                            raw = resp.read().decode()
+                        api_data = json.loads(raw)
+                        if isinstance(api_data, list):
+                            file_data = api_data[0] if api_data else {}
+                        else:
+                            file_data = api_data
+                        import base64
+                        content_b64 = file_data.get("content", "")
+                        result[0] = (json.loads(base64.b64decode(content_b64).decode("utf-8")), "gitee")
+                        return
+                    except Exception:
+                        continue
+                result[0] = (None, None)
 
             def try_github():
-                try:
-                    github_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/ver/version.json?ref=main"
-                    gh_headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/vnd.github.v3+json"}
-                    if GITHUB_TOKEN:
-                        gh_headers["Authorization"] = f"token {GITHUB_TOKEN}"
-                    req = urllib.request.Request(github_url, headers=gh_headers)
-                    with _urlopen_with_proxy(req, timeout=6) as resp:
-                        raw = resp.read().decode()
-                    api_data = json.loads(raw)
-                    import base64
-                    content_b64 = api_data.get("content", "")
-                    result[1] = (json.loads(base64.b64decode(content_b64).decode("utf-8")), "github")
-                except Exception:
+                for vj_path in _fallback_paths:
                     try:
-                        github_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/ver/version.json"
+                        github_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{vj_path}?ref=main"
+                        gh_headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/vnd.github.v3+json"}
+                        if GITHUB_TOKEN:
+                            gh_headers["Authorization"] = f"token {GITHUB_TOKEN}"
+                        req = urllib.request.Request(github_url, headers=gh_headers)
+                        with _urlopen_with_proxy(req, timeout=6) as resp:
+                            raw = resp.read().decode()
+                        api_data = json.loads(raw)
+                        import base64
+                        content_b64 = api_data.get("content", "")
+                        result[1] = (json.loads(base64.b64decode(content_b64).decode("utf-8")), "github")
+                        return
+                    except Exception:
+                        pass
+                    try:
+                        github_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{vj_path}"
                         req = urllib.request.Request(github_url, headers={"User-Agent": "Mozilla/5.0"})
                         with _urlopen_with_proxy(req, timeout=6) as resp:
                             result[1] = (json.loads(resp.read().decode()), "github")
+                            return
                     except Exception:
-                        result[1] = (None, None)
+                        continue
+                result[1] = (None, None)
 
             t1 = threading.Thread(target=try_gitee, daemon=True)
             t2 = threading.Thread(target=try_github, daemon=True)
@@ -5098,7 +5285,7 @@ class MainWindow(QMainWindow):
         if not filename:
             return
         dev_dir = self._get_dev_dir()
-        ver_dir = os.path.join(dev_dir, "ver")
+        ver_dir = os.path.join(dev_dir, _CFG["paths"]["ver"])
         os.makedirs(ver_dir, exist_ok=True)
         save_path = os.path.join(ver_dir, filename)
         if os.path.isfile(save_path):
@@ -5216,7 +5403,7 @@ class MainWindow(QMainWindow):
             return
 
         dev_dir = self._get_dev_dir()
-        ver_dir = os.path.join(dev_dir, "ver")
+        ver_dir = os.path.join(dev_dir, _CFG["paths"]["ver"])
         os.makedirs(ver_dir, exist_ok=True)
 
         target_filename = os.path.basename(exe_path)
@@ -5232,7 +5419,7 @@ class MainWindow(QMainWindow):
         if tag.endswith(".exe"):
             tag = tag[:-4]
 
-        settings_path = os.path.join(dev_dir, "app", "launcher_settings.json")
+        settings_path = os.path.join(dev_dir, _CFG["paths"]["app"], "launcher_settings.json")
         try:
             with open(settings_path, "r", encoding="utf-8") as f:
                 settings = json.load(f)
@@ -5316,6 +5503,11 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _on_prerelease_toggle(self, checked):
+        self._show_prerelease_kernels = checked
+        if getattr(self, '_kernel_releases', []):
+            self._on_kernel_versions_ready()
+
     def _on_check_kernel_btn(self):
         if hasattr(self, '_kernel_ver_worker') and self._kernel_ver_worker and self._kernel_ver_worker.isRunning():
             self._kernel_ver_worker.requestInterruption()
@@ -5390,11 +5582,6 @@ class MainWindow(QMainWindow):
             self.kernel_latest_label.setStyleSheet(f"font-size: 9pt; color: {COLOR_BLUE_LIGHT};")
 
         last_check = self._get_kernel_cache_last_check()
-        check_info = f"共 {len(releases)} 个版本可用"
-        if last_check:
-            check_info += f"  |  上次检查: {last_check}"
-        self.kernel_status.setText(check_info)
-        self.kernel_status.setStyleSheet(f"color: {COLOR_DIM};")
 
         while self._kernel_scroll_layout.count() > 1:
             item = self._kernel_scroll_layout.takeAt(0)
@@ -5417,7 +5604,15 @@ class MainWindow(QMainWindow):
 
         stable_rels = sorted([r for r in releases if not r.get("prerelease", False)], key=lambda r: r.get("published_at", ""), reverse=True)
         pre_rels = sorted([r for r in releases if r.get("prerelease", False)], key=lambda r: r.get("published_at", ""), reverse=True)
-        sorted_releases = stable_rels + pre_rels
+        visible_count = len(stable_rels) + (len(pre_rels) if self._show_prerelease_kernels else 0)
+        check_info = f"共 {visible_count} 个版本可用"
+        if pre_rels and not self._show_prerelease_kernels:
+            check_info += f"（含 {len(pre_rels)} 个预览版，开启预览版开关可见）"
+        if last_check:
+            check_info += f"  |  上次检查: {last_check}"
+        self.kernel_status.setText(check_info)
+        self.kernel_status.setStyleSheet(f"color: {COLOR_DIM};")
+        sorted_releases = stable_rels + (pre_rels if self._show_prerelease_kernels else [])
         for rel in sorted_releases:
             tag = rel["tag"]
             tag_num = tag.lstrip("v")
@@ -5555,6 +5750,7 @@ class MainWindow(QMainWindow):
             return
         self.kernel_status.setText("首次运行，正在获取最新内核...")
         self.kernel_status.setStyleSheet(f"color: {COLOR_ORANGE};")
+        self._set_home_kernel_status("initializing", "⏳ 获取代理内核信息...")
         self._auto_kernel_ver_worker = KernelVersionWorker(self.quick_dir)
         self._auto_kernel_ver_worker.progress.connect(lambda t: (
             self.kernel_status.setText(t),
@@ -5567,12 +5763,14 @@ class MainWindow(QMainWindow):
         if not releases:
             self.kernel_status.setText("自动下载内核失败，请手动检查更新")
             self.kernel_status.setStyleSheet("color: #FF6B80;")
+            self._set_home_kernel_status("failed", "⚠ 代理内核下载失败，请在代理设置中获取更新")
             return
-        stable = [r for r in releases if not r.get("is_prerelease", False)]
+        stable = [r for r in releases if not r.get("prerelease", False)]
         target = stable[0] if stable else (releases[0] if releases else None)
         if not target:
             self.kernel_status.setText("未找到可用内核版本")
             self.kernel_status.setStyleSheet("color: #FF6B80;")
+            self._set_home_kernel_status("failed", "⚠ 代理内核下载失败，请在代理设置中获取更新")
             return
         tag = target.get("tag", "")
         download_url = target.get("download_url", "")
@@ -5580,14 +5778,17 @@ class MainWindow(QMainWindow):
         if not download_url:
             self.kernel_status.setText("内核下载链接不可用")
             self.kernel_status.setStyleSheet("color: #FF6B80;")
+            self._set_home_kernel_status("failed", "⚠ 代理内核下载失败，请在代理设置中获取更新")
             return
         self.kernel_status.setText(f"正在下载内核 mihomo {tag}...")
         self.kernel_status.setStyleSheet(f"color: {COLOR_ORANGE};")
+        self._set_home_kernel_status("downloading", f"⏳ 下载代理内核 {tag}...")
         self._kernel_dl_worker = KernelDownloadWorker(self.quick_dir, tag, download_url, asset_name)
         self._kernel_dl_worker.progress.connect(lambda t: (
             self.kernel_status.setText(t),
             self.kernel_status.setStyleSheet(f"color: {COLOR_ORANGE};")
         ))
+        self._kernel_dl_worker.download_percent.connect(self._on_home_kernel_download_percent)
         self._kernel_dl_worker.finished.connect(self._on_auto_kernel_download_finished)
         self._kernel_dl_worker.start()
 
@@ -5602,10 +5803,11 @@ class MainWindow(QMainWindow):
             self._on_switch_kernel(path, tag)
             self.kernel_status.setText("内核下载完成，代理服务已就绪")
             self.kernel_status.setStyleSheet(f"color: {COLOR_GREEN};")
-            self.svc_kernel_label.setText(f"内核: {self._get_quick_version() or '未知'}")
+            self._set_home_kernel_status("ready")
         else:
             self.kernel_status.setText(f"内核下载失败: {msg}")
             self.kernel_status.setStyleSheet("color: #FF6B80;")
+            self._set_home_kernel_status("failed", "⚠ 代理内核下载失败，请在代理设置中获取更新")
 
     def _on_download_kernel(self, release_info):
         tag = release_info.get("tag", "")
@@ -5621,11 +5823,13 @@ class MainWindow(QMainWindow):
             return
         self.kernel_status.setText(f"正在下载 mihomo {tag}...")
         self.kernel_status.setStyleSheet(f"color: {COLOR_ORANGE};")
+        self._set_home_kernel_status("downloading", f"⏳ 下载代理内核 {tag}...")
         self._kernel_dl_worker = KernelDownloadWorker(self.quick_dir, tag, download_url, asset_name)
         self._kernel_dl_worker.progress.connect(lambda t: (
             self.kernel_status.setText(t),
             self.kernel_status.setStyleSheet(f"color: {COLOR_ORANGE};")
         ))
+        self._kernel_dl_worker.download_percent.connect(self._on_home_kernel_download_percent)
         self._kernel_dl_worker.finished.connect(self._on_kernel_download_finished)
         self._kernel_dl_worker.start()
 
@@ -5648,9 +5852,11 @@ class MainWindow(QMainWindow):
                             tag = "v" + tag
                     self._on_switch_kernel(path, tag)
             self._on_check_kernel_btn()
+            self._update_kernel_status()
         else:
             self.kernel_status.setText(msg)
             self.kernel_status.setStyleSheet("color: #FF6B80;")
+            self._set_home_kernel_status("failed", "⚠ 代理内核下载失败，请在代理设置中获取更新")
 
     def _on_switch_kernel(self, kernel_path, tag):
         if not os.path.isfile(kernel_path):
@@ -5684,6 +5890,7 @@ class MainWindow(QMainWindow):
             self.kernel_current_label.setText(f"当前版本: v{tag_num}")
             self.kernel_current_label.setStyleSheet(f"font-size: 9pt; color: {COLOR_GREEN}; font-weight: bold;")
             self.svc_kernel_label.setText(f"内核: {self._get_quick_version() or '未知'}")
+            self._update_kernel_status()
             self.kernel_status.setText(f"已切换到 mihomo {tag}")
             self.kernel_status.setStyleSheet(f"color: {COLOR_GREEN};")
             if was_running and self.settings.get("proxy_enabled", False):
@@ -5715,6 +5922,7 @@ class MainWindow(QMainWindow):
             self.kernel_current_label.setText(f"当前版本: v{tag_num}")
             self.kernel_current_label.setStyleSheet(f"font-size: 9pt; color: {COLOR_GREEN}; font-weight: bold;")
             self.svc_kernel_label.setText(f"内核: mihomo v{tag_num}")
+            self._update_kernel_status()
             self.kernel_status.setText(f"已切换到 mihomo {tag}（将在后台完成替换）")
             self.kernel_status.setStyleSheet(f"color: {COLOR_GREEN};")
 
