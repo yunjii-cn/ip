@@ -1,6 +1,22 @@
 {
-    "latest": "2026.05.21.0841",
+    "latest": "2026.05.22.0308",
     "versions": [
+        {
+            "version": "2026.05.22.0308",
+            "date": "2026-05-22",
+            "filename": "云集智能网联代理专家-v2026.05.22.0308.exe",
+            "size_mb": 36.3,
+            "changes": [
+                "project.json单一数据源架构：所有路径、命名、仓库信息统一由project.json驱动，代码通过_load_project_config()三级回退读取",
+                "根目录ver/改名为release/，与dev/ver/职责分离明确：release/存放公开版本元数据，dev/ver/存放私有稳定版EXE",
+                "远程版本列表路径回退机制：先尝试release/version.json，失败后自动回退ver/version.json，兼容旧版仓库结构",
+                "代理内核状态标签样式优化：统一为纯文字样式，去除边框和背景色，避免与进度条视觉混淆",
+                "代理内核缺失/失败状态引导优化：可点击跳转代理设置页下载内核，降低用户困惑",
+                "release.py版本同步优化：从version_history.json合并所有有完整描述的版本到version.json，不再截断版本列表",
+                "新增架构说明文档docs/架构说明.md：涵盖project.json数据源架构、代理内核状态系统、版本管理、双源并行更新机制",
+                "开发指南全面更新：新增project.json、代理内核管理、目录结构更新等章节"
+            ]
+        },
         {
             "version": "2026.05.21.0841",
             "date": "2026-05-21",
