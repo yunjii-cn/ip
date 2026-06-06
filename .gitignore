@@ -1,5 +1,10 @@
 # ========== 核心源码（私有，不上传公开仓库） ==========
-dev/app/
+!dev/app/version_history.json
+!dev/app/version_info.txt
+!dev/app/main.py
+dev/backend/
+dev/frontend/
+dev/mobile/
 
 # ========== 构建目录（私有） ==========
 build/
@@ -54,3 +59,18 @@ venv/
 
 # ========== 日志 ==========
 *.log
+
+# ========== node_modules（前端依赖） ==========
+**/node_modules/
+dev/web/node_modules/
+
+# ========== APK文件（通过Releases分发） ==========
+*.apk
+
+# ========== Android构建产物 ==========
+android/app/build/
+dev/web/android/app/build/
+
+# ========== iOS构建产物 ==========
+ios/App/build/
+dev/web/ios/App/build/

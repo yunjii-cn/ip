@@ -2451,21 +2451,18 @@ class MainWindow(QMainWindow):
         if self._get_quick_version():
             self.svc_kernel_status.setText("✅ 代理内核已启用")
             self.svc_kernel_status.setStyleSheet(
-                f"background-color: #1a3a2a; color: {COLOR_GREEN}; border: 1px solid #2a5a3a; "
-                f"border-radius: 3px; font-size: 7pt; font-weight: bold; padding: 1px 6px;"
+                f"color: {COLOR_GREEN}; font-size: 7pt; font-weight: bold;"
             )
         elif self._auto_download_kernel:
             self.svc_kernel_status.setText("⏳ 获取新版代理内核...")
             self.svc_kernel_status.setStyleSheet(
-                f"background-color: #1a2a3a; color: {COLOR_ORANGE}; border: 1px solid #2a3a5a; "
-                f"border-radius: 3px; font-size: 7pt; font-weight: bold; padding: 1px 6px;"
+                f"color: {COLOR_ORANGE}; font-size: 7pt; font-weight: bold;"
             )
         else:
             self.svc_kernel_status.setText("⚠ 代理内核缺失，点击修复")
             self.svc_kernel_status.setCursor(Qt.CursorShape.PointingHandCursor)
             self.svc_kernel_status.setStyleSheet(
-                f"background-color: #3a1a1a; color: #FF6B80; border: 1px solid #5a2a2a; "
-                f"border-radius: 3px; font-size: 7pt; font-weight: bold; padding: 1px 6px;"
+                f"color: #FF6B80; font-size: 7pt; font-weight: bold;"
             )
             self.svc_kernel_status.mousePressEvent = lambda e: self._on_nav_clicked(1)
         si_layout.addWidget(self.svc_kernel_status)
@@ -3372,8 +3369,7 @@ class MainWindow(QMainWindow):
         if state == "ready":
             self.svc_kernel_status.setText("✅ 代理内核已启用")
             self.svc_kernel_status.setStyleSheet(
-                f"background-color: #1a3a2a; color: {COLOR_GREEN}; border: 1px solid #2a5a3a; "
-                f"border-radius: 3px; font-size: 7pt; font-weight: bold; padding: 1px 6px;"
+                f"color: {COLOR_GREEN}; font-size: 7pt; font-weight: bold;"
             )
             self.svc_kernel_status.setCursor(Qt.CursorShape.ArrowCursor)
             self.svc_kernel_status.mousePressEvent = None
@@ -3382,16 +3378,14 @@ class MainWindow(QMainWindow):
         elif state == "initializing":
             self.svc_kernel_status.setText(text or "⏳ 获取新版代理内核...")
             self.svc_kernel_status.setStyleSheet(
-                f"background-color: #1a2a3a; color: {COLOR_ORANGE}; border: 1px solid #2a3a5a; "
-                f"border-radius: 3px; font-size: 7pt; font-weight: bold; padding: 1px 6px;"
+                f"color: {COLOR_ORANGE}; font-size: 7pt; font-weight: bold;"
             )
             self.svc_kernel_status.setCursor(Qt.CursorShape.ArrowCursor)
             self.svc_kernel_status.mousePressEvent = None
         elif state == "downloading":
             self.svc_kernel_status.setText(text or "⏳ 下载代理内核...")
             self.svc_kernel_status.setStyleSheet(
-                f"background-color: #1a2a3a; color: {COLOR_ORANGE}; border: 1px solid #2a3a5a; "
-                f"border-radius: 3px; font-size: 7pt; font-weight: bold; padding: 1px 6px;"
+                f"color: {COLOR_ORANGE}; font-size: 7pt; font-weight: bold;"
             )
             self.svc_kernel_status.setCursor(Qt.CursorShape.ArrowCursor)
             self.svc_kernel_status.mousePressEvent = None
@@ -3401,8 +3395,7 @@ class MainWindow(QMainWindow):
         elif state == "failed":
             self.svc_kernel_status.setText(text or "⚠ 代理内核缺失，点击修复")
             self.svc_kernel_status.setStyleSheet(
-                f"background-color: #3a1a1a; color: #FF6B80; border: 1px solid #5a2a2a; "
-                f"border-radius: 3px; font-size: 7pt; font-weight: bold; padding: 1px 6px;"
+                f"color: #FF6B80; font-size: 7pt; font-weight: bold;"
             )
             self.svc_kernel_status.setCursor(Qt.CursorShape.PointingHandCursor)
             self.svc_kernel_status.mousePressEvent = lambda e: self._on_nav_clicked(1)
@@ -3411,8 +3404,7 @@ class MainWindow(QMainWindow):
         else:
             self.svc_kernel_status.setText("⚠ 代理内核缺失，点击修复")
             self.svc_kernel_status.setStyleSheet(
-                f"background-color: #3a1a1a; color: #FF6B80; border: 1px solid #5a2a2a; "
-                f"border-radius: 3px; font-size: 7pt; font-weight: bold; padding: 1px 6px;"
+                f"color: #FF6B80; font-size: 7pt; font-weight: bold;"
             )
             self.svc_kernel_status.setCursor(Qt.CursorShape.PointingHandCursor)
             self.svc_kernel_status.mousePressEvent = lambda e: self._on_nav_clicked(1)

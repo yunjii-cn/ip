@@ -48,6 +48,16 @@ description: "云集智能网联代理专家项目开发规范。Invoke when wor
 │       ├── version_history.json# 版本历史
 │       └── Quick/              # 代理内核（体积大）
 │
+│   ├── native/                 # 原生壳（各 OS 的原生项目，Web化改造后）
+│       ├── android/            #   Android 全系列（手机/电视/平板）
+│       ├── ios/                #   Apple 全系列（iPhone/iPad/Mac）
+│       └── harmony/            #   鸿蒙全系列（未来预留）
+│
+│ # ========== 手机端（Git不管理） ==========
+├── phone/                      # 手机端输出目录
+│   └── android/
+│       └── app/                # APK 输出目录（构建后自动复制到这里）
+│
 │ # ========== 构建相关（Git不管理） ==========
 ├── build/                      # 构建目录（按版本组织）
 │   ├── build.py                # 构建脚本
@@ -329,6 +339,8 @@ python build/build.py
 
 ## 技术栈
 
+### Windows 桌面端
+
 | 技术 | 用途 |
 |------|------|
 | Python 3.12+ | 开发语言 |
@@ -340,6 +352,16 @@ python build/build.py
 | wininet API | 代理设置即时生效 |
 | GitHub Releases | 版本分发（主） |
 | Gitee Releases | 版本分发（备用） |
+
+### Android 手机端
+
+| 技术 | 用途 |
+|------|------|
+| Capacitor | 混合应用框架（WebView + 原生插件） |
+| Android VpnService | VPN 隧道创建与 TUN 接口管理 |
+| mihomo (Clash.Meta) | 代理内核（arm64 native library） |
+| Os.posix_spawn() | 启动 mihomo 进程（保留 TUN fd） |
+| Gradle | 构建系统 |
 
 ## 代理内核管理
 
@@ -405,6 +427,19 @@ When working on this project, follow these rules:
 - EXE 输出到 `dev/dist/` 目录（测试用），硬链接入口在 `dev/` 目录
 - **dist → ver 流程**：构建后 EXE 在 `dev/dist/`，双击入口 EXE 测试，确认稳定后手动将 EXE 移入 `dev/ver/`，并重建硬链接入口指向 ver
 - `dev/dist/` = 测试输出，`dev/ver/` = 稳定版仓库，二者职责不同，不可混淆
+
+### Android APK 构建规范
+- **源码目录**：`dev/web/android/`（Capacitor + Android 原生项目）
+- **构建命令**：`cd dev/web/android && .\gradlew.bat assembleDebug`
+- **APK 输出**：`dev/web/android/app/build/outputs/apk/production/debug/云集智能网联代理专家_YYYYMMDD_HHMM.apk`
+- **APK 分发目录**：`phone/android/app/`（构建后需手动复制 APK 到此目录）
+- **关键源码文件**：
+  - `dev/web/android/app/src/main/java/com/yunjii/proxy/MihomoPlugin.java` — 代理管理核心插件
+  - `dev/web/android/app/src/main/java/com/yunjii/proxy/MihomoVpnService.java` — VPN 服务实现
+  - `dev/web/android/app/src/main/assets/mihomo/` — mihomo 内核和配置模板
+- **minSdkVersion**：24，**targetSdkVersion**：36
+- **签名**：Debug 构建使用 debug 签名，Release 构建需要配置签名密钥
+- **TUN 模式**：Android 端通过 VpnService 创建 TUN 接口，使用 `Os.posix_spawn()` 启动 mihomo 以保留 TUN fd
 
 ### 发布规范
 - 发布命令：`python build/release.py`（全自动，一条命令完成构建+发布）
