@@ -49,7 +49,12 @@ if os.path.isdir(static_dir):
 
 def start_api(host="127.0.0.1", port=18080):
     import uvicorn
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    
+    # EXE环境禁用日志配置（避免tty错误）
+    if getattr(sys, 'frozen', False):
+        uvicorn.run(app, host=host, port=port, log_config=None)
+    else:
+        uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
 def start_desktop():

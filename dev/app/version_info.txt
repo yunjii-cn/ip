@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(2026, 5, 25, 440),
-    prodvers=(2026, 5, 25, 440),
+    filevers=(2026, 6, 6, 1306),
+    prodvers=(2026, 6, 6, 1306),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -17,12 +17,12 @@ VSVersionInfo(
           [
             StringStruct(u'CompanyName', u'云集智能'),
             StringStruct(u'FileDescription', u'云集智能网联代理专家'),
-            StringStruct(u'FileVersion', u'2026.05.25.0440'),
+            StringStruct(u'FileVersion', u'2026.06.06.1306'),
             StringStruct(u'InternalName', u'yunji-proxy'),
             StringStruct(u'LegalCopyright', u'Copyright 2026 云集智能'),
             StringStruct(u'OriginalFilename', u'云集智能网联代理专家.exe'),
             StringStruct(u'ProductName', u'云集智能网联代理专家'),
-            StringStruct(u'ProductVersion', u'2026.05.25.0440'),
+            StringStruct(u'ProductVersion', u'2026.06.06.1306'),
           ],
         ),
       ],
