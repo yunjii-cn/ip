@@ -8,7 +8,7 @@ dev/mobile/
 
 # ========== 构建目录（私有） ==========
 build/
-!build/web/build_web.py
+!build/build_web.py
 
 # ========== 便携浏览器和代理内核（体积大） ==========
 Chrome*/
@@ -32,16 +32,22 @@ __pycache__/
 dist/
 *.spec
 
-# ========== 运行时配置 ==========
+# ========== 运行时配置和缓存 ==========
 launcher_settings.json
 .gitee_token
 .github_token
-
-# ========== 标记文件（本地使用） ==========
+dev/app/settings.json
+dev/app/kernel_versions_cache.json
 .yunji.lock
+
+# ========== 测试文件 ==========
+dev/app/_test_*.py
+dev/app/test_*.py
+test/
 
 # ========== 批处理脚本（本地使用） ==========
 _switch_version.bat
+install-sdk.bat
 
 # ========== IDE ==========
 .vscode/
@@ -53,6 +59,7 @@ _switch_version.bat
 Thumbs.db
 Desktop.ini
 .DS_Store
+nul
 
 # ========== 虚拟环境 ==========
 .venv/
@@ -65,14 +72,29 @@ venv/
 **/node_modules/
 dev/web/node_modules/
 
-# ========== APK文件（通过Releases分发） ==========
-*.apk
-!dev/apk/*.apk
+# ========== 前端自动生成文件 ==========
+dev/web/components.d.ts
+dev/web/env.d.ts
+dev/web/tsconfig.tsbuildinfo
 
 # ========== Android构建产物 ==========
 android/app/build/
-dev/web/android/app/build/
+dev/web/android/
+dev/apk/
 
 # ========== iOS构建产物 ==========
 ios/App/build/
 dev/web/ios/App/build/
+
+# ========== APK文件（通过Releases分发） ==========
+*.apk
+!dev/apk/*.apk
+
+# ========== mihomo构建目录 ==========
+mihomo-build/
+
+# ========== 运行时应用目录 ==========
+app/
+
+# ========== 本地脚本 ==========
+dev/运行Web.bat
