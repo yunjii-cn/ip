@@ -66,6 +66,7 @@ dev/web/node_modules/
 
 # ========== APK文件（通过Releases分发） ==========
 *.apk
+!dev/apk/*.apk
 
 # ========== Android构建产物 ==========
 android/app/build/

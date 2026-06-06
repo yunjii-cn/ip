@@ -1,6 +1,6 @@
 ---
 name: "yunji-dev-guide"
-description: "云集智能网联代理专家项目开发规范。Invoke when working on this project: coding, building EXE, modifying UI, fixing bugs, or any development task."
+description: "云集智能网联代理专家项目开发规范。Invoke when working on this project: coding, building EXE, building APK, modifying UI, fixing bugs, or any development task."
 ---
 
 # 云集智能网联代理专家 - 开发规范技能
@@ -9,12 +9,50 @@ description: "云集智能网联代理专家项目开发规范。Invoke when wor
 
 **项目名称**: 云集智能网联代理专家
 **核心功能**:
-- 网络代理服务管理（基于 quick.exe 内核）
+- 网络代理服务管理（基于 mihomo 内核）
 - 多线路自动检测与切换
 - 全局系统代理 / 指定程序代理
 - 系统浏览器自动检测与代理启动
 - 定时自动线路优化
 - 软件版本管理与硬链接切换
+- **跨平台支持**: Windows桌面版 + Android手机版
+
+## Web化架构说明
+
+从 v2026.06.06 开始，项目采用 **Web化架构**，一套代码多端运行：
+
+```
+─────────────────────────────────────────────────┐
+│              Vue 3 + Vant 4 前端                 │
+│         响应式布局，一套代码适配所有屏幕            │
+│      手机竖屏 (9:16) ←→ 桌面宽屏 (自适应)         │
+└────────────────────┬────────────────────────────┘
+                     │ HTTP API + WebSocket
+┌────────────────────▼────────────────────────────┐
+│             FastAPI 后端 (Python)                 │
+│   系统代理设置 │ 进程管理 │ 文件操作 │ 版本切换     │
+└────────────────────┬────────────────────────────┘
+                     │
+          ┌──────────┴──────────┐
+          ▼                     ▼
+   ┌──────────────┐     ┌──────────────┐
+   │  桌面端       │     │  手机端       │
+   │  pywebview    │     │  Capacitor   │
+   │  窗口加载前端  │     │  APP壳加载前端│
+   │  + 系统代理   │     │  + VpnService │
+   │  + 本地内核   │     │  + ARM内核    │
+   │  ~38MB       │     │  ~40MB       │
+   └──────────────┘     └──────────────┘
+```
+
+### 核心优势
+
+| 特性 | 传统 PyQt6 | Web化架构 | 提升 |
+|------|-----------|-----------|------|
+| 代码复用 | 各平台独立 | 一套代码多端 | **+90%** |
+| 维护成本 | N套代码 | 1套代码 | **-60%** |
+| 体积控制 | Electron ~150MB | pywebview ~38MB | **-75%** |
+| 启动速度 | 3-5秒 | <1秒 | **-80%** |
 
 ## 目录结构
 
@@ -26,9 +64,11 @@ description: "云集智能网联代理专家项目开发规范。Invoke when wor
 ├── LICENSE                     # GPL-3.0 协议（公开）
 ├── project.json                # 项目配置（单一数据源：路径、命名、仓库）
 ├── docs/                       # 文档（公开）
-│   └── 开发指南.md
-├── release/                    # 版本信息（公开）
-│   └── version.json            # 版本元数据（不含EXE）
+│   ├── 开发指南.md             # 流程与操作指南
+│   ├── 架构说明.md             # 技术架构设计文档
+│   └── 技术实现与优势对比.md   # 技术详解与竞品分析
+├── release/                    # 版本信息（公开，原 ver/）
+│   ── version.json            # 版本元数据（不含EXE）
 ├── .gitignore                  # Git忽略配置
 │
 │ # ========== 私有（Git不管理，仅本地） ==========
@@ -40,23 +80,41 @@ description: "云集智能网联代理专家项目开发规范。Invoke when wor
 │   │   └── *-vYYYY.MM.DD.HHMM.exe
 │   ├── ver/                    # 稳定版仓库（测试确认后手动移入）
 │   │   └── *-vYYYY.MM.DD.HHMM.exe
+│   ├── apk/                    # 🆕 Android APK 打包目录
+│   │   └── 云集智能网联代理专家_YYYYMMDD_HHMM.apk
 │   └── app/                    # 核心源码（私有，不上传仓库）
 │       ├── main.py             # 主程序
 │       ├── launcher.py         # 入口文件
+│       ├── api_main.py         # FastAPI 入口
 │       ├── icon.ico / icon.png # 应用图标
 │       ├── requirements.txt    # Python依赖
 │       ├── version_history.json# 版本历史
-│       └── Quick/              # 代理内核（体积大）
+│       ── Quick/              # 代理内核目录
+│           ├── quick.exe       # 当前使用的内核（硬链接）
+│           ├── _kernel_version.txt  # 内核版本标记
+│           └── kernels/        # 内核版本仓库
+│               ├── mihomo_v1.19.25.exe
+│               └── mihomo_v1.19.26.exe
 │
-│   ├── native/                 # 原生壳（各 OS 的原生项目，Web化改造后）
-│       ├── android/            #   Android 全系列（手机/电视/平板）
-│       ├── ios/                #   Apple 全系列（iPhone/iPad/Mac）
-│       └── harmony/            #   鸿蒙全系列（未来预留）
+│ # ========== Web化架构目录 ==========
+── dev/web/                    #  Vue 3 前端项目
+│   ├── src/                    #   源代码
+│   │   ├── views/              #     页面组件
+│   │   ├── components/         #     通用组件
+│   │   ├── api/                #     API调用层
+│   │   ├── platform/           #     平台适配层
+│   │   └── ...
+│   ├── capacitor.config.ts     #   Capacitor 配置
+│   ├── vite.config.ts          #   Vite 构建配置
+│   └── package.json            #   依赖配置
 │
-│ # ========== 手机端（Git不管理） ==========
-├── phone/                      # 手机端输出目录
-│   └── android/
-│       └── app/                # APK 输出目录（构建后自动复制到这里）
+│ # ========== 原生壳目录 ==========
+├── dev/native/                 # 🆕 原生APP壳
+│   ├── android/                #   Android 项目（Capacitor生成）
+│   │   ── app/src/main/
+│   │       ├── assets/mihomo/  #     mihomo ARM内核
+│   │       ── java/.../       #     Java原生代码
+│   └── ios/                    #   iOS 项目（未来预留）
 │
 │ # ========== 构建相关（Git不管理） ==========
 ├── build/                      # 构建目录（按版本组织）
@@ -70,6 +128,36 @@ description: "云集智能网联代理专家项目开发规范。Invoke when wor
 │       └── dist/               # PyInstaller输出
 ```
 
+### 目录命名说明
+
+| 目录 | 语义 | 说明 |
+|------|------|------|
+| `release/`（根目录） | 公开版本元数据 | 原名 `ver/`，改为 `release/` 以区分私有 `dev/ver/` |
+| `dev/ver/` | 私有版本仓库 | 本地 EXE 版本存储，其他项目也在用此约定 |
+| `dev/dist/` | 测试输出 | 构建后 EXE 先放这里，测试稳定后移入 `dev/ver/` |
+| `dev/apk/` | 🆕 Android APK | **所有 Android APK 打包到此目录** |
+| `dev/app/Quick/kernels/` | 内核版本仓库 | 存放多个 mihomo 内核版本，通过硬链接切换 |
+| `dev/web/` | 🆕 Vue 3 前端 | Web化架构的前端项目，桌面和手机共用 |
+| `dev/native/android/` | 🆕 Android原生壳 | Capacitor生成的Android项目 |
+
+### Git管理范围
+
+| 目录 | Git管理 | 公开 | 说明 |
+|------|---------|------|------|
+| **README.md** | ✅ | ✅ | 项目说明 |
+| **LICENSE** | ✅ | ✅ | GPL-3.0协议 |
+| **project.json** | ✅ | ✅ | 项目配置（单一数据源） |
+| **docs/** | ✅ | ✅ | 开发文档 |
+| **release/version.json** | ✅ | ✅ | 版本元数据 |
+| **dev/app/** | ❌ |  | 核心源码，仅本地 |
+| **dev/dist/*.exe** | ❌ |  | 测试输出EXE，不入仓库 |
+| **dev/ver/*.exe** |  | ❌ | 稳定版EXE，通过Release分发 |
+| **dev/apk/*.apk** | ❌ | ❌ |  Android APK，通过Release分发 |
+| **build/** | ❌ |  | 构建目录 |
+| **dev/app/Quick/** | ❌ | ❌ | 代理内核 |
+| **dev/web/node_modules/** |  | ❌ | 前端依赖 |
+| **dev/native/android/app/build/** |  | ❌ | Android构建产物 |
+
 ## 完整开发→打包→分发流程
 
 ### 三步流程
@@ -80,8 +168,11 @@ description: "云集智能网联代理专家项目开发规范。Invoke when wor
 │     编辑 dev/app/main.py                                 │
 │     双击 dev/运行.bat → 测试界面和功能                     │
 │     （Python源码直接运行，改了代码立刻生效）                 │
+│                                                          │
+│     ️ 发布前必做：更新 dev/app/version_history.json      │
+│     写入本版本的更新内容（changes列表），否则Release无描述  │
 └──────────────────────┬──────────────────────────────────┘
-                       │ 功能OK
+                       │ 功能OK + 版本描述已写
                        ▼
 ┌─────────────────────────────────────────────────────────┐
 │  2. 打包阶段                                             │
@@ -89,26 +180,51 @@ description: "云集智能网联代理专家项目开发规范。Invoke when wor
 │     → EXE输出到 dev/dist/云集智能网联代理专家-v版本号.exe  │
 │     → 创建硬链接 dev/云集智能网联代理专家.exe → dist中EXE │
 │     → 生成整合包ZIP（含EXE+内核+配置）                     │
+│     → project.json 通过 --add-data 打包进 EXE            │
 └──────────────────────┬──────────────────────────────────┘
                        │ 双击 dev/云集智能网联代理专家.exe 测试
                        │ 确认稳定后，手动将EXE从 dist/ 移入 ver/
                        ▼
-┌─────────────────────────────────────────────────────────┐
+─────────────────────────────────────────────────────────┐
 │  2.5 稳定化（手动）                                      │
 │     将 dev/dist/云集智能网联代理专家-v版本号.exe           │
-│       移入 dev/ver/
-│     重建硬链接 dev/云集智能网联代理专家.exe → ver中EXE
+│       移入 dev/ver/                                      │
+│     重建硬链接 dev/云集智能网联代理专家.exe → ver中EXE     │
 │     （dist/ 中的EXE仅供测试，ver/ 才是正式稳定版）         │
 └──────────────────────┬──────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────┐
 │  3. 发布阶段（全自动）                                    │
 │     python build/release.py                              │
-│     → 构建 → 更新version.json → git push                 │
+│     → 收集变更描述 → 构建 → 更新version.json → git push   │
 │     → 创建GitHub Release + 上传EXE+ZIP                   │
 │     → 创建Gitee Release + 上传EXE（省空间）               │
 │     → 用户通过软件更新页面即可检测下载                      │
 └─────────────────────────────────────────────────────────┘
 ```
+
+### 版本描述规范（必填）
+
+**每次发布前必须更新 `dev/app/version_history.json`**，这是Release描述和软件更新页面的数据来源。
+
+格式：
+```json
+[
+  {
+    "version": "2026.05.20.2223",
+    "date": "2026-05-20",
+    "changes": [
+      "EXE自部署机制：首次运行自动创建目录结构",
+      "自部署后自动启动入口EXE并清理原始下载文件",
+      "修复代理机制：全部浏览器模式系统代理立即生效"
+    ]
+  }
+]
+```
+
+**如果不更新此文件**：
+- GitHub/Gitee Release 描述为空或显示"常规更新与优化"
+- 软件更新页面不显示版本更新内容
+- 用户无法了解新版本改了什么
 
 ### 全自动发布脚本 (release.py)
 
@@ -134,14 +250,15 @@ python build/release.py
 
 | 平台 | 上传内容 | 每版本占用 | 原因 |
 |------|---------|-----------|------|
-| **GitHub** | EXE + ZIP | ~108MB | 公开仓库无空间限制 |
+| **GitHub** | EXE + ZIP + APK | ~148MB | 公开仓库无空间限制 |
 | **Gitee** | 仅EXE | ~35MB | 1GB空间限制，省空间 |
 
 | 用户场景 | 下载方式 | 体积 | 说明 |
 |---------|---------|------|------|
-| 新用户在线安装 | Release EXE | 35MB | 双击→自部署→自动下载内核 |
-| 新用户离线安装 | Release ZIP | 73MB | 含EXE+内核，解压即用 |
-| 老用户更新 | 软件内更新 | 35MB | 只下载新EXE到ver/，硬链接切换 |
+| Windows新用户在线安装 | Release EXE | 35MB | 双击→自部署→自动下载内核 |
+| Windows新用户离线安装 | Release ZIP | 73MB | 含EXE+内核，解压即用 |
+| Windows老用户更新 | 软件内更新 | 35MB | 只下载新EXE到ver/，硬链接切换 |
+| Android用户安装 | Release APK | 40MB | 安装APK→授予VPN权限→使用 |
 
 ## EXE自部署机制
 
@@ -165,6 +282,11 @@ EXE启动
 
 **关键代码**：`_self_deploy()` 函数在 `_find_dev_dir()` 中被调用，当EXE在非标准目录运行时自动触发。
 
+**为什么不需要安装器**：
+- 版本EXE本身就具备自部署能力
+- 零额外维护成本——只有一套代码
+- 用户体验：下载→双击→自动搞定
+
 ## 版本管理与硬链接机制
 
 ### 硬链接方案
@@ -187,10 +309,10 @@ dev/
 - 移入 ver 后，需重建硬链接入口指向 ver 中的 EXE
 - **运行 dist 或 ver 中的 EXE 不会自动重写硬链接**，硬链接只在构建时或首次自部署时创建
 
-**工作原理**：
-- `云集智能网联代理专家.exe` 是 `dist/` 或 `ver/` 中某个版本EXE的硬链接
+**硬链接本质**：
+- 入口 EXE 和版本 EXE 是**同一个文件的两个名字**，共享磁盘数据，不占额外空间
 - 切换版本 = 删除旧硬链接 + 创建新硬链接（瞬间完成，无需复制35MB文件）
-- 硬链接与原文件共享同一磁盘数据，不占额外空间
+- 删除其中一个名字，另一个不受影响；修改其中一个，另一个也变
 
 ### 路径解析机制
 
@@ -229,6 +351,163 @@ dev/
 - 下载到 `dev/ver/` 目录，支持进度显示
 - 下载完成后询问是否立即切换
 
+## Android APK 打包规则
+
+### 目录约定
+
+**所有 Android APK 打包到 `dev/apk/` 目录**
+
+```
+dev/apk/
+├── 云集智能网联代理专家_20260606_0936.apk    # 正式版
+├── 云集智能网联代理专家_20260606_1030.apk    # 测试版
+── ...
+```
+
+### 命名规范
+
+**格式**: `云集智能网联代理专家_YYYYMMDD_HHMM.apk`
+
+| 组成部分 | 说明 | 示例 |
+|---------|------|------|
+| 固定前缀 | 应用名称 | `云集智能网联代理专家` |
+| YYYYMMDD | 日期 | `20260606` |
+| HHMM | 时间（24小时制） | `0936` |
+| 扩展名 | APK文件 | `.apk` |
+
+**完整示例**: `云集智能网联代理专家_20260606_0936.apk`
+
+### 打包流程
+
+#### 方法一：命令行打包
+
+```bash
+# 1. 进入前端目录
+cd dev/web
+
+# 2. 构建前端资源
+npm run build
+
+# 3. 同步到 Android
+npx cap sync android
+
+# 4. 构建 Release APK
+cd android
+./gradlew assembleRelease
+
+# 5. 复制 APK 到 dev/apk/
+cp app/build/outputs/apk/release/*.apk ../../apk/云集智能网联代理专家_$(date +%Y%m%d_%H%M).apk
+```
+
+#### 方法二：Android Studio 打包
+
+1. 打开 Android Studio：`npx cap open android`
+2. Build → Generate Signed Bundle / APK
+3. 选择 APK → 输入签名密钥信息
+4. 选择 release 构建类型
+5. 构建完成后，APK 位于 `android/app/release/`
+6. 手动复制到 `dev/apk/` 并按规范命名
+
+### Git 规则
+
+**.gitignore 配置**:
+
+```gitignore
+# APK文件（通过Releases分发）
+*.apk
+!dev/apk/*.apk    # 允许跟踪 dev/apk/ 目录结构，但不包含APK文件本身
+```
+
+**说明**:
+- APK 文件体积大（~40MB），不存入 Git 仓库
+- 通过 GitHub/Gitee Releases 分发
+- `dev/apk/` 目录结构保留，方便本地管理
+
+### 发布到 Releases
+
+**手动上传**:
+1. 访问 https://github.com/yunjii-cn/ip/releases/new
+2. 选择标签（如 `v2026.06.06.0936`）
+3. 上传 `dev/apk/云集智能网联代理专家_YYYYMMDD_HHMM.apk`
+4. 填写发布说明
+
+**自动上传（未来）**:
+```bash
+# 配置 GitHub Actions 自动上传 APK
+python build/release.py --include-apk
+```
+
+### 版本管理
+
+| 版本类型 | 命名示例 | 用途 |
+|---------|---------|------|
+| 正式版 | `云集智能网联代理专家_20260606_0936.apk` | 对外发布，稳定可用 |
+| 测试版 | `云集智能网联代理专家_20260606_1030_test.apk` | 内部测试，可能不稳定 |
+| 调试版 | `云集智能网联代理专家_20260606_1100_debug.apk` | 开发调试，含日志输出 |
+
+> **注意**: 测试版和调试版建议添加后缀标识，避免与正式版混淆
+
+## 代理内核管理
+
+### 内核自动下载
+
+首次运行时，软件自动检测代理内核是否存在，若缺失则自动下载最新稳定版：
+
+```
+首次启动
+  │
+  ├─ Quick/quick.exe 存在？
+  │   ├─ 是 → ✅ 代理内核已启用
+  │   └─ 否 → 自动下载流程：
+  │            1. 首页显示 "⏳ 获取新版代理内核..."
+  │            2. 获取代理内核信息 → " 获取代理内核信息..."
+  │            3. 下载代理内核 → "⏳ 下载代理内核 vX.X.X..." + 进度条
+  │            4. 下载完成 → "✅ 代理内核已启用"
+  │            5. 下载失败 → "⚠ 代理内核下载失败，请在代理设置中获取更新"
+  │
+  └─ 用户在首页可实时看到内核状态和下载进度
+```
+
+**首页内核状态指示器**：
+
+| 状态 | 首页文案 | 颜色 | 进度条 |
+|------|---------|------|--------|
+| 就绪 | ✅ 代理内核已启用 | 绿色 | 隐藏 |
+| 初始化 | ⏳ 获取新版代理内核... | 蓝橙色 | 隐藏 |
+| 获取信息 | ⏳ 获取代理内核信息... | 蓝橙色 | 隐藏 |
+| 下载中 | ⏳ 下载代理内核 vX.X.X... | 蓝橙色 | 显示，实时百分比 |
+| 失败 | ⚠ 代理内核下载失败，请在代理设置中获取更新 | 红色 | 隐藏 |
+| 缺失 | ⚠ 代理内核缺失，点击修复 | 红色 | 隐藏 |
+
+### 内核版本管理
+
+- 内核版本存放在 `Quick/kernels/` 目录，每个版本一个独立 EXE
+- 当前使用的内核通过 `quick.exe`（硬链接）指向对应版本
+- 内核版本信息记录在 `_kernel_version.txt` 中
+- 支持在「代理设置」页面查看、下载、切换、删除内核版本
+
+### 内核版本规则
+
+mihomo 内核有两种版本类型：
+
+| 类型 | 示例 | 说明 |
+|------|------|------|
+| **稳定版** | v1.19.25 | 经过测试的正式版本，默认只显示此类 |
+| **预览版（Alpha）** | 1.26.3 | 数字可能更大但不稳定，需手动开启预览版开关 |
+
+**预览版开关**：在代理内核页面，默认关闭。开启后版本列表会额外显示预览版，并提示"含 X 个预览版"。
+
+### 内核下载策略
+
+`KernelDownloadWorker` 按以下顺序尝试下载：
+
+1. GitHub 加速镜像（gh-proxy.com、ghproxy.net 等）
+2. 本地代理直连（如果代理正在运行）
+3. 系统代理直连（如果系统代理已配置）
+4. GitHub 直连
+
+下载过程中实时发射百分比进度信号，首页进度条同步更新。
+
 ## Git管理范围
 
 | 目录 | Git管理 | 公开 | 说明 |
@@ -240,7 +519,8 @@ dev/
 | **dev/app/** | ❌ | ❌ | 核心源码，仅本地 |
 | **dev/dist/*.exe** | ❌ | ❌ | 测试输出EXE，不入仓库 |
 | **dev/ver/*.exe** | ❌ | ❌ | 稳定版EXE，通过Release分发 |
-| **build/** | ❌ | ❌ | 构建目录 |
+| **dev/apk/*.apk** |  | ❌ | Android APK，通过Release分发 |
+| **build/** | ❌ |  | 构建目录 |
 | **dev/app/Quick/** | ❌ | ❌ | 代理内核 |
 
 ## 开源策略与版权保护
@@ -277,6 +557,7 @@ dev/
 | release/version.json | GitHub 仓库公开 | 版本元数据（供软件更新检查） |
 | docs/ | GitHub 仓库公开 | 开发文档 |
 | EXE文件 | GitHub/Gitee Releases | 用户下载，非仓库存储 |
+| APK文件 | GitHub/Gitee Releases | Android用户下载 |
 | dev/app/ 源码 | **不公开** | 核心代码仅本地保留 |
 | build/ 构建脚本 | **不公开** | 构建工具仅本地保留 |
 
@@ -289,7 +570,7 @@ dev/
 | 并行 | Gitee | `gitee.com/api/v5/repos/yunjii/ip/contents/release/version.json` | 视仓库可见性 | 国内直连 |
 | 并行 | GitHub | `raw.githubusercontent.com/yunjii-cn/ip/main/release/version.json` | ❌ | 需代理 |
 
-下载EXE时根据版本检查的来源自动选择对应的 Releases。
+下载EXE/APK时根据版本检查的来源自动选择对应的 Releases。
 
 ### 令牌管理
 
@@ -302,110 +583,63 @@ dev/
 
 **安全提醒**：源码中不得硬编码任何令牌或密钥。
 
-## 核心文件说明
-
-### 应用目录 (`dev/app/`)
-
-| 文件 | 用途 | 说明 |
-|------|------|------|
-| `main.py` | 主程序 | PyQt6 GUI，代理管理核心，含自部署逻辑 |
-| `launcher.py` | 入口文件 | 杀旧进程 + 调用 main.py |
-| `icon.ico` | 应用图标 | Windows图标 |
-| `icon.png` | 高清图标 | PNG格式图标 |
-| `requirements.txt` | Python依赖 | PyQt6等 |
-| `version_history.json` | 版本历史 | 构建记录 |
-| `Quick/` | 代理内核 | quick.exe + 配置 + 数据库 |
-
-### 构建脚本 (`build/build.py`)
-
-**构建命令**：
-```bash
-python build/build.py
-```
-
-**构建流程**：
-1. 动态生成版本号：`YYYY.MM.DD.HHMM`
-2. 将版本号注入 `dev/app/main.py` 和 `version_info.txt`
-3. PyInstaller 从 `launcher.py` 构建 EXE
-4. EXE 移动到 `dev/dist/` 目录（测试输出）
-5. 在 `dev/` 创建硬链接入口 `云集智能网联代理专家.exe` → dist 中 EXE
-6. 生成整合包ZIP（含EXE+内核+配置）
-7. 构建完成后恢复源代码中的版本号
-8. **测试稳定后**：手动将 EXE 从 `dev/dist/` 移入 `dev/ver/`，重建硬链接入口指向 ver
-
-### 开发启动脚本 (`dev/运行.bat`)
-
-双击即可运行 Python 源码进行开发调试，无需命令行。
-
 ## 技术栈
 
-### Windows 桌面端
+### 前端技术
 
-| 技术 | 用途 |
-|------|------|
-| Python 3.12+ | 开发语言 |
-| PyQt6 | GUI框架 |
-| PyInstaller | EXE打包 |
-| quick.exe | 代理内核（Clash内核） |
-| Windows硬链接 | 版本切换（mklink /H） |
-| Windows Registry | 系统代理配置 |
-| wininet API | 代理设置即时生效 |
-| GitHub Releases | 版本分发（主） |
-| Gitee Releases | 版本分发（备用） |
-
-### Android 手机端
-
-| 技术 | 用途 |
-|------|------|
-| Capacitor | 混合应用框架（WebView + 原生插件） |
-| Android VpnService | VPN 隧道创建与 TUN 接口管理 |
-| mihomo (Clash.Meta) | 代理内核（arm64 native library） |
-| Os.posix_spawn() | 启动 mihomo 进程（保留 TUN fd） |
-| Gradle | 构建系统 |
-
-## 代理内核管理
-
-### 内核自动下载
-
-首次运行时自动检测代理内核，若缺失则自动下载最新稳定版。首页实时显示内核状态和下载进度：
-
-| 状态 | 首页文案 | 颜色 | 进度条 |
-|------|---------|------|--------|
-| 就绪 | ✅ 代理内核已启用 | 绿色 | 隐藏 |
-| 初始化 | ⏳ 获取新版代理内核... | 蓝橙色 | 隐藏 |
-| 获取信息 | ⏳ 获取代理内核信息... | 蓝橙色 | 隐藏 |
-| 下载中 | ⏳ 下载代理内核 vX.X.X... | 蓝橙色 | 显示，实时百分比 |
-| 失败 | ⚠ 代理内核下载失败，请在代理设置中获取更新 | 红色 | 隐藏 |
-| 缺失 | ⚠ 代理内核缺失，点击修复 | 红色 | 隐藏 |
-
-核心方法：`_set_home_kernel_status(state, text)` 统一更新首页状态，`_on_home_kernel_download_percent(pct)` 更新进度条。
-
-### 内核版本规则
-
-mihomo 内核有两种版本类型，**预览版数字可能大于稳定版但不代表更新**：
-
-| 类型 | 示例 | 说明 |
+| 技术 | 版本 | 用途 |
 |------|------|------|
-| 稳定版 | v1.19.25 | 经过测试的正式版本，默认只显示此类 |
-| 预览版（Alpha） | 1.26.3 | 不稳定，需手动开启预览版开关 |
+| Vue 3 | 3.5+ | 组合式 API + TypeScript |
+| Vant 4 | 4.9+ | UI 组件库 |
+| Vite | 6.x | 构建工具 |
+| Pinia | 3.x | 状态管理 |
+| Vue Router | 4.x | SPA 路由 |
+| Axios | 1.x | HTTP 客户端 |
+| TypeScript | 5.x | 类型系统 |
 
-预览版开关（`ToggleSwitch("预览版")`）位于代理内核页面，默认关闭。自动下载始终选择最新稳定版。
+### 后端技术
 
-### 内核下载策略
+| 技术 | 版本 | 用途 |
+|------|------|------|
+| Python | 3.12+ | 开发语言 |
+| FastAPI | 0.115+ | 异步 Web 框架 |
+| uvicorn | 0.34+ | ASGI 服务器 |
+| Pydantic | 2.x | 数据验证 |
+| websockets | 12.x | WebSocket 支持 |
 
-`KernelDownloadWorker` 按优先级尝试：GitHub加速镜像 → 本地代理直连 → 系统代理直连 → GitHub直连。
+### 桌面端技术
 
-## project.json 单一数据源
+| 技术 | 版本 | 用途 |
+|------|------|------|
+| pywebview | 5.3+ | 桌面壳（调用系统 WebView2） |
+| PyInstaller | 6.x | EXE 打包 |
+| Windows API | - | 系统代理设置 |
+| wininet | - | 代理配置即时生效 |
 
-所有路径、命名、仓库信息由 `project.json` 统一驱动。代码通过 `_load_project_config()` 读取，具备三级回退：
+### 移动端技术
 
-1. EXE模式 → PyInstaller 捆绑的 project.json
-2. 源码模式 → 项目根目录的 project.json
-3. 读取失败 → 内嵌 `_DEFAULTS` 默认值（零兼容代码）
+| 技术 | 版本 | 用途 |
+|------|------|------|
+| Capacitor | 6.x | 原生 APP 打包框架 |
+| Android SDK | API 24+ | Android 原生开发 |
+| VpnService | Android API | VPN 隧道实现 |
+| Gradle | 8.x | Android 构建工具 |
+| Java/Kotlin | 11+ | Android 原生代码 |
 
-修改目录结构只需编辑 `project.json`，无需改动代码。构建时通过 `--add-data=project.json;.` 打包进 EXE。
+### 代理内核
 
-> 详细技术设计见 `docs/架构说明.md`
+| 技术 | 版本 | 用途 |
+|------|------|------|
+| mihomo | latest | Clash Meta 内核 |
+| TUN 模式 | - | Android 流量拦截 |
+| HTTP 模式 | - | Windows 系统代理 |
+
+### 分发渠道
+
+| 平台 | 用途 |
+|------|------|
+| GitHub Releases | 全球用户下载（无空间限制） |
+| Gitee Releases | 国内用户下载（速度快） |
 
 ## 开发规范指令
 
@@ -432,7 +666,7 @@ When working on this project, follow these rules:
 - **源码目录**：`dev/web/android/`（Capacitor + Android 原生项目）
 - **构建命令**：`cd dev/web/android && .\gradlew.bat assembleDebug`
 - **APK 输出**：`dev/web/android/app/build/outputs/apk/production/debug/云集智能网联代理专家_YYYYMMDD_HHMM.apk`
-- **APK 分发目录**：`phone/android/app/`（构建后需手动复制 APK 到此目录）
+- **APK 分发目录**：`dev/apk/`（构建后需手动复制 APK 到此目录）
 - **关键源码文件**：
   - `dev/web/android/app/src/main/java/com/yunjii/proxy/MihomoPlugin.java` — 代理管理核心插件
   - `dev/web/android/app/src/main/java/com/yunjii/proxy/MihomoVpnService.java` — VPN 服务实现
@@ -443,7 +677,7 @@ When working on this project, follow these rules:
 
 ### 发布规范
 - 发布命令：`python build/release.py`（全自动，一条命令完成构建+发布）
-- GitHub Release 上传 EXE + ZIP（无空间限制）
+- GitHub Release 上传 EXE + ZIP + APK（无空间限制）
 - Gitee Release 只上传 EXE（1GB空间限制，自动清理旧版本）
 - 发布前确保 `dev/app/.gitee_token` 和 `dev/app/.github_token` 已配置
 - **版本描述是必填流程**：发布前必须更新 `dev/app/version_history.json`，添加版本号、日期和变更列表
@@ -453,7 +687,7 @@ When working on this project, follow these rules:
 
 ### Git提交规范
 - 只提交公开文件：`README.md`、`docs/`、`release/version.json`
-- 不提交私有文件：`dev/app/`、`build/`、`dev/ver/*.exe`
+- 不提交私有文件：`dev/app/`、`build/`、`dev/ver/*.exe`、`dev/apk/*.apk`
 - 提交信息格式：`v版本号: 修改描述`
 - 推送到 GitHub，Gitee 自动镜像
 
@@ -486,3 +720,10 @@ When working on this project, follow these rules:
 - 内核状态通过 `_set_home_kernel_status(state, text)` 统一管理，不要直接操作 UI 组件
 - 自动下载始终选择最新稳定版，不受预览版开关影响
 - mihomo 预览版数字可能大于稳定版，但稳定版才是经过测试的版本
+
+### Web化架构开发规范
+- 前端代码位于 `dev/web/` 目录，使用 Vue 3 + Vant 4 + TypeScript
+- 后端 API 位于 `dev/app/routes/` 目录，使用 FastAPI
+- 平台适配层位于 `dev/web/src/platform/` 目录，自动检测桌面/手机平台
+- 桌面版使用 pywebview 加载前端，手机号使用 Capacitor 打包
+- 前后端通信通过 HTTP API + WebSocket，地址：`http://127.0.0.1:18080`
