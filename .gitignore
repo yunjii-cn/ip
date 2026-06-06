@@ -7,6 +7,7 @@ dev/frontend/
 dev/mobile/
 
 # ========== 构建目录（私有） ==========
+!build/build_web.py
 build/
 
 # ========== 便携浏览器和代理内核（体积大） ==========
