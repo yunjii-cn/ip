@@ -30,6 +30,20 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QPoint, QPropertyAnimation, QEasingCurve, pyqtProperty, QRectF, QMetaObject, Q_ARG
 from PyQt6.QtGui import QPixmap, QIcon, QFont, QColor, QPainter, QPen, QFontMetrics, QPalette, QLinearGradient, QTextOption
 
+# 隐藏启动时闪现的控制台窗口（PyInstaller 默认是 console 子系统，会弹一个黑色 cmd 窗口）
+# 双重保险：ShowWindow(SW_HIDE) + FreeConsole，前者隐藏窗口，后者彻底分离控制台
+# 避免在自部署进度条跑到一半时，闪一个黑框在进度条左上角
+if os.name == 'nt':
+    try:
+        _hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if _hwnd:
+            ctypes.windll.user32.ShowWindow(_hwnd, 0)  # SW_HIDE
+        # FreeConsole 必须在所有日志 handler 初始化之前调用，否则 logging.StreamHandler 会失效
+        # 但日志还有文件 handler，所以 console handler 失效不影响保存日志
+        ctypes.windll.kernel32.FreeConsole()
+    except Exception:
+        pass
+
 def _load_project_config():
     _DEFAULTS = {
         "brand_name": "云集智能网联代理专家",
@@ -73,7 +87,37 @@ def _load_project_config():
 
 _CFG = _load_project_config()
 
-VERSION = datetime.now().strftime(_CFG["version_format"])
+def _get_build_version():
+    """获取封装时固定的版本号。
+    优先级：
+    1. 从EXE内嵌的 _build_version.txt 读取（构建时写入，最可靠）
+    2. 从EXE文件名提取版本号（如 xxx-v2026.06.06.0936.exe）
+    3. 开发模式：使用当前日期时间
+    版本号在封装时确定，不受运行时日期或用户改名影响。
+    """
+    # 1. 从内嵌版本文件读取（构建时通过 --add-data 打包进EXE）
+    if getattr(sys, 'frozen', False):
+        meipass = getattr(sys, '_MEIPASS', '')
+        if meipass:
+            ver_file = os.path.join(meipass, '_build_version.txt')
+            if os.path.isfile(ver_file):
+                try:
+                    with open(ver_file, 'r', encoding='utf-8') as f:
+                        ver = f.read().strip()
+                        if re.match(r'\d{4}\.\d{2}\.\d{2}\.\d{4}', ver):
+                            return ver
+                except Exception:
+                    pass
+    # 2. 从EXE文件名提取版本号
+    if getattr(sys, 'frozen', False):
+        exe_name = os.path.basename(sys.executable)
+        m = re.search(r'v(\d{4}\.\d{2}\.\d{2}\.\d{4})', exe_name)
+        if m:
+            return m.group(1)
+    # 3. 开发模式：使用当前日期时间
+    return datetime.now().strftime(_CFG["version_format"])
+
+VERSION = _get_build_version()
 GITHUB_REPO = _CFG["repos"]["github"]
 GITEE_REPO = _CFG["repos"]["gitee"]
 MIHOMO_REPO = _CFG["repos"]["mihomo"]
@@ -498,10 +542,32 @@ def _self_deploy(exe_dir):
     deploy_dir = os.path.join(exe_dir, base_name)
     already_deployed = os.path.isdir(deploy_dir) and os.path.isfile(os.path.join(deploy_dir, _CFG["paths"]["lock_file"]))
 
+    # 构造静默启动新进程的参数（彻底避免新 EXE 弹出黑框）
+    # DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP 三重保险：
+    # - DETACHED_PROCESS：脱离父进程控制台
+    # - CREATE_NO_WINDOW：不创建新控制台窗口
+    # - CREATE_NEW_PROCESS_GROUP：创建新进程组，避免继承父进程的任何控制台资源
+    _silent_popen_kwargs = dict(
+        creationflags=0x00000008 | 0x08000000 | 0x00000200,  # DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if os.name == 'nt':
+        try:
+            _si = subprocess.STARTUPINFO()
+            _si.dwFlags |= 0x00000001  # STARTF_USESHOWWINDOW
+            _si.wShowWindow = 0        # SW_HIDE
+            _silent_popen_kwargs['startupinfo'] = _si
+        except Exception:
+            pass
+
     if already_deployed:
         entry_exe = os.path.join(deploy_dir, f"{base_name}.exe")
         if os.path.isfile(entry_exe) and os.path.normpath(src_exe) != os.path.normpath(entry_exe):
-            subprocess.Popen([entry_exe, f"--cleanup={src_exe}"])
+            # 已部署：启动入口并自销毁，保持进度条不间断
+            subprocess.Popen([entry_exe, f"--cleanup={src_exe}"], **_silent_popen_kwargs)
+            time.sleep(1.2)  # 让新进程的进度条先显示出来再退出，避免闪屏
             os._exit(0)
         return deploy_dir
 
@@ -535,8 +601,77 @@ def _self_deploy(exe_dir):
         except OSError:
             shutil.copy2(target_exe, entry_exe)
 
-    subprocess.Popen([entry_exe, f"--cleanup={src_exe}"])
+    # 在桌面创建硬链接快捷方式（必须完全静默，不能出现任何窗口）
+    _create_desktop_shortcut(entry_exe)
+
+    # 启动新进程并等待其进度条显示出来，再彻底退出原进程
+    subprocess.Popen([entry_exe, f"--cleanup={src_exe}"], **_silent_popen_kwargs)
+    time.sleep(1.5)  # 让新进程的进度条先出现，避免桌面闪现
     os._exit(0)
+
+
+def _create_desktop_shortcut(entry_exe):
+    """在桌面创建指向入口EXE的硬链接快捷方式"""
+    try:
+        # 通过注册表获取桌面路径
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders") as key:
+            desktop_path = winreg.QueryValueEx(key, "Desktop")[0]
+        if not desktop_path or not os.path.isdir(desktop_path):
+            return
+
+        base_name = BRAND_NAME
+        # 使用 .lnk 快捷方式（标准方式，桌面图标美观）
+        lnk_path = os.path.join(desktop_path, f"{base_name}.lnk")
+        # 如果已存在同名硬链接文件，先删除
+        exe_link = os.path.join(desktop_path, f"{base_name}.exe")
+        if os.path.isfile(exe_link):
+            try:
+                os.remove(exe_link)
+            except OSError:
+                pass
+        # 如果快捷方式不存在，则创建
+        if not os.path.isfile(lnk_path):
+            _create_windows_shortcut(lnk_path, entry_exe)
+    except Exception as e:
+        log.warning(f"创建桌面快捷方式失败: {e}")
+
+
+def _create_windows_shortcut(lnk_path, target_exe):
+    """在桌面创建硬链接文件（同名 .exe），双击即启动入口
+
+    优先级（全程不弹任何窗口）：
+    1. ctypes.windll.kernel32.CreateHardLinkW —— 直接系统调用，最快最静
+    2. os.link —— Pythonic 硬链接，同上不产生新进程
+    3. 复制入口 EXE（最坏情况，至少保证桌面有可点图标）
+    """
+    # 方案1：ctypes 直接调用 Win32 API（无任何进程产生，绝对静默）
+    try:
+        if not os.path.isfile(lnk_path):
+            if ctypes.windll.kernel32.CreateHardLinkW(
+                ctypes.c_wchar_p(lnk_path),
+                ctypes.c_wchar_p(target_exe),
+                None
+            ):
+                return
+    except Exception:
+        pass
+
+    # 方案2：os.link（同盘符时与方案1等价，也无新进程）
+    try:
+        if not os.path.isfile(lnk_path):
+            os.link(target_exe, lnk_path)
+            return
+    except OSError:
+        pass
+
+    # 方案3：最后回退到文件复制（保证至少能双击启动，仍静默无窗口）
+    try:
+        if not os.path.isfile(lnk_path):
+            shutil.copy2(target_exe, lnk_path)
+    except Exception:
+        pass
 
 
 def _find_dev_dir():
@@ -2113,6 +2248,80 @@ class CopyableLabel(QTextEdit):
             super().setStyleSheet(style)
 
 
+class ElidedLabel(QLabel):
+    """单行省略号标签：宽度不足时自动在右侧显示…
+
+    与 CopyableLabel 的区别：
+      - 基于 QLabel 而非 QTextEdit，开销更小
+      - 强制单行显示，不换行
+      - 宽度不足时自动调用 QFontMetrics.elidedText 省略
+      - 完整内容通过 setToolTip 单独提供
+    """
+
+    def __init__(self, text="", parent=None):
+        super().__init__(parent)
+        self._full_text = text or ""
+        self.setWordWrap(False)
+        # 不允许用户选中文字（保持单行省略号的简洁）
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._update_elided_text()
+
+    def setText(self, text):
+        """设置完整文本（宽度不够时自动在右侧加…）"""
+        self._full_text = text or ""
+        self._update_elided_text()
+
+    def fullText(self):
+        return self._full_text
+
+    def _update_elided_text(self):
+        if not self._full_text:
+            super().setText("")
+            return
+        fm = self.fontMetrics()
+        # 预留 4px 边距，避免文字触边
+        avail = max(10, self.width() - 4)
+        elided = fm.elidedText(self._full_text, Qt.TextElideMode.ElideRight, avail)
+        super().setText(elided)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_elided_text()
+
+
+def _clean_release_body(body):
+    """清洗 mihomo release notes 的 Markdown，保留可读文本。
+
+    处理内容：
+      - ## What's Changed  →  What's Changed
+      - **Full Changelog** →  Full Changelog
+      - [text](url)        →  text
+      - * feat: ...        →  • feat: ...
+      - <br> 等 HTML 标签   →  移除
+      - 长 commit hash 列表 →  去掉 hash 前缀，加 •
+    """
+    if not body:
+        return ""
+    # 移除 HTML 标签（<br>、<a> 等）
+    body = re.sub(r"<[^>]+>", "", body)
+    # 移除 markdown 标题符号（##、### 等）
+    body = re.sub(r"^#+\s*", "", body, flags=re.MULTILINE)
+    # 转换粗体 **text** → text
+    body = re.sub(r"\*\*([^*]+)\*\*", r"\1", body)
+    # 转换斜体 *text* → text（避免与 commit hash 后的空格冲突，先做粗体）
+    body = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", body)
+    # 转换 markdown 链接 [text](url) → text
+    body = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", body)
+    # 移除 commit hash 前缀（7-40 位 hex 字符 + 至少一个空格）
+    body = re.sub(r"^\s*[0-9a-f]{7,40}\s+", "• ", body, flags=re.MULTILINE)
+    # 移除普通 bullet 符号（*、-）转为统一 •
+    body = re.sub(r"^\s*[\*\-]\s+", "• ", body, flags=re.MULTILINE)
+    # 合并 3 个以上连续换行为 2 个
+    body = re.sub(r"\n{3,}", "\n\n", body)
+    return body.strip()
+
+
 def _make_help_btn(tooltip, detail_title, detail_text):
     btn = QPushButton()
     btn.setFixedSize(22, 22)
@@ -2154,7 +2363,24 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._splash = splash
         self.setWindowTitle(APP_NAME)
-        self.setMinimumSize(560, 780)
+
+        # 根据屏幕分辨率动态设置窗口尺寸
+        screen = QApplication.primaryScreen()
+        if screen:
+            screen_geom = screen.availableGeometry()
+            # 窗口高度不超过屏幕可用高度的90%，宽度不超过90%
+            max_w = int(screen_geom.width() * 0.90)
+            max_h = int(screen_geom.height() * 0.90)
+            base_w, base_h = 780, 780
+            win_w = min(base_w, max_w)
+            win_h = min(base_h, max_h)
+            # 最小尺寸设为较小值，内容通过滚动区域保证不被压缩
+            self.setMinimumSize(min(780, max_w), min(600, max_h))
+            self.resize(win_w, win_h)
+        else:
+            self.setMinimumSize(780, 600)
+            self.resize(780, 780)
+
         self.setStyleSheet(STYLESHEET)
         self.setAutoFillBackground(True)
 
@@ -2164,7 +2390,6 @@ class MainWindow(QMainWindow):
         self.settings = load_settings()
         self._version_data_ready.connect(self._on_version_data_ready)
         self._kernel_versions_ready.connect(self._on_kernel_versions_ready)
-        self._show_prerelease_kernels = False
 
         global PROXY_HOST, PROXY_PORT
         saved_host = self.settings.get("proxy_host", PROXY_HOST)
@@ -2175,6 +2400,8 @@ class MainWindow(QMainWindow):
             PROXY_PORT = int(saved_port)
         _update_proxy_url()
         self._auto_download_kernel = False
+        # 首次运行时从EXE内嵌资源还原数据文件（versions.json、gitlog.json）
+        self._restore_bundled_data()
         self.quick_dir = self._resolve_quick_dir()
         self.current_line = self.settings.get("current_line", "")
         self.line_results = {}
@@ -2190,6 +2417,9 @@ class MainWindow(QMainWindow):
 
         self._set_icon()
         self._build_ui()
+
+        # 初始化内容区最小高度（延迟到布局计算完成后）
+        QTimer.singleShot(100, self._update_content_min_height)
 
         if self._splash:
             self._splash.set_progress(0.8, "正在初始化...")
@@ -2215,7 +2445,12 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(1000, self._startup_download_config)
 
-        QTimer.singleShot(300, self._load_kernel_versions_cache)
+        # 加载内核版本列表（缓存或本地数据）
+        QTimer.singleShot(300, self._init_kernel_list)
+
+        # 恢复调试模式
+        if self.settings.get("debug_mode", False):
+            self._start_debug_log()
 
         if self._splash:
             self._splash.set_progress(1.0, "加载完成！")
@@ -2234,11 +2469,124 @@ class MainWindow(QMainWindow):
             log.info(f"使用保存的内核路径: {saved}")
             return saved
         os.makedirs(quick_dir, exist_ok=True)
+
+        # 尝试从EXE内嵌资源还原代理核心（构建时通过 --add-data 打包）
+        self._restore_bundled_kernel(quick_dir)
+
+        # 还原成功则直接使用，无需自动下载
+        if os.path.isfile(os.path.join(quick_dir, "quick.exe")):
+            log.info(f"已从内嵌资源还原代理核心: {quick_dir}")
+            self.settings["quick_dir_path"] = quick_dir
+            save_settings(self.settings)
+            return quick_dir
+
         self.settings["quick_dir_path"] = quick_dir
         save_settings(self.settings)
         log.info(f"内核目录已创建，等待下载内核: {quick_dir}")
         self._auto_download_kernel = True
         return quick_dir
+
+    def _restore_bundled_kernel(self, quick_dir):
+        """从EXE内嵌资源还原代理核心到Quick目录。
+        构建时将 mihomo 内核通过 --add-data 打包进EXE的 _MEIPASS/Quick/ 目录。
+        首次运行时自动还原，避免用户没有核心或下载不到核心。
+
+        精简策略（白名单复制）：只还原 mihomo 启动必需的文件，
+        跳过 ui/（pywebview 单独路径加载）、cache.db（运行时自动生成）、
+        config.yaml_backup（运行时自动备份）等冗余文件，加快首次启动速度。
+        """
+        if not getattr(sys, 'frozen', False):
+            return
+        meipass = getattr(sys, '_MEIPASS', '')
+        if not meipass:
+            return
+
+        bundled_quick = os.path.join(meipass, "Quick")
+        if not os.path.isdir(bundled_quick):
+            return
+
+        bundled_exe = os.path.join(bundled_quick, "quick.exe")
+        if not os.path.isfile(bundled_exe):
+            return
+
+        # 顶层文件白名单：mihomo 启动必需的配置文件和数据文件
+        # 不含 ui/（pywebview 走其他路径）、cache.db（运行时自动生成）、
+        #      config.yaml_backup（运行时自动备份）
+        top_level_whitelist = {
+            "_kernel_version.txt",  # 当前内核版本号
+            "config.yaml",          # mihomo 启动配置
+            "Country.mmdb",         # IP 地理位置库
+            "GeoSite.dat",          # 域名分类库
+        }
+
+        try:
+            kernels_dir = os.path.join(quick_dir, "kernels")
+            os.makedirs(kernels_dir, exist_ok=True)
+
+            # 1. 复制白名单内的顶层文件（不存在才复制，避免覆盖用户已有配置）
+            for basename in top_level_whitelist:
+                src = os.path.join(bundled_quick, basename)
+                if not os.path.isfile(src):
+                    continue
+                dst = os.path.join(quick_dir, basename)
+                if not os.path.exists(dst):
+                    shutil.copy2(src, dst)
+
+            # 2. 复制 kernels/ 下所有内核文件（不限制后缀，便于未来扩展多平台内核）
+            bundled_kernels = os.path.join(bundled_quick, "kernels")
+            if os.path.isdir(bundled_kernels):
+                import glob as _glob
+                for item in _glob.glob(os.path.join(bundled_kernels, "*")):
+                    basename = os.path.basename(item)
+                    target = os.path.join(kernels_dir, basename)
+                    if not os.path.exists(target):
+                        shutil.copy2(item, target)
+
+            # 3. 创建 quick.exe 硬链接指向还原的内核（选择最新版本）
+            quick_exe = os.path.join(quick_dir, "quick.exe")
+            if not os.path.isfile(quick_exe):
+                kernel_files = [f for f in os.listdir(kernels_dir) if f.endswith('.exe')]
+                if kernel_files:
+                    kernel_files.sort(reverse=True)  # 字符串倒序，单版本时也成立
+                    source_kernel = os.path.join(kernels_dir, kernel_files[0])
+                    try:
+                        os.link(source_kernel, quick_exe)
+                    except OSError:
+                        # 不支持硬链接时退化为普通复制
+                        shutil.copy2(source_kernel, quick_exe)
+
+            log.info(f"代理核心已从内嵌资源还原: {quick_dir}")
+        except Exception as e:
+            log.error(f"还原内嵌代理核心失败: {e}")
+
+    def _restore_bundled_data(self):
+        """从EXE内嵌资源还原数据文件（versions.json、gitlog.json）到本地dev/app/目录。
+        构建时通过 --add-data 打包进EXE的 _MEIPASS/ 目录。
+        首次运行时自动还原，后续检查更新时从远程获取覆盖本地。
+        """
+        if not getattr(sys, 'frozen', False):
+            return
+        meipass = getattr(sys, '_MEIPASS', '')
+        if not meipass:
+            return
+
+        dev_dir = self._get_dev_dir()
+        app_dir = os.path.join(dev_dir, _CFG["paths"]["app"])
+
+        for filename in ["versions.json", "gitlog.json", "kernel_versions_cache.json"]:
+            local_path = os.path.join(app_dir, filename)
+            # 本地已存在则跳过（说明已还原过或检查更新已覆盖）
+            if os.path.isfile(local_path):
+                continue
+            bundled_path = os.path.join(meipass, filename)
+            if not os.path.isfile(bundled_path):
+                continue
+            try:
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                shutil.copy2(bundled_path, local_path)
+                log.info(f"已从内嵌资源还原数据文件: {filename}")
+            except Exception as e:
+                log.error(f"还原内嵌数据文件 {filename} 失败: {e}")
 
     def _set_icon(self):
         if hasattr(sys, '_MEIPASS'):
@@ -2282,6 +2630,8 @@ class MainWindow(QMainWindow):
             btn.setObjectName("nav-btn")
             btn.setCheckable(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            # 顶部菜单按钮收窄 10px：默认每个按钮约 186px（780 窗口下），限制为 176px
+            btn.setMaximumWidth(176)
             btn.clicked.connect(lambda checked, i=idx: self._on_nav_clicked(i))
             nav_bar.addWidget(btn, stretch=1)
             self.nav_buttons.append(btn)
@@ -2294,9 +2644,38 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._build_proxy_tab())
         self.stack.addWidget(self._build_log_tab())
         self.stack.addWidget(self._build_update_tab())
-        layout.addWidget(self.stack, stretch=1)
+        self.stack.currentChanged.connect(self._update_content_min_height)
+
+        # 整个内容区用一个滚动区域包裹，避免每个tab单独包裹导致宽度截断
+        self._content_scroll = QScrollArea()
+        self._content_scroll.setWidgetResizable(True)
+        self._content_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._content_scroll.setStyleSheet(
+            f"QScrollArea {{ background-color: {COLOR_BG}; border: none; }}"
+            f"QScrollBar:vertical {{ width: 6px; background: transparent; margin: 0; }}"
+            f"QScrollBar::handle:vertical {{ background: #444; border-radius: 3px; min-height: 30px; }}"
+            f"QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}"
+            f"QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}"
+        )
+        self._content_scroll.setWidget(self.stack)
+        layout.addWidget(self._content_scroll, stretch=1)
 
         return container
+
+    def _update_content_min_height(self):
+        """切换tab时更新QStackedWidget的最小高度，防止内容被垂直压缩。
+        只约束高度，宽度由滚动区域视口决定，不会截断。
+        """
+        current = self.stack.currentWidget()
+        if not current:
+            return
+        # 强制布局计算
+        current.layout().activate() if current.layout() else None
+        min_h = current.minimumSizeHint().height()
+        # 设置stack的最小高度为当前页面的最小高度，宽度不约束
+        self.stack.setMinimumHeight(max(min_h, 1))
+        self.stack.setMinimumWidth(0)
 
     def _on_nav_clicked(self, idx):
         for i, btn in enumerate(self.nav_buttons):
@@ -2573,13 +2952,14 @@ class MainWindow(QMainWindow):
         sm_layout_title.addWidget(_make_help_btn(
             "智能线路管理",
             "智能线路说明",
-            "【断线自动重连】\n"
-            "每10秒检测代理连通性，发现断线时自动重连当前线路。\n"
+            "【断线自动切换】\n"
+            "每10秒检测代理连通性，发现断线时自动切换到最快线路。\n"
             "适合网络不稳定时保持代理持续在线。\n\n"
             "【定时切换最快线路】\n"
             "按设定间隔检测所有线路延迟，自动切换到最快线路。\n"
             "适合长时间使用时自动优化线路质量。\n\n"
-            "两个功能独立控制，可按需开启，也可同时开启互补。\n\n"
+            "两个功能独立控制，可按需开启，也可同时开启互补。\n"
+            "同时开启时：断线时立即切换最快线路，定时检测持续优化。\n\n"
             "【每次检测前更新配置】\n"
             "开启后，每次检测线路都会先下载最新线路配置。\n"
             "关闭时，每天仅自动更新一次配置。"
@@ -2593,10 +2973,10 @@ class MainWindow(QMainWindow):
         rrr.setContentsMargins(14, 8, 14, 8)
         reconnect_info = QVBoxLayout()
         reconnect_info.setSpacing(1)
-        reconnect_lbl = QLabel("🔄 断线自动重连")
+        reconnect_lbl = QLabel("🔄 断线自动切换")
         reconnect_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
         reconnect_info.addWidget(reconnect_lbl)
-        reconnect_desc = QLabel("每10秒检测连通性，断线时自动重连当前线路")
+        reconnect_desc = QLabel("每10秒检测连通性，断线时自动切换到最快线路")
         reconnect_desc.setObjectName("dim")
         reconnect_desc.setStyleSheet("font-size: 8pt;")
         reconnect_info.addWidget(reconnect_desc)
@@ -2656,14 +3036,6 @@ class MainWindow(QMainWindow):
         update_config_lbl = QLabel("📥 每次检测前更新配置")
         update_config_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
         update_config_title_row.addWidget(update_config_lbl)
-        update_config_title_row.addWidget(_make_help_btn(
-            "每次检测前更新配置",
-            "每次检测前更新配置说明",
-            "【每次检测前更新配置】\n"
-            "开启后，每次点击「检测线路」都会先下载最新的线路服务器配置。\n"
-            "关闭时，每天仅自动更新一次配置，当天已更新过则直接检测。\n\n"
-            "建议在网络不稳定时开启，确保使用最新的线路信息。"
-        ))
         update_config_title_row.addStretch()
         update_config_info.addLayout(update_config_title_row)
         update_config_desc = QLabel("开启后检测线路时始终先更新线路配置")
@@ -2676,8 +3048,6 @@ class MainWindow(QMainWindow):
         self.switch_always_update_config.toggled.connect(lambda checked: self._save_setting("always_update_config", checked))
         ucr.addWidget(self.switch_always_update_config, alignment=Qt.AlignmentFlag.AlignVCenter)
         sm.addWidget(update_config_row)
-
-        layout.addWidget(smart_card)
 
         browser_card = QFrame()
         browser_card.setObjectName("card")
@@ -2792,6 +3162,8 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(browser_card)
 
+        layout.addWidget(smart_card)
+
         layout.addStretch()
         return page
 
@@ -2817,7 +3189,7 @@ class MainWindow(QMainWindow):
             "代理功能设置",
             "代理功能说明",
             "【浏览器代理】\n"
-            "控制浏览器是否通过本地代理访问网络，始终开启。\n\n"
+            "浏览器始终通过本地代理访问网络。\n\n"
             "【代理范围】\n"
             "全部浏览器：通过系统代理设置，所有浏览器都走代理。\n"
             "指定浏览器：仅对线路服务页面选定的浏览器设置代理参数，\n"
@@ -2833,38 +3205,20 @@ class MainWindow(QMainWindow):
         browser_row.setObjectName("switch-row")
         br = QHBoxLayout(browser_row)
         br.setContentsMargins(14, 8, 14, 8)
-        browser_info = QVBoxLayout()
-        browser_info.setSpacing(1)
         browser_lbl = QLabel("🌐 浏览器代理")
         browser_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
-        browser_info.addWidget(browser_lbl)
-        self.browser_proxy_desc = QLabel("浏览器通过本地代理访问")
-        self.browser_proxy_desc.setObjectName("dim")
-        self.browser_proxy_desc.setStyleSheet("font-size: 8pt;")
-        browser_info.addWidget(self.browser_proxy_desc)
-        br.addLayout(browser_info, stretch=1)
-        browser_switch = ToggleSwitch("", default=True)
-        browser_switch.setEnabled(False)
-        browser_switch.setFixedWidth(80)
-        br.addWidget(browser_switch, alignment=Qt.AlignmentFlag.AlignVCenter)
-        pl.addWidget(browser_row)
-
-        browser_mode_row = QFrame()
-        browser_mode_row.setObjectName("switch-row")
-        bmr = QHBoxLayout(browser_mode_row)
-        bmr.setContentsMargins(14, 8, 14, 8)
-        bmr.addWidget(QLabel("代理范围:"))
+        br.addWidget(browser_lbl)
+        br.addStretch()
         self.browser_proxy_group = []
         self.all_browser_rb = RadioButton("全部浏览器", default=self.settings.get("browser_proxy_mode", "all") == "all")
         self.browser_proxy_group.append(self.all_browser_rb)
-        bmr.addWidget(self.all_browser_rb)
+        br.addWidget(self.all_browser_rb)
         self.spec_browser_rb = RadioButton("指定浏览器", default=self.settings.get("browser_proxy_mode", "all") == "specified")
         self.browser_proxy_group.append(self.spec_browser_rb)
-        bmr.addWidget(self.spec_browser_rb)
-        bmr.addStretch()
+        br.addWidget(self.spec_browser_rb)
         self.all_browser_rb.toggled.connect(lambda checked: self._on_proxy_mode_radio_toggled("all", checked))
         self.spec_browser_rb.toggled.connect(lambda checked: self._on_proxy_mode_radio_toggled("specified", checked))
-        pl.addWidget(browser_mode_row)
+        pl.addWidget(browser_row)
 
         self.specified_browser_hint = QLabel("")
         self.specified_browser_hint.setObjectName("dim")
@@ -3021,12 +3375,17 @@ class MainWindow(QMainWindow):
 
         kernel_card = QFrame()
         kernel_card.setObjectName("card")
+        # 灵活自适应：Preferred/Preferred 策略，不硬卡最大高度
+        # 让卡片根据内部内容自然伸缩（收起 ~100px，展开 ~250px）
+        kernel_card.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         kl = QVBoxLayout(kernel_card)
-        kl.setSpacing(8)
-        kl.setContentsMargins(20, 14, 20, 14)
+        # 顶部内边距稍大（10px），让标题行的检查更新按钮视觉上不顶到卡片上沿
+        # 底部 8px，水平 12px，控件间距 4px，整体比之前更舒展
+        kl.setSpacing(4)
+        kl.setContentsMargins(12, 10, 12, 8)
 
         kernel_title_row = QHBoxLayout()
-        kernel_title_row.setSpacing(4)
+        kernel_title_row.setSpacing(6)
         kernel_title = QLabel("代理内核")
         kernel_title.setObjectName("accent")
         kernel_title.setStyleSheet("font-size: 9pt; font-weight: bold;")
@@ -3045,39 +3404,58 @@ class MainWindow(QMainWindow):
             "切换到已下载的其他内核版本。\n"
             "如遇新版本问题，可回滚到旧版本。"
         ))
+        # 检查更新按钮：与标题同一行右侧，垂直居中
+        # 尺寸调整为 92x28，比之前的 100x22 更舒展、不扁
+        # 与版本页"检查更新"按钮（80x26）保持同款蓝色实心圆角风格
+        self.btn_check_kernel = QPushButton("🔄 检查更新")
+        self.btn_check_kernel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_check_kernel.setFixedSize(92, 28)
+        self.btn_check_kernel.setStyleSheet(
+            f"QPushButton {{ background-color: {COLOR_BLUE}; color: #FFFFFF; border: none; border-radius: 6px; "
+            f"font-size: 9pt; font-weight: bold; padding: 0px; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
+            f"QPushButton:pressed {{ background-color: {COLOR_BLUE}; padding-top: 1px; padding-left: 1px; }}"
+        )
+        self.btn_check_kernel.clicked.connect(self._on_check_kernel_btn)
         kernel_title_row.addStretch()
+        kernel_title_row.addWidget(self.btn_check_kernel, 0, Qt.AlignmentFlag.AlignVCenter)
         kl.addLayout(kernel_title_row)
 
+        # 描述行：当前版本 + 已是最新版本/最新版本 + 共X个版本可用
+        # 三个标签在同一行内紧凑展示，整体放在"检查更新"按钮下面
         kernel_info_row = QHBoxLayout()
-        kernel_info_row.setSpacing(12)
+        kernel_info_row.setSpacing(10)
         self.kernel_current_label = QLabel(f"当前版本: {self._get_mihomo_version() or '未知'}")
         self.kernel_current_label.setStyleSheet(f"font-size: 9pt; color: {COLOR_GREEN}; font-weight: bold;")
         kernel_info_row.addWidget(self.kernel_current_label)
         self.kernel_latest_label = QLabel("")
         self.kernel_latest_label.setStyleSheet(f"font-size: 9pt; color: {COLOR_DIM};")
         kernel_info_row.addWidget(self.kernel_latest_label)
-        self._prerelease_toggle = ToggleSwitch("预览版", default=False)
-        self._prerelease_toggle.setFixedWidth(100)
-        self._prerelease_toggle.toggled.connect(self._on_prerelease_toggle)
-        kernel_info_row.addWidget(self._prerelease_toggle)
-        kernel_info_row.addStretch()
-
-        self.btn_check_kernel = QPushButton("🔄 检查更新")
-        self.btn_check_kernel.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_check_kernel.setFixedSize(100, 28)
-        self.btn_check_kernel.setStyleSheet(
-            f"QPushButton {{ background-color: {COLOR_BLUE}; color: #FFFFFF; border: none; border-radius: 6px; "
-            f"font-size: 8pt; font-weight: bold; }}"
-            f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
-        )
-        self.btn_check_kernel.clicked.connect(self._on_check_kernel_btn)
-        kernel_info_row.addWidget(self.btn_check_kernel)
+        # 版本数量描述（"共 X 个版本可用  |  上次检查: ..."）
+        # 位置：推到 info_row 最右端，与上方"检查更新"按钮的右边缘对齐
+        #   视觉上让"检查更新 → 数量反馈"形成一条从右上到右下的对齐线
+        #   占据中间空白用 addStretch() 自适应填充（无论窗口宽度如何都对齐）
+        self.kernel_count_label = QLabel("")
+        self.kernel_count_label.setStyleSheet(f"font-size: 9pt; color: {COLOR_DIM};")
+        kernel_info_row.addStretch()  # 关键：stretch 必须在 count 之前
+        kernel_info_row.addWidget(self.kernel_count_label)
 
         kl.addLayout(kernel_info_row)
 
+        # 状态行（默认隐藏，仅显示"正在检查..."等瞬时状态，不展示数量信息）
         self.kernel_status = CopyableLabel("", max_height=30)
+        self.kernel_status.setVisible(False)
+        # 文本非空时自动显示，为空时自动隐藏（避免在 30+ 个 setText 处手动控制）
+        self.kernel_status.textChanged.connect(
+            lambda: self.kernel_status.setVisible(bool(self.kernel_status.toPlainText().strip()))
+        )
         kl.addWidget(self.kernel_status)
+        # 描述行与下载列表之间保持 10px 间隔（setSpacing=4 + 此处 addSpacing(6) = 10）
+        kl.addSpacing(6)
 
+        # 列表区域：默认显示 2 排高度的下载列表框，框内显示提示文案
+        # 点检查更新获取到结果后再展开高度
+        self._kernel_scroll_visible = True
         self._kernel_scroll = QScrollArea()
         self._kernel_scroll.setWidgetResizable(True)
         self._kernel_scroll.setStyleSheet(
@@ -3089,16 +3467,65 @@ class MainWindow(QMainWindow):
         self._kernel_scroll_layout = QVBoxLayout(self._kernel_scroll_content)
         self._kernel_scroll_layout.setContentsMargins(0, 0, 0, 0)
         self._kernel_scroll_layout.setSpacing(0)
-        self._kernel_scroll_layout.addStretch()
+        # 提示标签：默认显示，拿到版本列表后隐藏
+        self._kernel_hint_label = QLabel("点击「检查更新」获取最新版本列表")
+        self._kernel_hint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._kernel_hint_label.setStyleSheet(
+            f"color: {COLOR_DIM}; font-size: 9pt; padding: 6px 4px; background: transparent; border: none;"
+        )
+        # 紧凑高度（2 排），用 setMaximumHeight 控制上限，避免内容撑高
+        self._kernel_hint_label.setMaximumHeight(44)
+        self._kernel_scroll_layout.addWidget(self._kernel_hint_label)
+        # 表头行：版本 / 发布日期 / 更新说明(stretch) / 状态 / 操作
+        # 关键：表头作为独立控件常驻在 scroll 布局的 index=1 位置，永远在下载列表最上方
+        # 之前用 insertWidget(1, header_row) + insertWidget(count-1, card) 的写法，
+        # 每次插入 card 都会把表头向下挤，导致表头被推到底部。
+        # 改为：表头作为常驻控件仅创建/显示一次，cards 通过 addWidget 直接追加到尾部。
+        # 列宽调整（与下方卡片"5 列"一一对应）：
+        #   版本 70（v1.19.25 紧凑），发布日期 105（容纳 "2026-06-07 04:45" 完整显示），
+        #   状态 90（"🧪 预发布 99MB" 紧凑），操作 100（容纳"🔄 切换 + 🗑"），
+        #   更新说明 stretch（占满剩余宽度，与状态列互换位置后视觉重心更平衡）
+        self._kernel_header_row = QFrame()
+        self._kernel_header_row.setObjectName("kernel_header_row")
+        self._kernel_header_row.setStyleSheet(
+            "background-color: #1a1a1a; border: none; border-bottom: 1px solid #2a2a2a;"
+        )
+        header_layout = QHBoxLayout(self._kernel_header_row)
+        header_layout.setContentsMargins(10, 5, 10, 5)
+        header_layout.setSpacing(6)
+        for text, width, stretch in [
+            ("版本", 70, 0), ("发布日期", 105, 0), ("更新说明", 0, 1),
+            ("状态", 90, 0), ("操作", 100, 0)
+        ]:
+            lbl = QLabel(text)
+            if width > 0:
+                lbl.setFixedWidth(width)
+            lbl.setStyleSheet("font-size: 8pt; color: #FFFFFF; border: none; font-weight: bold;")
+            header_layout.addWidget(lbl, stretch=stretch)
+        self._kernel_header_row.setVisible(False)  # 默认隐藏，拿到版本列表后显示
+        self._kernel_scroll_layout.addWidget(self._kernel_header_row)
+        # 关键：不加 addStretch()！
+        # 原因：addStretch() 在 setMaximumHeight(N) 限制下，会撑满 scroll area
+        #       视口的剩余空间，把后续插入的 cards 挤到不可见区域，
+        #       导致"列表只有一排"的 bug。直接让 layout 由 widgets sizeHint 决定。
         self._kernel_scroll.setWidget(self._kernel_scroll_content)
-        kl.addWidget(self._kernel_scroll, stretch=1)
+        self._kernel_scroll.setVisible(True)
+        # 默认紧凑 2 排高度（约 50px），点检查更新获取到结果后由 _show_kernel_list 调高
+        self._kernel_scroll.setMaximumHeight(50)
+        # 收起时不再 stretch，让卡片按内容自适应；展开时再 stretch
+        kl.addWidget(self._kernel_scroll)
 
-        layout.addWidget(kernel_card, stretch=1)
+        # 保存为实例属性，便于 _show_kernel_list 动态调整最大高度
+        self.kernel_card = kernel_card
+        # 不加 stretch=1，让卡片根据内容自适应高度，避免被父布局拉伸导致收起状态也无法压缩
+        layout.addWidget(kernel_card)
 
         self.sys_proxy_lbl = QLabel("")
         self.sys_proxy_lbl.setObjectName("dim")
         self._update_sys_proxy_label()
         layout.addWidget(self.sys_proxy_lbl)
+        # 关键：末尾加 stretch，把父布局的剩余空白吃掉，避免下方露出大片黑色空区域
+        layout.addStretch(1)
         return page
 
     def _build_log_tab(self):
@@ -3113,18 +3540,84 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.log_text)
 
         btn_row = QHBoxLayout()
-        clear_btn = QPushButton("清空日志")
-        clear_btn.setObjectName("small-blue")
+        btn_row.setSpacing(20)
+        btn_row.setContentsMargins(0, 0, 0, 0)
+
+        # 跟随滚动开关（红色，开关态时高亮）
+        self._log_auto_scroll = True
+        self.btn_auto_scroll = QPushButton("📌 跟随")
+        self.btn_auto_scroll.setCheckable(True)
+        self.btn_auto_scroll.setChecked(True)
+        self.btn_auto_scroll.setCursor(Qt.CursorShape.PointingHandCursor)
+        # 日志栏目下方按钮收窄 10px：原 min-width 90 → 80
+        self.btn_auto_scroll.setMinimumWidth(80)
+        self.btn_auto_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.btn_auto_scroll.setStyleSheet(
+            f"QPushButton {{ background-color: {COLOR_RED}; color: #fff; border: none; border-radius: 4px; "
+            f"font-size: 8pt; font-weight: bold; padding: 4px 6px; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_RED_LIGHT}; }}"
+            f"QPushButton:!checked {{ background-color: #555; color: #aaa; }}"
+            f"QPushButton:!checked:hover {{ background-color: #666; color: #ccc; }}"
+        )
+        self.btn_auto_scroll.toggled.connect(self._on_auto_scroll_toggled)
+        btn_row.addWidget(self.btn_auto_scroll)
+
+        # 复制日志
+        copy_btn = QPushButton("📋 复制")
+        copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        copy_btn.setMinimumWidth(80)
+        copy_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        copy_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; border: none; border-radius: 4px; "
+            f"font-size: 8pt; font-weight: bold; padding: 4px 6px; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
+        )
+        copy_btn.clicked.connect(self._on_copy_log)
+        btn_row.addWidget(copy_btn)
+
+        # 保存日志
+        save_btn = QPushButton("💾 保存")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setMinimumWidth(80)
+        save_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        save_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; border: none; border-radius: 4px; "
+            f"font-size: 8pt; font-weight: bold; padding: 4px 6px; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
+        )
+        save_btn.clicked.connect(self._on_export_log)
+        btn_row.addWidget(save_btn)
+
+        # 清空日志
+        clear_btn = QPushButton("🗑 清空")
         clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear_btn.setMinimumWidth(80)
+        clear_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        clear_btn.setStyleSheet(
+            f"QPushButton {{ background-color: #555; color: #ddd; border: none; border-radius: 4px; "
+            f"font-size: 8pt; font-weight: bold; padding: 4px 6px; }}"
+            f"QPushButton:hover {{ background-color: #666; }}"
+        )
         clear_btn.clicked.connect(self.log_text.clear)
         btn_row.addWidget(clear_btn)
-        btn_row.addStretch()
 
-        export_btn = QPushButton("导出日志")
-        export_btn.setObjectName("small-blue")
-        export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        export_btn.clicked.connect(self._on_export_log)
-        btn_row.addWidget(export_btn)
+        # 调试模式开关（深绿色按钮样式，与跟随开关风格一致）
+        self.btn_debug_mode = QPushButton("🐛 调试")
+        self.btn_debug_mode.setCheckable(True)
+        self.btn_debug_mode.setChecked(self.settings.get("debug_mode", False))
+        self.btn_debug_mode.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_debug_mode.setMinimumWidth(80)
+        self.btn_debug_mode.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.btn_debug_mode.setStyleSheet(
+            f"QPushButton {{ background-color: #2E5D3A; color: #fff; border: none; border-radius: 4px; "
+            f"font-size: 8pt; font-weight: bold; padding: 4px 6px; }}"
+            f"QPushButton:hover {{ background-color: #3A7548; }}"
+            f"QPushButton:checked {{ background-color: #1E7D34; }}"
+            f"QPushButton:checked:hover {{ background-color: #2A9D45; }}"
+        )
+        self.btn_debug_mode.toggled.connect(self._on_debug_mode_toggled)
+        btn_row.addWidget(self.btn_debug_mode)
+
         layout.addLayout(btn_row)
 
         handler = QTextEditLogHandler(self._append_log)
@@ -3157,7 +3650,7 @@ class MainWindow(QMainWindow):
         btn_about.clicked.connect(self._show_about)
         header_layout.addWidget(btn_about)
 
-        self._ver_tab_stable_btn = QPushButton("软件版本")
+        self._ver_tab_stable_btn = QPushButton("正式版本")
         self._ver_tab_stable_btn.setFixedSize(110, 30)
         self._ver_tab_stable_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._ver_tab_stable_btn.setStyleSheet(
@@ -3186,12 +3679,12 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(_make_help_btn(
             "软件版本管理",
             "软件更新说明",
-            "【软件版本】\n"
-            "显示已发布正式版本的列表，可切换、下载和查看更新内容。\n"
+            "【正式版本】\n"
+            "已发布的正式版本列表，可切换、下载和查看更新内容。\n"
             "绿色标记为当前使用的版本。\n\n"
             "【开发动态】\n"
-            "显示远程仓库的开发提交记录，仅开发者可见。\n"
-            "需要本地有源码环境才能切换到开发版。\n\n"
+            "全量开发提交记录，每次构建时从git历史生成。\n"
+            "点击检查更新可获取远程最新开发动态。\n\n"
             "【切换版本】\n"
             "点击「切换」按钮可在已下载的版本间切换，\n"
             "切换后程序会自动重启。\n\n"
@@ -3238,6 +3731,7 @@ class MainWindow(QMainWindow):
         self._ver_scroll_layout.setSpacing(6)
         self._ver_scroll_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         scroll_area.setWidget(self._ver_scroll_content)
+        self._ver_scroll = scroll_area
         layout.addWidget(scroll_area, stretch=1)
 
         self._ver_stable_data = []
@@ -3340,8 +3834,9 @@ class MainWindow(QMainWindow):
 
     def _append_log(self, msg):
         self.log_text.append(msg)
-        scrollbar = self.log_text.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        if getattr(self, '_log_auto_scroll', True):
+            scrollbar = self.log_text.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
 
     def _update_kernel_status(self):
         has_kernel = bool(self._get_quick_version())
@@ -3684,7 +4179,6 @@ class MainWindow(QMainWindow):
         browser_name = os.path.basename(browser_path) if browser_path else "未选择"
         if mode == "all":
             self.specified_browser_hint.setText("所有浏览器都将通过代理访问网络")
-            self.browser_proxy_desc.setText("浏览器通过本地代理访问")
         else:
             type_label = ""
             if browser_path and os.path.isfile(browser_path):
@@ -3692,7 +4186,6 @@ class MainWindow(QMainWindow):
                 type_map = {"chromium": "Chromium内核", "firefox": "Firefox", "unknown": "未知内核"}
                 type_label = f" [{type_map.get(bt, '未知内核')}]"
             self.specified_browser_hint.setText(f"当前指定浏览器: {browser_name}{type_label}" + (f" ({browser_path})" if browser_path else ""))
-            self.browser_proxy_desc.setText("仅指定浏览器通过代理访问")
 
     def _get_current_browser_name(self):
         browser_type = self.settings.get("browser_type", "system")
@@ -3762,19 +4255,50 @@ class MainWindow(QMainWindow):
         if not is_proxy_running() and self.settings.get("proxy_enabled", False):
             if self.worker and self.worker.isRunning():
                 return
-            log.warning("实时检测: 代理断开，尝试重连")
+            log.warning("实时检测: 代理断开，尝试切换到最快线路")
             self._cleanup_worker()
-            if self.current_line and self.current_line in self.line_results and self.line_results[self.current_line]:
-                self.worker = ServiceWorker("use_line", name=self.current_line,
-                                            data=self.line_results[self.current_line],
-                                            quick_dir=self.quick_dir,
-                                            proxy_enabled=True)
-                self.worker.line_selected.connect(self._on_line_selected)
-                self.worker.progress.connect(lambda t: self.svc_detail_label.setText(t))
-                self.worker.finished.connect(self._on_use_line_finished)
-                self.worker.start()
-            elif self.quick_dir:
+            # 断线时自动检测所有线路并切换到最快的
+            self._auto_switch_on_disconnect()
+
+    def _auto_switch_on_disconnect(self):
+        """断线时自动检测所有线路并切换到最快的线路"""
+        if not self.line_results:
+            # 没有线路数据时，直接启动代理
+            if self.quick_dir:
                 self._on_start()
+            return
+        # 检测所有线路延迟，选择最快的
+        best_line = None
+        best_latency = 999999
+        for name, data in self.line_results.items():
+            if not data:
+                continue
+            latency = self.line_latencies.get(name, 0)
+            if latency > 0 and latency < best_latency:
+                best_latency = latency
+                best_line = name
+        if best_line and best_line != self.current_line:
+            log.info(f"断线切换: 从 {self.current_line} 切换到最快线路 {best_line} ({best_latency}ms)")
+            self.worker = ServiceWorker("use_line", name=best_line,
+                                        data=self.line_results[best_line],
+                                        quick_dir=self.quick_dir,
+                                        proxy_enabled=True)
+            self.worker.line_selected.connect(self._on_line_selected)
+            self.worker.progress.connect(lambda t: self.svc_detail_label.setText(t))
+            self.worker.finished.connect(self._on_use_line_finished)
+            self.worker.start()
+        elif self.current_line and self.current_line in self.line_results and self.line_results[self.current_line]:
+            # 没有更好的线路，重连当前线路
+            self.worker = ServiceWorker("use_line", name=self.current_line,
+                                        data=self.line_results[self.current_line],
+                                        quick_dir=self.quick_dir,
+                                        proxy_enabled=True)
+            self.worker.line_selected.connect(self._on_line_selected)
+            self.worker.progress.connect(lambda t: self.svc_detail_label.setText(t))
+            self.worker.finished.connect(self._on_use_line_finished)
+            self.worker.start()
+        elif self.quick_dir:
+            self._on_start()
 
     def _on_auto_start_toggled(self, checked):
         self._save_setting("auto_start", checked)
@@ -4166,14 +4690,60 @@ class MainWindow(QMainWindow):
 
     def _on_export_log(self):
         from PyQt6.QtWidgets import QFileDialog
-        path, _ = QFileDialog.getSaveFileName(self, "导出日志", f"yunji_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt", "文本文件 (*.txt)")
+        path, _ = QFileDialog.getSaveFileName(self, "保存日志", f"yunji_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt", "文本文件 (*.txt)")
         if path:
             try:
                 with open(path, 'w', encoding='utf-8') as f:
                     f.write(self.log_text.toPlainText())
-                log.info(f"日志已导出到: {path}")
+                log.info(f"日志已保存到: {path}")
             except Exception as e:
-                QMessageBox.critical(self, "错误", f"导出日志失败: {e}")
+                QMessageBox.critical(self, "错误", f"保存日志失败: {e}")
+
+    def _on_copy_log(self):
+        clipboard = QApplication.clipboard()
+        text = self.log_text.toPlainText()
+        if text:
+            clipboard.setText(text)
+            log.info("日志已复制到剪贴板")
+
+    def _on_auto_scroll_toggled(self, checked):
+        self._log_auto_scroll = checked
+        if checked:
+            scrollbar = self.log_text.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+
+    def _on_debug_mode_toggled(self, checked):
+        self._save_setting("debug_mode", checked)
+        if checked:
+            self._start_debug_log()
+            log.info("调试模式已开启，日志将实时写入文件")
+        else:
+            self._stop_debug_log()
+            log.info("调试模式已关闭")
+
+    def _start_debug_log(self):
+        """开启调试模式：日志实时写入temp/log目录"""
+        if not hasattr(self, '_debug_log_dir'):
+            self._debug_log_dir = os.path.join(get_app_dir(), "temp", "log")
+        os.makedirs(self._debug_log_dir, exist_ok=True)
+        log_file = os.path.join(self._debug_log_dir, f"debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        try:
+            self._debug_file_handler = logging.FileHandler(log_file, encoding='utf-8')
+            self._debug_file_handler.setFormatter(_formatter)
+            log.addHandler(self._debug_file_handler)
+            self._debug_log_path = log_file
+        except Exception as e:
+            log.error(f"创建调试日志文件失败: {e}")
+
+    def _stop_debug_log(self):
+        """关闭调试模式：移除文件日志handler"""
+        if hasattr(self, '_debug_file_handler') and self._debug_file_handler:
+            try:
+                log.removeHandler(self._debug_file_handler)
+                self._debug_file_handler.close()
+            except Exception:
+                pass
+            self._debug_file_handler = None
 
     def _startup_download_config(self):
         if not self.quick_dir:
@@ -4478,6 +5048,7 @@ class MainWindow(QMainWindow):
         detail_widget = card.findChild(QWidget, "_detail")
         if detail_widget is not None:
             detail_widget.deleteLater()
+            self._update_ver_scroll_geometry()
             return
 
         detail = QFrame()
@@ -4522,11 +5093,13 @@ class MainWindow(QMainWindow):
 
         card_layout = card.layout()
         card_layout.addWidget(detail)
+        self._update_ver_scroll_geometry()
 
     def _toggle_current_card_detail(self, card, changes):
         detail_widget = card.findChild(QWidget, "_detail")
         if detail_widget is not None:
             detail_widget.deleteLater()
+            self._update_ver_scroll_geometry()
             return
 
         detail = QFrame()
@@ -4549,6 +5122,15 @@ class MainWindow(QMainWindow):
 
         card_layout = card.layout()
         card_layout.addWidget(detail)
+        self._update_ver_scroll_geometry()
+
+    def _update_ver_scroll_geometry(self):
+        """版本展开/收起后更新滚动区域内容几何信息，确保滚动条正确显示。"""
+        if hasattr(self, '_ver_scroll') and self._ver_scroll:
+            content = self._ver_scroll.widget()
+            if content:
+                content.updateGeometry()
+                content.adjustSize()
 
     def _render_stable_versions(self, all_versions, current_version):
         self._ver_all_versions = all_versions
@@ -4557,7 +5139,7 @@ class MainWindow(QMainWindow):
         current_in_list = any(v["version"] == current_version for v in all_versions)
         if not current_in_list and current_version:
             current_changes = []
-            vh_path = os.path.join(get_app_dir(), "version_history.json")
+            vh_path = os.path.join(get_app_dir(), "versions.json")
             if os.path.isfile(vh_path):
                 try:
                     with open(vh_path, "r", encoding="utf-8") as f:
@@ -4899,63 +5481,66 @@ class MainWindow(QMainWindow):
 
             self._ver_scroll_layout.addWidget(card)
 
-    def _fetch_remote_commits(self):
-        def do_fetch():
+    def _get_local_gitlog(self):
+        """读取本地开发动态，优先从本地文件，回退到内嵌资源。"""
+        dev_dir = self._get_dev_dir()
+        path = os.path.join(dev_dir, _CFG["paths"]["app"], "gitlog.json")
+        if os.path.exists(path):
             try:
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-
-                def _urlopen_with_proxy(req, timeout=10):
-                    if is_proxy_running():
-                        try:
-                            proxy_handler = urllib.request.ProxyHandler({
-                                'http': f'http://{PROXY_URL}',
-                                'https': f'http://{PROXY_URL}',
-                            })
-                            opener = urllib.request.build_opener(
-                                urllib.request.HTTPSHandler(context=ctx),
-                                proxy_handler,
-                            )
-                            return opener.open(req, timeout=timeout)
-                        except Exception:
-                            pass
-                    return urllib.request.urlopen(req, timeout=timeout, context=ctx)
-
-                data = None
-                gitee_url = f"https://gitee.com/api/v5/repos/{GITEE_REPO}/commits?per_page=20"
-                if GITEE_TOKEN:
-                    gitee_url += f"&access_token={GITEE_TOKEN}"
-                try:
-                    req = urllib.request.Request(gitee_url, headers={"User-Agent": "Mozilla/5.0"})
-                    with _urlopen_with_proxy(req, timeout=10) as resp:
-                        data = json.loads(resp.read().decode())
-                except Exception:
-                    pass
-
-                if data is None:
-                    github_url = f"https://api.github.com/repos/{GITHUB_REPO}/commits?per_page=20"
-                    headers = {"User-Agent": "Mozilla/5.0"}
-                    if GITHUB_TOKEN:
-                        headers["Authorization"] = f"token {GITHUB_TOKEN}"
-                    req = urllib.request.Request(github_url, headers=headers)
-                    with _urlopen_with_proxy(req, timeout=8) as resp:
-                        data = json.loads(resp.read().decode())
-
-                commits = []
-                for c in data:
-                    commit_info = c.get("commit", {})
-                    commits.append({
-                        "sha": c.get("sha", ""),
-                        "message": commit_info.get("message", ""),
-                        "author": commit_info.get("author", {}).get("name", ""),
-                        "date": commit_info.get("author", {}).get("date", ""),
-                    })
-                self._ver_git_data = commits
-                self._version_data_ready.emit()
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return data
             except Exception:
-                self._ver_git_data = []
-                self._version_data_ready.emit()
+                pass
+        # 回退到内嵌资源
+        try:
+            base = getattr(sys, '_MEIPASS', '')
+            if base:
+                bundled = os.path.join(base, "gitlog.json")
+                if os.path.exists(bundled):
+                    with open(bundled, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, list):
+                        return data
+        except Exception:
+            pass
+        # 开发模式：从本地git log读取
+        if not getattr(sys, 'frozen', False):
+            try:
+                project_root = os.path.dirname(_find_dev_dir())
+                result = subprocess.run(
+                    ["git", "log", "--pretty=format:%H|%an|%ai|%s", "--no-merges", "-100"],
+                    capture_output=True, text=True, cwd=project_root, timeout=10
+                )
+                if result.returncode == 0:
+                    commits = []
+                    for line in result.stdout.strip().split("\n"):
+                        if not line.strip():
+                            continue
+                        parts = line.split("|", 3)
+                        if len(parts) == 4:
+                            sha, author, date, message = parts
+                            commits.append({
+                                "sha": sha[:7],
+                                "author": author,
+                                "date": date[:10],
+                                "message": message,
+                            })
+                    if commits:
+                        return commits
+            except Exception:
+                pass
+        return []
+
+    def _fetch_remote_commits(self):
+        """加载开发动态数据。优先从本地gitlog.json读取，回退到内嵌资源。
+        检查更新时从远程获取覆盖本地。
+        """
+        def do_fetch():
+            commits = self._get_local_gitlog()
+            self._ver_git_data = commits
+            self._version_data_ready.emit()
 
         threading.Thread(target=do_fetch, daemon=True).start()
 
@@ -4989,7 +5574,7 @@ class MainWindow(QMainWindow):
 
     def _get_local_version_history(self):
         dev_dir = self._get_dev_dir()
-        path = os.path.join(dev_dir, _CFG["paths"]["app"], "version_history.json")
+        path = os.path.join(dev_dir, _CFG["paths"]["app"], "versions.json")
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as f:
@@ -5000,7 +5585,7 @@ class MainWindow(QMainWindow):
                 pass
         try:
             base = sys._MEIPASS
-            bundled = os.path.join(base, "version_history.json")
+            bundled = os.path.join(base, "versions.json")
             if os.path.exists(bundled):
                 with open(bundled, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -5464,6 +6049,79 @@ class MainWindow(QMainWindow):
 
     def _on_check_update(self):
         self._check_remote_versions()
+        # 同时从远程获取最新开发动态，覆盖本地gitlog.json
+        self._fetch_remote_gitlog()
+
+    def _fetch_remote_gitlog(self):
+        """从远程GitHub/Gitee获取最新提交记录，覆盖本地gitlog.json。"""
+        def do_fetch():
+            commits = []
+            try:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+
+                def _urlopen_with_proxy(req, timeout=10):
+                    if is_proxy_running():
+                        try:
+                            proxy_handler = urllib.request.ProxyHandler({
+                                'http': f'http://{PROXY_URL}',
+                                'https': f'http://{PROXY_URL}',
+                            })
+                            opener = urllib.request.build_opener(
+                                urllib.request.HTTPSHandler(context=ctx),
+                                proxy_handler,
+                            )
+                            return opener.open(req, timeout=timeout)
+                        except Exception:
+                            pass
+                    return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+
+                data = None
+                gitee_url = f"https://gitee.com/api/v5/repos/{GITEE_REPO}/commits?per_page=100"
+                if GITEE_TOKEN:
+                    gitee_url += f"&access_token={GITEE_TOKEN}"
+                try:
+                    req = urllib.request.Request(gitee_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with _urlopen_with_proxy(req, timeout=10) as resp:
+                        data = json.loads(resp.read().decode())
+                except Exception:
+                    pass
+
+                if data is None:
+                    github_url = f"https://api.github.com/repos/{GITHUB_REPO}/commits?per_page=100"
+                    headers = {"User-Agent": "Mozilla/5.0"}
+                    if GITHUB_TOKEN:
+                        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+                    req = urllib.request.Request(github_url, headers=headers)
+                    with _urlopen_with_proxy(req, timeout=8) as resp:
+                        data = json.loads(resp.read().decode())
+
+                for c in data:
+                    commit_info = c.get("commit", {})
+                    commits.append({
+                        "sha": (c.get("sha", ""))[:7],
+                        "author": commit_info.get("author", {}).get("name", ""),
+                        "date": (commit_info.get("author", {}).get("date", ""))[:10],
+                        "message": commit_info.get("message", ""),
+                    })
+            except Exception:
+                pass
+
+            if commits:
+                # 覆盖本地gitlog.json
+                dev_dir = self._get_dev_dir()
+                gitlog_path = os.path.join(dev_dir, _CFG["paths"]["app"], "gitlog.json")
+                try:
+                    os.makedirs(os.path.dirname(gitlog_path), exist_ok=True)
+                    with open(gitlog_path, "w", encoding="utf-8") as f:
+                        json.dump(commits, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+                self._ver_git_data = commits
+                self._version_data_ready.emit()
+
+        threading.Thread(target=do_fetch, daemon=True).start()
 
     def _on_download_update(self):
         if not hasattr(self, '_latest_info') or not self._latest_info:
@@ -5489,16 +6147,68 @@ class MainWindow(QMainWindow):
                 cache = json.load(f)
             releases = cache.get("releases", [])
             if releases and isinstance(releases, list):
+                # 仅把缓存数据加载到内存，不主动展开列表
                 self._kernel_releases = releases
                 self._kernel_current_ver = self._get_mihomo_version()
-                self._kernel_versions_ready.emit()
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _init_kernel_list(self):
+        """初始化内核列表：
+          1. 默认尝试加载本地缓存（kernel_versions_cache.json）
+          2. 如果缓存存在且有效 → 直接渲染版本行 + 展开滚动区
+             （首次启动也能看到下载列表，用户体验更好）
+          3. 无缓存时 → 仅记录本地内核版本号，列表保持收起
+        """
+        loaded = self._load_kernel_versions_cache()
+        if not loaded:
+            # 无缓存，记录本地内核版本号备用（不渲染）
+            self._kernel_releases = []
+            self._kernel_current_ver = self._get_mihomo_version()
+            return
+        # 有缓存：直接渲染 + 展开（与点检查更新后效果一致）
+        try:
+            self._show_kernel_list()
+        except Exception:
+            # 渲染失败也不影响后续检查更新流程
+            pass
+        try:
+            self._kernel_versions_ready.emit()
         except Exception:
             pass
 
-    def _on_prerelease_toggle(self, checked):
-        self._show_prerelease_kernels = checked
-        if getattr(self, '_kernel_releases', []):
-            self._on_kernel_versions_ready()
+    def _show_kernel_list(self):
+        """展开内核版本列表（点检查更新获取到结果后/首次启动加载缓存后调用）
+
+        根据当前版本数量动态计算滚动区高度，保留最大 400px 上限：
+          - 版本少（<11）：完整显示所有行，无需滚动条
+          - 版本多（>=11）：出现垂直滚动条，可滚动浏览剩余版本
+
+        不再硬卡 kernel_card 高度，让卡片随滚动区自然伸缩。
+        """
+        self._kernel_scroll_visible = True
+        self._kernel_scroll.setVisible(True)
+        if hasattr(self, '_kernel_hint_label'):
+            self._kernel_hint_label.setVisible(False)
+        # 表头同步显示（首次展开 / 重新展开都生效）
+        if hasattr(self, '_kernel_header_row') and self._kernel_header_row is not None:
+            self._kernel_header_row.setVisible(True)
+        # 动态计算目标高度：每张卡为单行 5 列结构（描述默认 1 行 + 省略号）
+        #   meta 列（版本/日期/状态/操作）：固定 1 行 ~22px（按钮高）
+        #   描述列：1 行 18px（ElidedLabel 单行省略号）
+        #   卡片实际高度 ≈ 32px（meta 居中 + 描述 1 行 + padding 10px）
+        # 取平均 32px，最小 130px，最大 460px（约 12 排）
+        n = len(getattr(self, '_kernel_releases', []))
+        target_h = min(460, max(130, n * 32 + 50))
+        self._kernel_scroll.setMinimumHeight(target_h)
+        self._kernel_scroll.setMaximumHeight(target_h)
+        # 强制刷新 size hint，让卡片随列表内容自然伸缩
+        if hasattr(self, 'kernel_card') and self.kernel_card is not None:
+            self.kernel_card.updateGeometry()
+        if hasattr(self, '_kernel_scroll') and self._kernel_scroll is not None:
+            self._kernel_scroll.updateGeometry()
 
     def _on_check_kernel_btn(self):
         if hasattr(self, '_kernel_ver_worker') and self._kernel_ver_worker and self._kernel_ver_worker.isRunning():
@@ -5542,18 +6252,33 @@ class MainWindow(QMainWindow):
                 json.dump(cache_data, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
+        # 用户点检查更新后，获取到内核列表后再展开显示下载列表框
+        self._show_kernel_list()
         self._kernel_versions_ready.emit()
 
     def _on_kernel_versions_ready(self):
         releases = getattr(self, '_kernel_releases', [])
         current_ver = getattr(self, '_kernel_current_ver', '')
-        if not releases:
-            self.kernel_status.setText("暂无可用版本")
-            self.kernel_status.setStyleSheet(f"color: {COLOR_DIM};")
-            return
 
         local_kernels = self._list_local_kernels()
         local_map = {k["tag"]: k for k in local_kernels}
+
+        if not releases and not local_kernels:
+            self.kernel_status.setText("暂无可用版本")
+            self.kernel_status.setStyleSheet(f"color: {COLOR_DIM};")
+            # 清空数量描述
+            if hasattr(self, 'kernel_count_label'):
+                self.kernel_count_label.setText("")
+            # 无版本时显示提示标签，隐藏表头
+            if hasattr(self, '_kernel_hint_label'):
+                self._kernel_hint_label.setVisible(True)
+            if hasattr(self, '_kernel_header_row'):
+                self._kernel_header_row.setVisible(False)
+            return
+
+        # 有版本数据，隐藏提示标签
+        if hasattr(self, '_kernel_hint_label'):
+            self._kernel_hint_label.setVisible(False)
 
         stable_releases = [r for r in releases if not r.get("prerelease", False)]
         latest_tag = stable_releases[0]["tag"] if stable_releases else (releases[0]["tag"] if releases else "")
@@ -5575,36 +6300,67 @@ class MainWindow(QMainWindow):
 
         last_check = self._get_kernel_cache_last_check()
 
-        while self._kernel_scroll_layout.count() > 1:
-            item = self._kernel_scroll_layout.takeAt(0)
+        # 清理旧的版本行 / 提示行
+        # 固定保留：index 0 = hint_label（提示文案），index 1 = _kernel_header_row（列标题表头）
+        # 清理 index 2 及之后的所有项（即 cards 和 tip_row）
+        # 关键修复：旧的写法用 takeAt(1) 会把表头也一起删掉，
+        # 而且 insertWidget(1, header) + insertWidget(count-1, card) 会让表头随每张 card 一起下移，
+        # 最终被挤到下载列表最底部。
+        while self._kernel_scroll_layout.count() > 2:
+            item = self._kernel_scroll_layout.takeAt(2)
             w = item.widget()
             if w:
                 w.deleteLater()
 
-        header_row = QFrame()
-        header_row.setStyleSheet("background-color: #1a1a1a; border: none; border-bottom: 1px solid #2a2a2a;")
-        header_layout = QHBoxLayout(header_row)
-        header_layout.setContentsMargins(10, 5, 10, 5)
-        header_layout.setSpacing(0)
-        for text, width, stretch in [("版本", 100, 0), ("发布日期", 90, 0), ("状态", 100, 0), ("操作", 140, 0)]:
-            lbl = QLabel(text)
-            if width > 0:
-                lbl.setFixedWidth(width)
-            lbl.setStyleSheet("font-size: 8pt; color: #FFFFFF; border: none; font-weight: bold;")
-            header_layout.addWidget(lbl, stretch=stretch)
-        self._kernel_scroll_layout.insertWidget(0, header_row)
+        # 拿到版本列表后显示表头（之前是隐藏的）
+        if hasattr(self, '_kernel_header_row') and self._kernel_header_row is not None:
+            self._kernel_header_row.setVisible(True)
+
+        # 当只有本地内核时，添加一个柔和的提示行
+        # 位置：表头之后（index 2），即 [hint, header, tip, card1, card2, ...]
+        if not releases and local_kernels:
+            tip_row = QFrame()
+            tip_row.setStyleSheet("background-color: #0f1a1f; border: none; border-bottom: 1px dashed #1f2a30;")
+            tip_layout = QHBoxLayout(tip_row)
+            tip_layout.setContentsMargins(10, 6, 10, 6)
+            tip_icon = QLabel("💡")
+            tip_icon.setFixedWidth(20)
+            tip_icon.setStyleSheet("font-size: 9pt; border: none;")
+            tip_layout.addWidget(tip_icon)
+            tip_text = QLabel("下方为本地已下载的代理内核。点击右上「检查更新」可联网获取更多版本。")
+            tip_text.setStyleSheet(f"font-size: 8pt; color: {COLOR_DIM}; border: none;")
+            tip_layout.addWidget(tip_text, stretch=1)
+            # 始终插入到表头之后（index 2），这样 cards 紧跟其后
+            self._kernel_scroll_layout.insertWidget(2, tip_row)
 
         stable_rels = sorted([r for r in releases if not r.get("prerelease", False)], key=lambda r: r.get("published_at", ""), reverse=True)
         pre_rels = sorted([r for r in releases if r.get("prerelease", False)], key=lambda r: r.get("published_at", ""), reverse=True)
-        visible_count = len(stable_rels) + (len(pre_rels) if self._show_prerelease_kernels else 0)
-        check_info = f"共 {visible_count} 个版本可用"
-        if pre_rels and not self._show_prerelease_kernels:
-            check_info += f"（含 {len(pre_rels)} 个预览版，开启预览版开关可见）"
+        sorted_releases = stable_rels
+
+        # 添加本地已下载但不在远程列表中的内核版本
+        remote_tags = {r["tag"] for r in sorted_releases}
+        for local_k in local_kernels:
+            if local_k["tag"] not in remote_tags:
+                sorted_releases.append({
+                    "tag": local_k["tag"],
+                    "name": f"mihomo {local_k['tag']}",
+                    "published_at": "",
+                    "body": "",
+                    "asset_name": None,
+                    "download_url": "",
+                    "prerelease": False,
+                })
+
+        # 版本数量描述：放在"已是最新版本"右侧（info_row 内）
+        # 区别于 kernel_status（瞬时状态提示），这里是持久化信息
+        if releases:
+            self.kernel_count_label.setText(f"共 {len(sorted_releases)} 个版本可用")
+        else:
+            self.kernel_count_label.setText(f"共 {len(sorted_releases)} 个本地版本（点击检查更新获取更多）")
         if last_check:
-            check_info += f"  |  上次检查: {last_check}"
-        self.kernel_status.setText(check_info)
-        self.kernel_status.setStyleSheet(f"color: {COLOR_DIM};")
-        sorted_releases = stable_rels + (pre_rels if self._show_prerelease_kernels else [])
+            self.kernel_count_label.setText(
+                self.kernel_count_label.text() + f"  |  上次检查: {last_check}"
+            )
         for rel in sorted_releases:
             tag = rel["tag"]
             tag_num = tag.lstrip("v")
@@ -5630,24 +6386,77 @@ class MainWindow(QMainWindow):
             card.setStyleSheet(
                 f"background-color: {row_bg}; border: 1px solid {border_color}; border-radius: 0px;"
             )
+            # 卡片采用单行 5 列结构（描述作为表格项，节省纵向高度）：
+            #   版本 | 发布日期 | 更新说明(stretch) | 状态 | 操作
+            # 注：状态列和更新说明列已互换位置（状态原本在第 3 列，更新说明原本在第 4 列）
+            #   互换后视觉重心更平衡：左边"标识+时间+详情"是一组连贯的元信息，
+            #   右边"状态+操作"是用户操作区，分组更清晰。
+            # 描述列占满剩余宽度，垂直居中对齐，整张卡片只有一行。
             card_layout = QHBoxLayout(card)
             card_layout.setContentsMargins(10, 5, 10, 5)
             card_layout.setSpacing(6)
 
             ver_color = "#4CAF50" if is_current else (COLOR_TEXT if is_local else COLOR_DIM)
             ver_label = QLabel(tag)
-            ver_label.setFixedWidth(100)
+            ver_label.setFixedWidth(70)
             ver_font_size = "10pt" if is_current else "9pt"
             ver_label.setStyleSheet(f"font-family: Consolas; font-size: {ver_font_size}; font-weight: bold; color: {ver_color}; border: none;")
+            ver_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
             card_layout.addWidget(ver_label)
 
-            date_label = QLabel(rel.get("published_at", ""))
-            date_label.setFixedWidth(90)
-            date_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_DIM}; border: none;")
+            # 发布日期：宽度 105px，容纳 "2026-06-07 04:45" 完整时间戳不被截断
+            # 原始 GitHub 格式 "2026-06-07T04:45:17Z" 太长（20 字符），
+            # 清洗为 "2026-06-07 04:45"（16 字符），保留日期+小时:分钟，信息密度高
+            date_str = rel.get("published_at", "")
+            if date_str:
+                # 清洗 ISO 8601 → "YYYY-MM-DD HH:MM"（去秒去 Z，替换 T 为空格）
+                date_str = date_str.replace("T", " ").rstrip("Z")[:16]
+            date_label = QLabel(date_str)
+            date_label.setFixedWidth(105)
+            date_label.setStyleSheet(f"font-size: 8pt; color: {COLOR_DIM}; border: none; font-family: Consolas;")
+            date_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
             card_layout.addWidget(date_label)
 
+            # === 更新说明（5 列中第 3 列，stretch 占据剩余宽度）===
+            # 默认只显示一行（取第一个有意义的非空行），宽度不足时自动在右侧省略…
+            # 鼠标悬停时显示完整 cleaned body（tooltip），不需要展开/折叠模式
+            raw_body = (rel.get("body") or "").strip()
+            preview_text = ""
+            full_body_for_tooltip = ""
+            if raw_body:
+                clean_body = _clean_release_body(raw_body)
+                if clean_body:
+                    # 取第一个有意义的非空行（跳过 "What's Changed" / "Full Changelog" 之类章节标题）
+                    non_empty_lines = [l.strip() for l in clean_body.split("\n") if l.strip()]
+                    meaningful = [l for l in non_empty_lines if not l.endswith("Changed") and not l.startswith("Full Changelog")]
+                    if not meaningful:
+                        meaningful = non_empty_lines
+                    if meaningful:
+                        preview_text = meaningful[0]  # 单行预览（首行）
+                    # tooltip 用完整 cleaned body（截前 500 字符防过长）
+                    if len(clean_body) > 500:
+                        full_body_for_tooltip = clean_body[:500] + "…"
+                    else:
+                        full_body_for_tooltip = clean_body
+
+            # 单行省略号标签：固定 18px 高（容纳 8pt 一行），宽度不足自动…
+            # 相比 CopyableLabel 的 2 行模式，整体卡片高度从 38px 降到 32px
+            desc_label = ElidedLabel(preview_text)
+            desc_label.setFixedHeight(18)
+            desc_label.setStyleSheet(
+                f"QLabel {{ color: {COLOR_DIM}; font-size: 8pt; background: transparent; "
+                f"border: none; border-radius: 0px; padding: 0px; margin: 0px; }}"
+            )
+            if full_body_for_tooltip:
+                desc_label.setToolTip(full_body_for_tooltip)
+            desc_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+            # stretch=1 让更新说明列占满剩余宽度
+            card_layout.addWidget(desc_label, stretch=1)
+
+            # === 状态（5 列中第 4 列，与更新说明互换位置） ===
+            # 从第 3 列移到第 4 列：左边"版本+日期+说明"是元信息组，右边"状态+操作"是操作组
             status_label = QLabel("")
-            status_label.setFixedWidth(100)
+            status_label.setFixedWidth(90)
             if is_current:
                 status_label.setText("● 当前版本")
                 status_label.setStyleSheet(f"font-size: 8pt; color: #4CAF50; border: none; font-weight: bold;")
@@ -5671,10 +6480,11 @@ class MainWindow(QMainWindow):
             else:
                 status_label.setText("—")
                 status_label.setStyleSheet(f"font-size: 8pt; color: #555; border: none;")
+            status_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
             card_layout.addWidget(status_label)
 
             action_frame = QFrame()
-            action_frame.setFixedWidth(140)
+            action_frame.setFixedWidth(100)
             action_frame.setStyleSheet(f"background-color: {row_bg}; border: none;")
             action_layout = QHBoxLayout(action_frame)
             action_layout.setContentsMargins(0, 0, 0, 0)
@@ -5723,7 +6533,7 @@ class MainWindow(QMainWindow):
                 dl_btn.clicked.connect(lambda checked, r=rel: self._on_download_kernel(r))
                 action_layout.addWidget(dl_btn)
 
-            if is_local and not is_current:
+            if is_local and not is_current and len(local_kernels) > 1:
                 del_btn = QPushButton("🗑")
                 del_btn.setFixedSize(26, 22)
                 del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -5735,7 +6545,16 @@ class MainWindow(QMainWindow):
             action_layout.addStretch()
             card_layout.addWidget(action_frame)
 
-            self._kernel_scroll_layout.insertWidget(self._kernel_scroll_layout.count() - 1, card)
+            # 直接 addWidget 追加到尾部：
+            #   布局结构稳定为 [hint, header, tip?, card1, card2, ...]
+            #   表头永远在 index=1，不会被 cards 挤到下方
+            self._kernel_scroll_layout.addWidget(card)
+
+        # 强制刷新 size hint，确保卡片高度能跟随列表内容增长
+        if hasattr(self, '_kernel_scroll') and self._kernel_scroll is not None:
+            self._kernel_scroll.updateGeometry()
+        if hasattr(self, 'kernel_card') and self.kernel_card is not None:
+            self.kernel_card.updateGeometry()
 
     def _auto_download_latest_kernel(self):
         if not self.quick_dir:
@@ -5843,7 +6662,12 @@ class MainWindow(QMainWindow):
                         if not tag.startswith("v"):
                             tag = "v" + tag
                     self._on_switch_kernel(path, tag)
-            self._on_check_kernel_btn()
+                else:
+                    self._kernel_current_ver = self._get_mihomo_version()
+                    self._on_kernel_versions_ready()
+            else:
+                self._kernel_current_ver = self._get_mihomo_version()
+                self._on_kernel_versions_ready()
             self._update_kernel_status()
         else:
             self.kernel_status.setText(msg)
@@ -5887,7 +6711,8 @@ class MainWindow(QMainWindow):
             self.kernel_status.setStyleSheet(f"color: {COLOR_GREEN};")
             if was_running and self.settings.get("proxy_enabled", False):
                 self._on_start()
-            self._on_check_kernel_btn()
+            self._kernel_current_ver = tag_num
+            self._on_kernel_versions_ready()
         except PermissionError:
             bat_path = current_exe + "_replace.bat"
             new_exe_src = kernel_path
@@ -5917,6 +6742,8 @@ class MainWindow(QMainWindow):
             self._update_kernel_status()
             self.kernel_status.setText(f"已切换到 mihomo {tag}（将在后台完成替换）")
             self.kernel_status.setStyleSheet(f"color: {COLOR_GREEN};")
+            self._kernel_current_ver = tag_num
+            self._on_kernel_versions_ready()
 
     def _on_delete_kernel(self, kernel_path):
         tag = ""
@@ -5925,6 +6752,11 @@ class MainWindow(QMainWindow):
             tag = m.group(1)
             if not tag.startswith("v"):
                 tag = "v" + tag
+        # 至少保留一个内核
+        local_kernels = self._list_local_kernels()
+        if len(local_kernels) <= 1:
+            QMessageBox.warning(self, "无法删除", "至少需要保留一个代理内核")
+            return
         reply = QMessageBox.question(
             self, "确认删除",
             f"确定要删除 mihomo {tag} 内核文件吗？",
@@ -5935,7 +6767,8 @@ class MainWindow(QMainWindow):
                 os.remove(kernel_path)
                 self.kernel_status.setText(f"已删除 mihomo {tag}")
                 self.kernel_status.setStyleSheet(f"color: {COLOR_DIM};")
-                self._on_check_kernel_btn()
+                self._kernel_current_ver = self._get_mihomo_version()
+                self._on_kernel_versions_ready()
             except Exception as e:
                 self.kernel_status.setText(f"删除失败: {e}")
                 self.kernel_status.setStyleSheet("color: #FF6B80;")
@@ -5943,6 +6776,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._stop_auto_line_timer()
         self._stop_realtime_monitor()
+        self._stop_debug_log()
         self.monitor.stop()
         self.monitor.wait()
         event.accept()
@@ -5988,6 +6822,12 @@ def _global_exception_handler(exc_type, exc_value, exc_tb):
 
 def main():
     sys.excepthook = _global_exception_handler
+
+    # 高精度DPI缩放：PassThrough不取整缩放因子，保证各分辨率下界面比例一致
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 

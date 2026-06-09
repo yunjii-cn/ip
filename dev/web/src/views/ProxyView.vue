@@ -149,7 +149,17 @@
           <button class="btn-help" @click="showHelp('kernel')">?</button>
         </div>
         <span class="kernel-header-spacer"></span>
-        <button class="btn-blue btn-sm" @click="onCheckUpdate" :disabled="kernelStore.loading">🔄 更新</button>
+        <button
+          v-if="kernelStore.versions.length"
+          class="btn-toggle"
+          @click="kernelListCollapsed = !kernelListCollapsed"
+          :title="kernelListCollapsed ? '展开版本列表' : '收起版本列表'"
+        >
+          <span class="toggle-icon" :class="{ collapsed: kernelListCollapsed }">▾</span>
+        </button>
+        <button class="btn-blue btn-sm" @click="onCheckUpdate" :disabled="kernelStore.loading">
+          {{ kernelStore.loading ? '检查中…' : '🔄 更新' }}
+        </button>
       </div>
       <div class="kernel-info-grid">
         <div class="kernel-info-item">
@@ -179,7 +189,7 @@
         stroke-width="4"
         style="margin: 8px 0"
       />
-      <div v-if="kernelStore.versions.length" class="version-list">
+      <div v-if="kernelStore.versions.length && !kernelListCollapsed" class="version-list">
         <div v-for="v in kernelStore.versions" :key="v.version" class="version-item flex-between">
           <div>
             <div class="version-name">
@@ -200,6 +210,9 @@
             <van-tag v-else type="success" size="medium">当前</van-tag>
           </div>
         </div>
+      </div>
+      <div v-else-if="!kernelStore.versions.length && !kernelStore.loading" class="kernel-empty-hint">
+        点击右上角「更新」按钮获取可用内核版本
       </div>
     </div>
 
@@ -250,6 +263,7 @@ const showPrerelease = ref(false)
 const showRestartHint = ref(false)
 const latestVersion = ref('')
 const kernelStatusText = ref('')
+const kernelListCollapsed = ref(false)
 
 const allowedApps = ref<{ name: string; package: string }[]>([])
 const mobileAppList = ref<{ name: string; package: string }[]>([])
@@ -438,6 +452,8 @@ async function onCheckUpdate() {
     if (kernelStore.versions.length > 0) {
       latestVersion.value = kernelStore.versions[0].version
       const isNew = kernelStore.versions[0].version !== kernelStore.version
+      // 拉到结果后自动展开列表，避免用户看不到
+      kernelListCollapsed.value = false
       showToast(isNew ? `最新版本 v${latestVersion.value}，共 ${kernelStore.versions.length} 个版本` : `当前已是最新版本 v${latestVersion.value}`)
     } else {
       showToast('未发现可用版本，请检查网络连接')
@@ -829,6 +845,47 @@ async function loadPlatformData() {
 }
 .card-title-group .card-title {
   margin-bottom: 0;
+}
+
+.btn-toggle {
+  background: transparent;
+  border: 1px solid #2d2d2d;
+  color: var(--text-secondary);
+  width: 28px;
+  height: 26px;
+  border-radius: 6px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: all 0.15s;
+}
+.btn-toggle:hover {
+  background: #1f1f1f;
+  color: var(--text-primary);
+  border-color: #444;
+}
+.btn-toggle .toggle-icon {
+  font-size: 14px;
+  line-height: 1;
+  display: inline-block;
+  transition: transform 0.2s ease;
+}
+.btn-toggle .toggle-icon.collapsed {
+  transform: rotate(-90deg);
+}
+
+.kernel-empty-hint {
+  margin-top: 6px;
+  padding: 14px 12px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: #111;
+  border: 1px dashed #2a2a2a;
+  border-radius: 6px;
+  letter-spacing: 0.3px;
 }
 
 </style>

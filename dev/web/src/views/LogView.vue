@@ -1,10 +1,28 @@
 <template>
   <div class="log-page">
     <div class="log-header">
-      <button class="log-btn" @click="scrollToBottom">⬇ 滚动</button>
-      <button class="log-btn" @click="copyAllLog">📋 复制</button>
-      <button class="log-btn" @click="clearLog">🗑 清空</button>
-      <button class="log-btn" :class="debugMode ? 'log-btn-active' : ''" @click="debugMode = !debugMode">🔧 调试</button>
+      <button
+        class="log-btn log-btn-follow"
+        :class="{ 'log-btn-follow-on': autoScroll }"
+        @click="toggleFollow"
+        :title="autoScroll ? '已开启跟随，新日志自动滚动到底部（点击停止跟随）' : '已停止跟随，日志不会自动滚动（点击开启跟随）'"
+      >
+        <span class="log-btn-icon">{{ autoScroll ? '👁' : '🚫' }}</span>
+        <span class="log-btn-label">跟随</span>
+        <span class="log-btn-dot" v-if="autoScroll"></span>
+      </button>
+      <button class="log-btn" @click="copyAllLog">
+        <span class="log-btn-icon">📋</span>
+        <span class="log-btn-label">复制</span>
+      </button>
+      <button class="log-btn" @click="clearLog">
+        <span class="log-btn-icon">🗑</span>
+        <span class="log-btn-label">清空</span>
+      </button>
+      <button class="log-btn" :class="debugMode ? 'log-btn-active' : ''" @click="debugMode = !debugMode">
+        <span class="log-btn-icon">🔧</span>
+        <span class="log-btn-label">调试</span>
+      </button>
     </div>
     <div class="log-content" ref="logContainer" @scroll="onScroll">
       <div v-for="(line, i) in logLines" :key="i" class="log-line" :class="getLineClass(line)">{{ line }}</div>
@@ -336,7 +354,22 @@ function scrollToBottom() {
 function onScroll() {
   if (!logContainer.value) return
   const { scrollTop, scrollHeight, clientHeight } = logContainer.value
-  autoScroll.value = scrollHeight - scrollTop - clientHeight < 50
+  // 用户向上滚动离开底部时自动停止跟随；只有主动点击"跟随"按钮才会重新开启
+  const atBottom = scrollHeight - scrollTop - clientHeight < 50
+  if (!atBottom && autoScroll.value) {
+    autoScroll.value = false
+  }
+}
+
+function toggleFollow() {
+  if (autoScroll.value) {
+    autoScroll.value = false
+    showToast('已停止跟随')
+  } else {
+    autoScroll.value = true
+    scrollToBottom()
+    showToast('已开启跟随')
+  }
 }
 
 function copyAllLog() {
@@ -372,7 +405,7 @@ function getLineClass(line: string): string {
   align-items: center;
   justify-content: center;
   gap: 8px;
-  padding: 6px 0 4px;
+  padding: 8px 0 6px;
   flex-shrink: 0;
 }
 .log-btn {
@@ -380,12 +413,25 @@ function getLineClass(line: string): string {
   color: var(--text-secondary);
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 5px 14px;
+  padding: 6px 0;
   font-size: 12px;
   cursor: pointer;
   transition: all 0.15s;
   white-space: nowrap;
   line-height: 1.4;
+  min-width: 72px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  position: relative;
+}
+.log-btn-icon {
+  font-size: 13px;
+  line-height: 1;
+}
+.log-btn-label {
+  letter-spacing: 0.5px;
 }
 .log-btn:hover {
   background: #383838;
@@ -395,6 +441,37 @@ function getLineClass(line: string): string {
 .log-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* 跟随按钮：开启时红色高亮，关闭时灰色 */
+.log-btn-follow {
+  border-color: #3a3a3a;
+}
+.log-btn-follow-on {
+  background: #e74c3c;
+  color: #fff;
+  border-color: #e74c3c;
+  box-shadow: 0 0 0 1px #e74c3c40, 0 2px 6px #e74c3c33;
+}
+.log-btn-follow-on:hover {
+  background: #d44133;
+  color: #fff;
+  border-color: #d44133;
+}
+.log-btn-follow-on .log-btn-icon {
+  filter: drop-shadow(0 0 2px rgba(255,255,255,0.4));
+}
+.log-btn-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #fff;
+  margin-left: 2px;
+  animation: log-follow-pulse 1.6s ease-in-out infinite;
+}
+@keyframes log-follow-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.7); }
 }
 .log-content {
   flex: 1;
@@ -432,15 +509,16 @@ function getLineClass(line: string): string {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 12px;
-  padding: 6px 0 2px;
+  gap: 8px;
+  padding: 8px 0 2px;
   flex-shrink: 0;
-  margin-top: 4px;
+  margin-top: 6px;
 }
 .log-btn-debug {
   background: #2a1a1a;
   border-color: #e74c3c33;
   color: #e0a0a0;
+  min-width: 72px;
 }
 .log-btn-debug:hover:not(:disabled) {
   background: #3a2222;
@@ -451,5 +529,10 @@ function getLineClass(line: string): string {
   background: #e74c3c;
   color: #fff;
   border-color: #e74c3c;
+}
+.log-btn-active:hover {
+  background: #d44133;
+  color: #fff;
+  border-color: #d44133;
 }
 </style>
