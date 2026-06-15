@@ -34,6 +34,7 @@ def get_config():
         "custom_apps_enabled": s.get("custom_apps_enabled", False),
         "custom_apps": s.get("custom_apps", []),
         "auto_start": s.get("auto_start", True),
+        "proxy_rules": s.get("proxy_rules", []),
     }
 
 
@@ -42,7 +43,7 @@ def save_config(data: dict):
     from services.config import load_settings, save_settings, _update_proxy_url
     s = load_settings()
     for key in ["proxy_host", "proxy_port", "global_proxy", "browser_proxy_mode",
-                "custom_apps_enabled", "custom_apps", "auto_start"]:
+                "custom_apps_enabled", "custom_apps", "auto_start", "proxy_rules"]:
         if key in data:
             s[key] = data[key]
     save_settings(s)
@@ -51,4 +52,8 @@ def save_config(data: dict):
         cfg.PROXY_HOST = s.get("proxy_host", "127.0.0.1")
         cfg.PROXY_PORT = s.get("proxy_port", 7890)
         _update_proxy_url()
+    # 如果修改了代理规则，重新注入
+    if "proxy_rules" in data:
+        from services.line_service import _inject_custom_rules
+        _inject_custom_rules()
     return {"ok": True}

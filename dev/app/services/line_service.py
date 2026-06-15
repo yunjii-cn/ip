@@ -1,4 +1,5 @@
 import os
+import re
 import ssl
 import socket
 import time
@@ -92,6 +93,7 @@ def _update_line_config(name, primary_url, fallback_url):
     last_update = s.get(f"line_config_date_{name}", "")
 
     if not s.get("always_update_config", False) and last_update == today:
+        _inject_custom_rules()
         return False
 
     quick_dir = _get_quick_dir()
@@ -124,11 +126,62 @@ def _update_line_config(name, primary_url, fallback_url):
                         f.write(data)
                     s[f"line_config_date_{name}"] = today
                     save_settings(s)
+                    _inject_custom_rules()
                     return True
             except Exception as e:
                 log.debug(f"更新线路{name}配置失败(url={url}, proxy={use_proxy}): {e}")
                 continue
+    _inject_custom_rules()
     return False
+
+
+def _inject_custom_rules():
+    """在mihomo的config.yaml中注入用户自定义的代理规则"""
+    s = load_settings()
+    proxy_rules = s.get("proxy_rules", [])
+    if not proxy_rules:
+        return
+
+    quick_dir = _get_quick_dir()
+    if not quick_dir:
+        return
+
+    config_path = os.path.join(quick_dir, "config.yaml")
+    if not os.path.isfile(config_path):
+        return
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # 构建自定义规则行
+        custom_rule_lines = []
+        for rule in proxy_rules:
+            rule_type = rule.get("type", "DOMAIN-SUFFIX")
+            value = rule.get("value", "").strip()
+            if not value:
+                continue
+            # DOMAIN-SUFFIX: 域名后缀匹配, DOMAIN: 完整域名匹配, IP-CIDR: IP段匹配
+            custom_rule_lines.append(f"  - {rule_type},{value},🚀 节点选择")
+
+        if not custom_rule_lines:
+            return
+
+        # 在rules:后面插入自定义规则（放在最前面，优先级最高）
+        rules_pattern = re.compile(r'^(rules:\s*)$', re.MULTILINE)
+        if rules_pattern.search(content):
+            custom_block = "\n".join(custom_rule_lines)
+            content = rules_pattern.sub(r'\1\n' + custom_block, content)
+        else:
+            # 如果没有rules段，追加
+            custom_block = "rules:\n" + "\n".join(custom_rule_lines)
+            content += "\n" + custom_block + "\n"
+
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        log.info(f"已注入 {len(custom_rule_lines)} 条自定义代理规则")
+    except Exception as e:
+        log.error(f"注入自定义代理规则失败: {e}")
 
 
 def _test_single_line(name):

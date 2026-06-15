@@ -25,6 +25,7 @@
         <div v-if="proxyScope === 'specified'" class="scope-warning">
           请在"线路"页面选择指定浏览器
         </div>
+        <div class="setting-divider"></div>
         <div class="setting-row flex-between">
           <div>
             <div>🌍 全局系统代理</div>
@@ -63,13 +64,52 @@
 
     <div class="card">
       <div class="card-title-group">
+        <span class="card-title">📋 代理规则</span>
+        <button class="btn-help" @click="showHelp('rules')">?</button>
+      </div>
+      <div class="info-item" style="margin-bottom: 8px">指定网址或IP强制走代理</div>
+      <div class="setting-row">
+        <div class="rule-add-row">
+          <select class="dark-select rule-type-select" v-model="newRuleType">
+            <option value="DOMAIN-SUFFIX">域名后缀</option>
+            <option value="DOMAIN">完整域名</option>
+            <option value="IP-CIDR">IP地址段</option>
+          </select>
+          <input
+            class="dark-input rule-value-input"
+            v-model="newRuleValue"
+            :placeholder="rulePlaceholder"
+            @keyup.enter="onAddRule"
+          />
+          <button class="btn-blue" @click="onAddRule">＋添加</button>
+        </div>
+      </div>
+      <div v-if="proxyRules.length" class="rule-list">
+        <div v-for="(rule, idx) in proxyRules" :key="idx" class="rule-item flex-between">
+          <div class="rule-info">
+            <span class="rule-type-badge" :class="rule.type">{{ ruleTypeLabel(rule.type) }}</span>
+            <span class="rule-value">{{ rule.value }}</span>
+          </div>
+          <button class="btn-red btn-sm" @click="onRemoveRule(idx)">删除</button>
+        </div>
+      </div>
+      <div v-else class="rule-empty-hint">尚未添加代理规则，添加后指定网址将通过代理访问</div>
+      <div v-if="proxyRules.length" class="restart-hint">
+        ⚠ 修改规则后需重启服务生效
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title-group">
         <span class="card-title">🎯 指定程序代理</span>
         <button class="btn-help" @click="showHelp('app')">?</button>
       </div>
-      <div class="info-item" style="margin-bottom: 8px">添加的程序也通过代理访问</div>
       <template v-if="!isMobile">
         <div class="setting-row flex-between">
-          <div>启用指定程序代理</div>
+          <div>
+            <div>🖥️ 指定程序代理</div>
+            <div class="info-item">添加的程序也通过代理访问</div>
+          </div>
           <van-switch v-model="customAppsEnabled" size="22px" active-color="#e74c3c" @change="onAppProxyChange" />
         </div>
         <div class="setting-row">
@@ -77,7 +117,7 @@
             <span class="scope-label">代理范围:</span>
             <van-radio-group v-model="customAppsScope" direction="horizontal">
               <van-radio name="all" checked-color="#e74c3c">全部指定程序</van-radio>
-              <van-radio name="specified" checked-color="#e74c3c">指定程序</van-radio>
+              <van-radio name="specified" checked-color="#e74c3c">单个指定程序</van-radio>
             </van-radio-group>
           </div>
         </div>
@@ -201,7 +241,7 @@
         stroke-width="4"
         style="margin: 8px 0"
       />
-      <div v-if="kernelStore.versions.length && !kernelListCollapsed" class="version-list">
+      <div v-if="kernelStore.versions.length && !kernelListCollapsed" class="version-list" :style="{ height: versionListHeight + 'px' }">
         <div v-for="v in kernelStore.versions" :key="v.version" class="version-item flex-between">
           <div>
             <div class="version-name">
@@ -221,6 +261,9 @@
             </button>
             <van-tag v-else type="success" size="medium">当前</van-tag>
           </div>
+        </div>
+        <div class="resize-handle" @mousedown="onResizeStart">
+          <div class="resize-bar"></div>
         </div>
       </div>
       <div v-else-if="!kernelStore.versions.length && !kernelStore.loading" class="kernel-empty-hint">
@@ -277,6 +320,46 @@ const showRestartHint = ref(false)
 const latestVersion = ref('')
 const kernelStatusText = ref('')
 const kernelListCollapsed = ref(false)
+const versionListHeight = ref(270)
+
+const proxyRules = ref<{ type: string; value: string }[]>([])
+const newRuleType = ref('DOMAIN-SUFFIX')
+const newRuleValue = ref('')
+
+const rulePlaceholder = computed(() => {
+  if (newRuleType.value === 'DOMAIN-SUFFIX') return '例: agnes-ai.com'
+  if (newRuleType.value === 'DOMAIN') return '例: apihub.agnes-ai.com'
+  return '例: 192.168.1.0/24'
+})
+
+function ruleTypeLabel(type: string): string {
+  if (type === 'DOMAIN-SUFFIX') return '域名后缀'
+  if (type === 'DOMAIN') return '完整域名'
+  if (type === 'IP-CIDR') return 'IP段'
+  return type
+}
+
+function onAddRule() {
+  const value = newRuleValue.value.trim()
+  if (!value) {
+    showToast('请输入网址或IP')
+    return
+  }
+  if (proxyRules.value.some(r => r.type === newRuleType.value && r.value === value)) {
+    showToast('该规则已存在')
+    return
+  }
+  proxyRules.value.push({ type: newRuleType.value, value })
+  newRuleValue.value = ''
+  saveProxyConfig()
+  showToast('已添加')
+}
+
+function onRemoveRule(idx: number) {
+  proxyRules.value.splice(idx, 1)
+  saveProxyConfig()
+  showToast('已删除')
+}
 
 const allowedApps = ref<{ name: string; package: string }[]>([])
 const mobileAppList = ref<{ name: string; package: string }[]>([])
@@ -301,6 +384,10 @@ const helpMessages: Record<string, { title: string; message: string }> = {
     message: isMobile
       ? '代理模式：\n全局VPN - 所有应用通过VPN代理访问网络（本应用自身除外）\n指定应用 - 仅所选应用通过VPN代理访问，其他应用正常联网\n\n修改代理模式后需要重启服务才能生效。'
       : '浏览器代理：为浏览器设置本地代理服务器，所有浏览器流量将通过代理转发。\n\n代理范围：选择"全部浏览器"则为所有浏览器设置代理，选择"指定浏览器"则仅为指定浏览器设置代理。\n\n全局系统代理：开启后所有系统应用的网络请求都将通过代理访问，包括非浏览器程序。',
+  },
+  rules: {
+    title: '代理规则说明',
+    message: '代理规则可以指定特定网址或IP强制走代理，优先级高于默认规则。\n\n规则类型：\n• 域名后缀（DOMAIN-SUFFIX）：匹配域名及其所有子域名\n  例: agnes-ai.com 将匹配 apihub.agnes-ai.com、www.agnes-ai.com 等\n\n• 完整域名（DOMAIN）：仅匹配精确域名\n  例: apihub.agnes-ai.com 仅匹配该域名\n\n• IP地址段（IP-CIDR）：匹配IP地址范围\n  例: 192.168.1.0/24 匹配 192.168.1.0~192.168.1.255\n\n修改规则后需要重启代理服务才能生效。',
   },
   app: {
     title: '指定程序代理说明',
@@ -369,6 +456,7 @@ async function saveProxyConfig() {
         custom_apps: customApps.value,
         browser_proxy: browserProxyOn.value,
         browser_proxy_mode: proxyScope.value,
+        proxy_rules: proxyRules.value,
       })
     }
   } catch (e) {
@@ -482,6 +570,25 @@ function onKernelDownload(ver: string) {
   kernelStore.download(ver)
 }
 
+function onResizeStart(e: MouseEvent) {
+  e.preventDefault()
+  const startY = e.clientY
+  const startHeight = versionListHeight.value
+  const ROW_HEIGHT = 54
+  const MIN_ROWS = 3
+
+  function onMouseMove(ev: MouseEvent) {
+    const delta = ev.clientY - startY
+    versionListHeight.value = Math.max(MIN_ROWS * ROW_HEIGHT, startHeight + delta)
+  }
+  function onMouseUp() {
+    document.removeEventListener('mousemove', onMouseMove)
+    document.removeEventListener('mouseup', onMouseUp)
+  }
+  document.addEventListener('mousemove', onMouseMove)
+  document.addEventListener('mouseup', onMouseUp)
+}
+
 function copyKernelStatus() {
   navigator.clipboard.writeText(kernelStatusText.value)
   showToast('已复制')
@@ -567,6 +674,7 @@ async function loadConfig() {
       customAppsEnabled.value = data.custom_apps_enabled || false
       customAppsScope.value = data.custom_apps_scope || 'all'
       customApps.value = data.custom_apps || []
+      proxyRules.value = data.proxy_rules || []
       if (customApps.value.length > 0) {
         selectedApp.value = customApps.value[0]
       }
@@ -641,6 +749,12 @@ async function loadPlatformData() {
 
 .setting-row:last-child {
   border-bottom: none;
+}
+
+.setting-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
 }
 
 .proxy-scope-row {
@@ -760,8 +874,33 @@ async function loadPlatformData() {
 
 .version-list {
   margin-top: 8px;
-  max-height: 300px;
   overflow-y: auto;
+  position: relative;
+}
+
+.resize-handle {
+  position: sticky;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: ns-resize;
+  background: var(--bg-card);
+  border-top: 1px solid var(--border);
+}
+
+.resize-bar {
+  width: 40px;
+  height: 4px;
+  border-radius: 2px;
+  background: #555;
+}
+
+.resize-handle:hover .resize-bar {
+  background: #888;
 }
 
 .version-item {
@@ -784,6 +923,82 @@ async function loadPlatformData() {
   line-height: 1.8;
   color: var(--text-secondary);
   white-space: pre-line;
+}
+
+.rule-add-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+}
+
+.rule-type-select {
+  flex: 0 0 auto;
+  width: 100px;
+}
+
+.rule-value-input {
+  flex: 1;
+  min-width: 120px;
+}
+
+.rule-list {
+  margin-top: 4px;
+}
+
+.rule-item {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.rule-item:last-child {
+  border-bottom: none;
+}
+
+.rule-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.rule-type-badge {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.rule-type-badge.DOMAIN-SUFFIX {
+  color: #3498db;
+  background: rgba(52, 152, 219, 0.15);
+}
+
+.rule-type-badge.DOMAIN {
+  color: #27ae60;
+  background: rgba(39, 174, 96, 0.15);
+}
+
+.rule-type-badge.IP-CIDR {
+  color: #f39c12;
+  background: rgba(243, 156, 18, 0.15);
+}
+
+.rule-value {
+  font-size: 13px;
+  font-family: Consolas, 'Courier New', monospace;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rule-empty-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 8px 0;
 }
 
 .dark-input :deep(.van-field__control) {

@@ -1,6 +1,34 @@
 {
-    "latest": "2026.06.09.1555",
+    "latest": "2026.06.15.2351",
     "versions": [
+        {
+            "version": "2026.06.15.2351",
+            "date": "2026-06-15",
+            "filename": "云集智能网联代理专家-v2026.06.15.2351.exe",
+            "size_mb": 0,
+            "changes": [
+                "代理方式面板全新重构：采用1大卡片+4子卡片结构（系统代理/浏览器代理/地址代理/程序代理），设计语言统一",
+                "系统代理新增「绕过境内（仅代理境外）」模式：自动注入 GEOIP,CN,DIRECT 规则，国内流量直连，境外走代理",
+                "程序代理支持「全部指定程序/单个指定程序」二选一：与浏览器代理逻辑一致，互斥可选",
+                "新增代理规则功能：支持三种规则类型——指定域名(DOMAIN-SUFFIX)、指定网址(DOMAIN)、IP地址段(IP-CIDR)",
+                "代理规则注入 mihomo config.yaml 的 rules 段最前面，优先级最高，规则随配置同步生效",
+                "系统代理开启时自动联动变灰：浏览器代理/地址代理/程序代理三张子卡片整体禁用，避免冲突",
+                "「检测线路前更新配置」新增频率下拉：每次/每天/每周/每月，跨年也能正确触发",
+                "所有 RadioButton 实例改用 2 选 1 互斥逻辑：系统代理、浏览器代理、程序代理模式均统一行为",
+                "修复系统代理模式 2 选 1 失效 Bug：补全 _on_global_proxy_mode_toggled 互斥循环",
+                "修复 RadioButton 鼠标事件不遵守 _block_signal 标志导致重复 toggle 的隐患",
+                "修复 _should_skip_config_update 周比较年份自比较 Bug（saved_dt.year == saved_dt.year）",
+                "修复 _config_needs_update 同款 Bug",
+                "修复 _on_proxy_edit_confirm 空地址/无效端口无法退出编辑模式的边界问题",
+                "修复 proxy_rules 同步后端 API（routes/proxy.py）：配置保存后自动重新注入规则",
+                "Web 化新架构同步：ProxyView.vue 代理规则管理 UI、main.css 配套样式",
+                "本地代理行控件（地址/端口/修改/复制）整体居中显示，前后等比例 stretch",
+                "代理内核版本表格默认显示 5 行高度，可拖拽手柄自由调整",
+                "所有 ComboBox 改用 UpComboBox：禁止鼠标滚轮切换选项，避免和页面滚动冲突",
+                "清理死代码 _on_update_freq_changed（引用不存在的 update_freq_combo）",
+                "Python 2 残留 u 前缀字符串清理"
+            ]
+        },
         {
             "version": "2026.06.09.1555",
             "date": "2026-06-09",

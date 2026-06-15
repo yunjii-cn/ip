@@ -265,7 +265,8 @@ class ToggleSwitch(QWidget):
         super().__init__(parent)
         self._checked = default
         self._label = label
-        self.setFixedHeight(36)
+        # 不再固定高度，由内容自适应，避免挤占其他行
+        self.setMinimumHeight(24)
         self._update_cursor()
 
         self._track_color_off = QColor("#3A3A3A")
@@ -277,7 +278,7 @@ class ToggleSwitch(QWidget):
         self._anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
 
         if default:
-            self._thumb_x = 36.0
+            self._thumb_x = 42.0
 
     def get_thumb_x(self):
         return self._thumb_x
@@ -300,8 +301,10 @@ class ToggleSwitch(QWidget):
 
     def _animate_thumb(self):
         self._anim.stop()
+        # 动画范围基于 64px track 的 thumb 偏移 (4=左, 42=右)
+        # paintEvent 会按 actual_track_w 缩放，所以这里用 64 基准即可
         self._anim.setStartValue(self._thumb_x)
-        self._anim.setEndValue(36.0 if self._checked else 4.0)
+        self._anim.setEndValue(42.0 if self._checked else 4.0)
         self._anim.start()
 
     def mousePressEvent(self, event):
@@ -316,19 +319,34 @@ class ToggleSwitch(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # 严格裁切到 widget 范围内，避免任何元素画到边界外
+        painter.setClipRect(self.rect())
 
         total_w = self.width()
-        track_rect_x = total_w - 72
-        track_rect_y = 6
+        total_h = self.height()
+        track_h = 22
+        track_r = 11
         track_w = 64
-        track_h = 24
-        track_r = 12
+        # 关键修复：保证 track 起点 >= 0，不画到 widget 外
+        # 想要 layout 是：右 8px 边距 + 64px track + 8px 间隔 + label
+        # 如果 widget 太小装不下完整 track，则按比例缩小
+        right_margin = 4
+        if total_w >= track_w + right_margin:
+            track_rect_x = total_w - track_w - right_margin
+            actual_track_w = track_w
+        else:
+            track_rect_x = 0
+            actual_track_w = max(0, total_w)
+        track_rect_y = (total_h - track_h) // 2
 
         if self._label:
             label_color = QColor(COLOR_DIM) if not self.isEnabled() else QColor(COLOR_TEXT)
             painter.setPen(label_color)
-            painter.setFont(QFont("Microsoft YaHei UI", 10))
-            painter.drawText(0, 0, track_rect_x - 8, 36, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self._label)
+            painter.setFont(QFont("Microsoft YaHei UI", 9))
+            # label 范围：从 0 到 track 起点 - 4
+            label_w = max(0, track_rect_x - 4)
+            if label_w > 0:
+                painter.drawText(0, 0, label_w, total_h, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self._label)
 
         if self.isEnabled():
             track_color = self._track_color_on if self._checked else self._track_color_off
@@ -339,10 +357,14 @@ class ToggleSwitch(QWidget):
 
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(track_color)
-        painter.drawRoundedRect(int(track_rect_x), track_rect_y, track_w, track_h, track_r, track_r)
+        painter.drawRoundedRect(int(track_rect_x), track_rect_y, int(actual_track_w), track_h, track_r, track_r)
 
+        # thumb 严格在 track 内绘制
         thumb_r = 9
-        thumb_cx = track_rect_x + self._thumb_x + thumb_r
+        if actual_track_w >= thumb_r * 2 + 2:
+            thumb_cx = track_rect_x + self._thumb_x * (actual_track_w / 64.0) + thumb_r
+        else:
+            thumb_cx = track_rect_x + actual_track_w // 2
         thumb_cy = track_rect_y + track_h // 2
         painter.setBrush(thumb_color)
         painter.drawEllipse(QPoint(int(thumb_cx), int(thumb_cy)), thumb_r, thumb_r)
@@ -350,7 +372,11 @@ class ToggleSwitch(QWidget):
         painter.end()
 
     def minimumSizeHint(self):
-        return QSize(200, 36)
+        # 最小宽度：label 60 + 间隔 4 + track 64 + 右边距 4 = 132（带 label 时）
+        # 无 label 时只要装下 track + 边距 = 72
+        if self._label:
+            return QSize(132, 24)
+        return QSize(72, 24)
 
     def _update_cursor(self):
         if self.isEnabled():
@@ -457,6 +483,11 @@ class RadioButton(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            if self._block_signal:
+                return
+            # 已经被选中时不再触发 toggle（避免误触）
+            if self._checked:
+                return
             self._checked = True
             self.toggled.emit(True)
             self.update()
@@ -508,6 +539,10 @@ class UpComboBox(QComboBox):
         if popup_y < 0:
             popup_y = combo_pos.y() + self.height()
         popup.move(popup_x, popup_y)
+
+    def wheelEvent(self, event):
+        # 禁止鼠标滚轮切换选项，避免误操作
+        event.ignore()
 
 
 class QTextEditLogHandler(logging.Handler):
@@ -1203,6 +1238,8 @@ def load_settings():
         "update_config_freq": "always",
         "always_update_config": False,
         "browser_proxy_mode": "all",
+        "global_proxy_mode": "all",
+        "address_proxy_enabled": True,
         "current_line": "",
         "proxy_enabled": False,
         "proxy_host": "127.0.0.1",
@@ -2442,6 +2479,8 @@ class MainWindow(QMainWindow):
         self.monitor.start()
 
         if self.settings.get("proxy_enabled", False) and self.settings.get("auto_start", True) and self.quick_dir:
+            # 启动前先注入所有 Yunji 规则
+            self._inject_all_rules()
             QTimer.singleShot(500, self._on_start)
 
         if self._auto_download_kernel and self.quick_dir:
@@ -2700,35 +2739,48 @@ class MainWindow(QMainWindow):
         # 设置大小策略，让卡片内容自适应，不被拉伸
         status_card.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
 
-        status_top = QHBoxLayout()
-        status_top.setSpacing(10)
+        # 关键修复：用 QFrame#switch-row + 强制 setFixedHeight(38) 锁定行高
+        # 因为 QFrame 默认 sizeHint() 是 640x480，会撑高 layout，必须显式约束
+        status_top_row = QFrame()
+        status_top_row.setObjectName("switch-row")
+        status_top_row.setFixedHeight(38)
+        status_top_row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        status_top = QHBoxLayout(status_top_row)
+        status_top.setContentsMargins(14, 8, 14, 8)
+        status_top.setSpacing(8)
 
+        # 左侧：状态点 + 状态文字 + 详情
+        status_left = QHBoxLayout()
+        status_left.setSpacing(8)
         self.svc_status_dot = QLabel("●")
-        self.svc_status_dot.setStyleSheet(f"font-size: 18px; color: #FF6B80;")
-        self.svc_status_dot.setFixedSize(24, 24)
+        self.svc_status_dot.setStyleSheet(f"font-size: 14px; color: #FF6B80; background: transparent;")
+        self.svc_status_dot.setFixedSize(14, 22)
         self.svc_status_dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        status_top.addWidget(self.svc_status_dot, alignment=Qt.AlignmentFlag.AlignVCenter)
-
+        status_left.addWidget(self.svc_status_dot)
         self.svc_status_label = QLabel("代理未启动")
-        self.svc_status_label.setStyleSheet(f"font-size: 11pt; font-weight: bold; color: {COLOR_TEXT};")
-        status_top.addWidget(self.svc_status_label, alignment=Qt.AlignmentFlag.AlignVCenter)
-
+        self.svc_status_label.setStyleSheet(f"font-size: 10pt; font-weight: bold; color: {COLOR_TEXT}; background: transparent;")
+        self.svc_status_label.setFixedHeight(22)
+        status_left.addWidget(self.svc_status_label)
         self.svc_detail_label = QLabel("开启代理服务以访问外网")
         self.svc_detail_label.setObjectName("dim")
-        self.svc_detail_label.setStyleSheet("font-size: 7pt;")
-        status_top.addWidget(self.svc_detail_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        self.svc_detail_label.setStyleSheet("font-size: 8pt; background: transparent;")
+        self.svc_detail_label.setFixedHeight(22)
+        status_left.addWidget(self.svc_detail_label)
+        status_top.addLayout(status_left, stretch=1)
 
-        status_top.addStretch()
-
+        # 右侧：开关
         self.switch_proxy = ToggleSwitch("代理服务", default=False)
-        self.switch_proxy.setFixedWidth(140)
+        self.switch_proxy.setFixedHeight(22)
+        self.switch_proxy.setFixedWidth(132)
+        self.switch_proxy.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.switch_proxy.toggled.connect(self._on_proxy_switch_toggled)
         status_top.addWidget(self.switch_proxy, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        sc.addLayout(status_top)
+        sc.addWidget(status_top_row)
 
         proxy_addr_row = QHBoxLayout()
         proxy_addr_row.setSpacing(6)
+        # 左边：标题 + 气泡（保持不动）
         proxy_addr_label = QLabel("本地代理:")
         proxy_addr_label.setStyleSheet(f"font-size: 9pt; font-weight: bold; color: {COLOR_TEXT};")
         proxy_addr_row.addWidget(proxy_addr_label)
@@ -2749,6 +2801,10 @@ class MainWindow(QMainWindow):
         )
         proxy_addr_row.addWidget(self.proxy_help_btn)
 
+        # 中间用 stretch 包围让右侧控件组居中显示
+        proxy_addr_row.addStretch()
+
+        # 居中：地址 + 端口 + 修改 + 复制
         self.proxy_host_input = QLineEdit(PROXY_HOST)
         self.proxy_host_input.setFixedWidth(110)
         self.proxy_host_input.setReadOnly(True)
@@ -2800,12 +2856,12 @@ class MainWindow(QMainWindow):
 
         status_info = QFrame()
         status_info.setStyleSheet(f"background-color: #111; border: 1px solid #1a1a1a; border-radius: 4px;")
-        status_info.setFixedHeight(40)
-        # 设置大小策略，防止被拉伸
+        # 内部元素最大高度 22px（btn_test），加 4px 上下内边距 = 26px
         status_info.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        status_info.setFixedHeight(26)
         si_layout = QHBoxLayout(status_info)
-        si_layout.setContentsMargins(12, 6, 12, 6)
-        si_layout.setSpacing(16)
+        si_layout.setContentsMargins(12, 2, 12, 2)
+        si_layout.setSpacing(12)
 
         self.svc_latency_label = QLabel("延迟: --")
         self.svc_latency_label.setObjectName("latency")
@@ -2834,7 +2890,6 @@ class MainWindow(QMainWindow):
         si_layout.addWidget(self.svc_kernel_label)
 
         self.svc_kernel_status = QLabel("")
-        self.svc_kernel_status.setFixedHeight(20)
         self.svc_kernel_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         if self._get_quick_version():
             self.svc_kernel_status.setText("✅ 代理内核已启用")
@@ -2856,7 +2911,7 @@ class MainWindow(QMainWindow):
         si_layout.addWidget(self.svc_kernel_status)
 
         self.svc_kernel_progress = QProgressBar()
-        self.svc_kernel_progress.setFixedHeight(14)
+        self.svc_kernel_progress.setFixedHeight(12)
         self.svc_kernel_progress.setFixedWidth(120)
         self.svc_kernel_progress.setTextVisible(True)
         self.svc_kernel_progress.setFormat("%p%")
@@ -2872,12 +2927,12 @@ class MainWindow(QMainWindow):
 
         si_layout.addStretch()
 
-        self.line_progress = CopyableLabel("", max_height=26)
+        self.line_progress = CopyableLabel("", max_height=18)
         si_layout.addWidget(self.line_progress)
 
         self.btn_test = QPushButton("🔍 检测线路")
         self.btn_test.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_test.setFixedSize(90, 26)
+        self.btn_test.setFixedSize(85, 22)
         self.btn_test.setStyleSheet(
             f"QPushButton {{ background-color: {COLOR_RED}; color: #FFFFFF; "
             f"font-size: 8pt; font-weight: bold; border-radius: 4px; border: none; }}"
@@ -3014,7 +3069,8 @@ class MainWindow(QMainWindow):
         realtime_interval_wrap.addWidget(self.realtime_status)
         rrr.addLayout(realtime_interval_wrap)
         self.switch_realtime_reconnect = ToggleSwitch("", default=self.settings.get("realtime_reconnect", False))
-        self.switch_realtime_reconnect.setFixedWidth(80)
+        self.switch_realtime_reconnect.setFixedHeight(22)
+        self.switch_realtime_reconnect.setFixedWidth(72)
         self.switch_realtime_reconnect.toggled.connect(self._on_realtime_reconnect_toggled)
         rrr.addWidget(self.switch_realtime_reconnect, alignment=Qt.AlignmentFlag.AlignVCenter)
         sm.addWidget(reconnect_row)
@@ -3052,7 +3108,8 @@ class MainWindow(QMainWindow):
         interval_wrap.addWidget(self.auto_line_status)
         alr.addLayout(interval_wrap)
         self.switch_auto_line = ToggleSwitch("", default=self.settings.get("auto_line_switch", False))
-        self.switch_auto_line.setFixedWidth(80)
+        self.switch_auto_line.setFixedHeight(22)
+        self.switch_auto_line.setFixedWidth(72)
         self.switch_auto_line.toggled.connect(self._on_auto_line_switch_toggled)
         alr.addWidget(self.switch_auto_line, alignment=Qt.AlignmentFlag.AlignVCenter)
         sm.addWidget(auto_line_row)
@@ -3069,31 +3126,39 @@ class MainWindow(QMainWindow):
         update_config_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
         update_config_title_row.addWidget(update_config_lbl)
         update_config_info.addLayout(update_config_title_row)
-        update_config_desc = QLabel("控制检测线路时是否更新线路配置")
+        update_config_desc = QLabel("开启后按设定频率自动更新线路配置")
         update_config_desc.setObjectName("dim")
         update_config_desc.setStyleSheet("font-size: 8pt;")
         update_config_info.addWidget(update_config_desc)
         ucr.addLayout(update_config_info, stretch=1)
-        update_config_freq_wrap = QHBoxLayout()
-        update_config_freq_wrap.setSpacing(6)
-        update_config_freq_wrap.setContentsMargins(0, 0, 0, 0)
-        update_config_freq_lbl = QLabel("频率:")
-        update_config_freq_lbl.setObjectName("dim")
-        update_config_freq_lbl.setStyleSheet("font-size: 9pt;")
-        update_config_freq_wrap.addWidget(update_config_freq_lbl)
-        self.update_freq_combo = QComboBox()
-        self.update_freq_combo.setFixedWidth(100)
-        self.update_freq_combo.addItem("每次", "always")
-        self.update_freq_combo.addItem("每天", "daily")
-        self.update_freq_combo.addItem("每周", "weekly")
-        self.update_freq_combo.addItem("每月", "monthly")
-        current_freq = self.settings.get("update_config_freq", "always")
-        idx = self.update_freq_combo.findData(current_freq)
-        if idx >= 0:
-            self.update_freq_combo.setCurrentIndex(idx)
-        self.update_freq_combo.currentIndexChanged.connect(self._on_update_freq_changed)
-        update_config_freq_wrap.addWidget(self.update_freq_combo)
-        ucr.addLayout(update_config_freq_wrap)
+
+        # 频率选择下拉
+        self.update_config_freq_combo = UpComboBox()
+        self.update_config_freq_combo.setFixedHeight(22)
+        self.update_config_freq_combo.setFixedWidth(100)
+        freq_options = [
+            ("每次", "always"),
+            ("每天", "daily"),
+            ("每周", "weekly"),
+            ("每月", "monthly"),
+        ]
+        for display, value in freq_options:
+            self.update_config_freq_combo.addItem(display, value)
+        # 恢复保存的设置
+        saved_freq = self.settings.get("update_config_freq", "always")
+        for i in range(self.update_config_freq_combo.count()):
+            if self.update_config_freq_combo.itemData(i) == saved_freq:
+                self.update_config_freq_combo.setCurrentIndex(i)
+                break
+        self.update_config_freq_combo.currentIndexChanged.connect(self._on_update_config_freq_changed)
+        ucr.addWidget(self.update_config_freq_combo)
+
+        self.switch_always_update_config = ToggleSwitch("", default=self.settings.get("always_update_config", True))
+        self.switch_always_update_config.setFixedHeight(22)
+        self.switch_always_update_config.setFixedWidth(72)
+        self.switch_always_update_config.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.switch_always_update_config.toggled.connect(self._on_always_update_config_toggled)
+        ucr.addWidget(self.switch_always_update_config, alignment=Qt.AlignmentFlag.AlignVCenter)
         sm.addWidget(update_config_row)
 
         browser_card = QFrame()
@@ -3134,7 +3199,8 @@ class MainWindow(QMainWindow):
         auto_browser_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
         abr.addWidget(auto_browser_lbl, stretch=1)
         self.switch_auto_browser = ToggleSwitch("", default=self.settings.get("auto_open_browser", True))
-        self.switch_auto_browser.setFixedWidth(80)
+        self.switch_auto_browser.setFixedHeight(22)
+        self.switch_auto_browser.setFixedWidth(72)
         self.switch_auto_browser.toggled.connect(self._on_auto_open_browser_toggled)
         abr.addWidget(self.switch_auto_browser, alignment=Qt.AlignmentFlag.AlignVCenter)
         bc.addWidget(auto_browser_row)
@@ -3213,7 +3279,6 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(smart_card)
 
-        layout.addStretch()
         return page
 
     def _build_proxy_tab(self):
@@ -3222,58 +3287,72 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
-        proxy_card = QFrame()
-        proxy_card.setObjectName("card")
-        pl = QVBoxLayout(proxy_card)
-        pl.setContentsMargins(20, 14, 20, 14)
-        pl.setSpacing(8)
+        # ========================================================
+        # 代理方式区域：1 个大卡片（标题"代理方式"）+ 4 个独立子小卡片
+        # 设计语言统一：每个子卡片 = info+开关行 + 内容行 + 提示
+        # ========================================================
+        proxy_mode_card = QFrame()
+        proxy_mode_card.setObjectName("card")
+        pmc = QVBoxLayout(proxy_mode_card)
+        pmc.setContentsMargins(20, 14, 20, 14)
+        pmc.setSpacing(10)
 
-        proxy_title = QLabel("代理功能")
-        proxy_title.setObjectName("accent")
-        proxy_title.setStyleSheet("font-size: 9pt; font-weight: bold;")
-        pl_title_row = QHBoxLayout()
-        pl_title_row.setSpacing(4)
-        pl_title_row.addWidget(proxy_title)
-        pl_title_row.addWidget(_make_help_btn(
-            "代理功能设置",
-            "代理功能说明",
-            "【浏览器代理】\n"
-            "浏览器始终通过本地代理访问网络。\n\n"
-            "【代理范围】\n"
-            "全部浏览器：通过系统代理设置，所有浏览器都走代理。\n"
-            "指定浏览器：仅对线路服务页面选定的浏览器设置代理参数，\n"
-            "其他浏览器不受影响。\n\n"
-            "【全局系统代理】\n"
-            "开启后，系统中所有应用（不仅浏览器）都通过代理访问网络。\n"
-            "关闭后仅浏览器走代理，其他程序不受影响。"
-        ))
-        pl_title_row.addStretch()
-        pl.addLayout(pl_title_row)
+        # 大卡片标题
+        proxy_mode_title = QLabel("代理方式")
+        proxy_mode_title.setObjectName("accent")
+        proxy_mode_title.setStyleSheet("font-size: 9pt; font-weight: bold;")
+        pmc.addWidget(proxy_mode_title)
 
-        # 全局系统代理卡片（独立）
+        # ========== 1. 系统代理 子卡片 ==========
         global_row = QFrame()
-        global_row.setObjectName("card")
+        global_row.setObjectName("switch-row")
         gr = QVBoxLayout(global_row)
-        gr.setContentsMargins(20, 14, 20, 14)
-        gr.setSpacing(8)
+        gr.setContentsMargins(14, 8, 14, 8)
+        gr.setSpacing(6)
 
-        global_header = QHBoxLayout()
-        global_header.setContentsMargins(14, 8, 14, 8)
-        global_info = QVBoxLayout()
-        global_info.setSpacing(1)
-        global_lbl = QLabel("🌍 全局系统代理")
-        global_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
-        global_info.addWidget(global_lbl)
-        global_desc = QLabel("所有系统应用通过代理访问")
-        global_desc.setObjectName("dim")
-        global_desc.setStyleSheet("font-size: 8pt;")
-        global_info.addWidget(global_desc)
-        global_header.addLayout(global_info, stretch=1)
+        # 标题行
+        gr_title = QHBoxLayout()
+        gr_title.setSpacing(4)
+        gr_title.addWidget(QLabel("🌐 系统代理"))
+        gr_title.itemAt(0).widget().setStyleSheet("font-size: 8pt; font-weight: bold;")
+        gr_title.addWidget(_make_help_btn(
+            "系统代理设置",
+            "系统代理说明",
+            "【系统代理】\n"
+            "开启后，系统中所有应用（不仅浏览器）都通过代理访问网络。\n"
+            "关闭后仅浏览器走代理，其他程序不受影响。\n\n"
+            "【代理模式】\n"
+            "全局系统代理：所有流量（包括国内网站）都走代理。\n"
+            "绕过境内（仅代理境外）：仅国外流量走代理，国内网站直连，\n"
+            "访问国内网站更快更省带宽。\n\n"
+            "修改后需要重启代理服务才能生效。"
+        ))
+        gr_title.addStretch()
+        # 开关
         self.switch_global_proxy = ToggleSwitch("", default=self.settings.get("global_proxy", False))
-        self.switch_global_proxy.setFixedWidth(80)
+        self.switch_global_proxy.setFixedHeight(22)
+        self.switch_global_proxy.setFixedWidth(72)
+        self.switch_global_proxy.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.switch_global_proxy.toggled.connect(self._on_global_proxy_toggled)
-        global_header.addWidget(self.switch_global_proxy, alignment=Qt.AlignmentFlag.AlignVCenter)
-        gr.addLayout(global_header)
+        gr_title.addWidget(self.switch_global_proxy, alignment=Qt.AlignmentFlag.AlignVCenter)
+        gr.addLayout(gr_title)
+
+        # 模式选择行
+        global_mode_inner = QHBoxLayout()
+        global_mode_inner.setSpacing(8)
+        global_mode_lbl = QLabel("代理模式:")
+        global_mode_lbl.setStyleSheet("font-size: 8pt; color: #999999;")
+        global_mode_inner.addWidget(global_mode_lbl)
+        self.global_proxy_mode_group = []
+        self.all_mode_rb = RadioButton("全局系统代理", default=self.settings.get("global_proxy_mode", "all") == "all")
+        self.global_proxy_mode_group.append(self.all_mode_rb)
+        global_mode_inner.addWidget(self.all_mode_rb)
+        self.foreign_mode_rb = RadioButton("绕过境内（仅代理境外）", default=self.settings.get("global_proxy_mode", "all") == "foreign")
+        self.global_proxy_mode_group.append(self.foreign_mode_rb)
+        global_mode_inner.addWidget(self.foreign_mode_rb)
+        self.all_mode_rb.toggled.connect(lambda checked: self._on_global_proxy_mode_toggled("all", checked))
+        self.foreign_mode_rb.toggled.connect(lambda checked: self._on_global_proxy_mode_toggled("foreign", checked))
+        gr.addLayout(global_mode_inner)
 
         self.global_restart_hint = QLabel("⚠ 修改后需重启服务生效")
         self.global_restart_hint.setObjectName("restart-hint")
@@ -3281,212 +3360,234 @@ class MainWindow(QMainWindow):
         self.global_restart_hint.setVisible(False)
         gr.addWidget(self.global_restart_hint)
 
-        layout.addWidget(global_row)
+        pmc.addWidget(global_row)
 
-        # 代理功能卡片（浏览器代理 + 指定程序代理）
-        proxy_card = QFrame()
-        proxy_card.setObjectName("card")
-        pl = QVBoxLayout(proxy_card)
-        pl.setContentsMargins(20, 14, 20, 14)
-        pl.setSpacing(8)
+        # ========== 2. 浏览器代理 子卡片 ==========
+        browser_row = QFrame()
+        browser_row.setObjectName("switch-row")
+        br = QVBoxLayout(browser_row)
+        br.setContentsMargins(14, 8, 14, 8)
+        br.setSpacing(6)
 
-        proxy_title = QLabel("代理功能")
-        proxy_title.setObjectName("accent")
-        proxy_title.setStyleSheet("font-size: 9pt; font-weight: bold;")
-        pl_title_row = QHBoxLayout()
-        pl_title_row.setSpacing(4)
-        pl_title_row.addWidget(proxy_title)
-        pl_title_row.addWidget(_make_help_btn(
-            "代理功能设置",
-            "代理功能说明",
+        br_title = QHBoxLayout()
+        br_title.setSpacing(4)
+        br_title.addWidget(QLabel("🌐 浏览器代理"))
+        br_title.itemAt(0).widget().setStyleSheet("font-size: 8pt; font-weight: bold;")
+        br_title.addWidget(_make_help_btn(
+            "浏览器代理设置",
+            "浏览器代理说明",
             "【浏览器代理】\n"
             "浏览器始终通过本地代理访问网络。\n\n"
             "【代理范围】\n"
             "全部浏览器：通过系统代理设置，所有浏览器都走代理。\n"
             "指定浏览器：仅对线路服务页面选定的浏览器设置代理参数，\n"
-            "其他浏览器不受影响。\n\n"
-            "【指定程序代理】\n"
-            "添加指定程序后，这些程序也会通过代理访问网络。\n"
-            "适合需要让某些非浏览器应用也走代理的场景。"
+            "其他浏览器不受影响。"
         ))
-        pl_title_row.addStretch()
-        pl.addLayout(pl_title_row)
-
-        browser_row = QFrame()
-        browser_row.setObjectName("switch-row")
-        br = QHBoxLayout(browser_row)
-        br.setContentsMargins(14, 8, 14, 8)
-        browser_info = QVBoxLayout()
-        browser_info.setSpacing(1)
-        browser_lbl = QLabel("🌐 浏览器代理")
-        browser_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
-        browser_info.addWidget(browser_lbl)
-        browser_desc = QLabel("浏览器通过本地代理访问")
-        browser_desc.setObjectName("dim")
-        browser_desc.setStyleSheet("font-size: 8pt;")
-        browser_info.addWidget(browser_desc)
-        br.addLayout(browser_info, stretch=1)
+        br_title.addStretch()
         self.switch_browser_proxy = ToggleSwitch("", default=self.settings.get("browser_proxy_enabled", True))
-        self.switch_browser_proxy.setFixedWidth(80)
+        self.switch_browser_proxy.setFixedHeight(22)
+        self.switch_browser_proxy.setFixedWidth(72)
+        self.switch_browser_proxy.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.switch_browser_proxy.toggled.connect(self._on_browser_proxy_toggled)
-        br.addWidget(self.switch_browser_proxy, alignment=Qt.AlignmentFlag.AlignVCenter)
-        pl.addWidget(browser_row)
+        br_title.addWidget(self.switch_browser_proxy, alignment=Qt.AlignmentFlag.AlignVCenter)
+        br.addLayout(br_title)
 
-        browser_scope_row = QFrame()
-        browser_scope_row.setObjectName("switch-row")
-        bsr = QHBoxLayout(browser_scope_row)
-        bsr.setContentsMargins(14, 8, 14, 8)
+        browser_scope_inner = QHBoxLayout()
+        browser_scope_inner.setSpacing(8)
         browser_scope_lbl = QLabel("代理范围:")
         browser_scope_lbl.setStyleSheet("font-size: 8pt; color: #999999;")
-        bsr.addWidget(browser_scope_lbl)
+        browser_scope_inner.addWidget(browser_scope_lbl)
         self.browser_proxy_group = []
         self.all_browser_rb = RadioButton("全部浏览器", default=self.settings.get("browser_proxy_mode", "all") == "all")
         self.browser_proxy_group.append(self.all_browser_rb)
-        bsr.addWidget(self.all_browser_rb)
+        browser_scope_inner.addWidget(self.all_browser_rb)
         self.spec_browser_rb = RadioButton("指定浏览器", default=self.settings.get("browser_proxy_mode", "all") == "specified")
         self.browser_proxy_group.append(self.spec_browser_rb)
-        bsr.addWidget(self.spec_browser_rb)
+        browser_scope_inner.addWidget(self.spec_browser_rb)
         self.all_browser_rb.toggled.connect(lambda checked: self._on_proxy_mode_radio_toggled("all", checked))
         self.spec_browser_rb.toggled.connect(lambda checked: self._on_proxy_mode_radio_toggled("specified", checked))
-        pl.addWidget(browser_scope_row)
+        br.addLayout(browser_scope_inner)
 
         self.specified_browser_hint = QLabel("")
         self.specified_browser_hint.setObjectName("dim")
         self.specified_browser_hint.setStyleSheet(f"font-size: 8pt; color: {COLOR_RED_LIGHT};")
         self.specified_browser_hint.setWordWrap(True)
         self._update_browser_proxy_hint()
-        pl.addWidget(self.specified_browser_hint)
+        br.addWidget(self.specified_browser_hint)
 
-        global_row = QFrame()
-        global_row.setObjectName("switch-row")
-        gr = QHBoxLayout(global_row)
-        gr.setContentsMargins(14, 8, 14, 8)
-        global_info = QVBoxLayout()
-        global_info.setSpacing(1)
-        global_lbl = QLabel("🌍 全局系统代理")
-        global_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
-        global_info.addWidget(global_lbl)
-        global_desc = QLabel("所有系统应用通过代理访问")
-        global_desc.setObjectName("dim")
-        global_desc.setStyleSheet("font-size: 8pt;")
-        global_info.addWidget(global_desc)
-        gr.addLayout(global_info, stretch=1)
-        self.switch_global_proxy = ToggleSwitch("", default=self.settings.get("global_proxy", False))
-        self.switch_global_proxy.setFixedWidth(80)
-        self.switch_global_proxy.toggled.connect(self._on_global_proxy_toggled)
-        gr.addWidget(self.switch_global_proxy, alignment=Qt.AlignmentFlag.AlignVCenter)
-        pl.addWidget(global_row)
+        pmc.addWidget(browser_row)
 
-        self.global_restart_hint = QLabel("⚠ 修改后需重启服务生效")
-        self.global_restart_hint.setObjectName("restart-hint")
-        self.global_restart_hint.setStyleSheet(f"color: {COLOR_ORANGE}; font-size: 8pt;")
-        self.global_restart_hint.setVisible(False)
-        pl.addWidget(self.global_restart_hint)
+        # ========== 3. 地址代理 子卡片 ==========
+        rules_row = QFrame()
+        rules_row.setObjectName("switch-row")
+        rr = QVBoxLayout(rules_row)
+        rr.setContentsMargins(14, 8, 14, 8)
+        rr.setSpacing(6)
 
-        layout.addWidget(proxy_card)
+        rr_title = QHBoxLayout()
+        rr_title.setSpacing(4)
+        rr_title.addWidget(QLabel("📋 地址代理"))
+        rr_title.itemAt(0).widget().setStyleSheet("font-size: 8pt; font-weight: bold;")
+        rr_title.addWidget(_make_help_btn(
+            "地址代理设置",
+            "地址代理说明",
+            "【地址代理】\n"
+            "指定特定网址或IP强制走代理，优先级高于默认规则。\n\n"
+            "【规则类型】\n"
+            "指定域名（DOMAIN-SUFFIX）：匹配该域名及其所有子域名\n"
+            "  例: agnes-ai.com 将匹配 apihub.agnes-ai.com、www.agnes-ai.com 等\n\n"
+            "指定网址（DOMAIN）：仅匹配精确网址\n"
+            "  例: apihub.agnes-ai.com 仅匹配该网址\n\n"
+            "IP地址段（IP-CIDR）：匹配IP地址范围\n"
+            "  例: 192.168.1.0/24 匹配 192.168.1.0~192.168.1.255\n\n"
+            "修改规则后需要重启代理服务才能生效。"
+        ))
+        rr_title.addStretch()
+        self.switch_address_proxy = ToggleSwitch("", default=self.settings.get("address_proxy_enabled", True))
+        self.switch_address_proxy.setFixedHeight(22)
+        self.switch_address_proxy.setFixedWidth(72)
+        self.switch_address_proxy.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.switch_address_proxy.toggled.connect(self._on_address_proxy_toggled)
+        rr_title.addWidget(self.switch_address_proxy, alignment=Qt.AlignmentFlag.AlignVCenter)
+        rr.addLayout(rr_title)
 
-        custom_card = QFrame()
-        custom_card.setObjectName("card")
-        cl = QVBoxLayout(custom_card)
-        cl.setContentsMargins(20, 14, 20, 14)
-        cl.setSpacing(8)
+        add_rule_row = QHBoxLayout()
+        add_rule_row.setSpacing(6)
+        self.rule_type_combo = UpComboBox()
+        self.rule_type_combo.setFixedWidth(100)
+        self.rule_type_combo.addItem("指定域名", "DOMAIN-SUFFIX")
+        self.rule_type_combo.addItem("指定网址", "DOMAIN")
+        self.rule_type_combo.addItem("IP地址段", "IP-CIDR")
+        add_rule_row.addWidget(self.rule_type_combo)
+        self.rule_value_input = QLineEdit()
+        self.rule_value_input.setPlaceholderText("例: agnes-ai.com")
+        self.rule_value_input.setStyleSheet(
+            f"QLineEdit {{ background-color: {COLOR_CARD}; border: 1px solid {COLOR_BORDER}; "
+            f"border-radius: 4px; padding: 4px 8px; color: {COLOR_TEXT}; font-size: 8pt; }}"
+        )
+        self.rule_value_input.returnPressed.connect(self._on_add_proxy_rule)
+        add_rule_row.addWidget(self.rule_value_input, stretch=1)
+        add_rule_btn = QPushButton("＋添加")
+        add_rule_btn.setObjectName("small-blue")
+        add_rule_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_rule_btn.setFixedSize(60, 28)
+        add_rule_btn.clicked.connect(self._on_add_proxy_rule)
+        add_rule_row.addWidget(add_rule_btn)
+        self.add_rule_btn = add_rule_btn
+        rr.addLayout(add_rule_row)
 
-        custom_header = QHBoxLayout()
-        custom_header.setContentsMargins(14, 8, 14, 8)
-        custom_info = QVBoxLayout()
-        custom_info.setSpacing(1)
-        custom_title_row = QHBoxLayout()
-        custom_title_row.setSpacing(4)
-        custom_title = QLabel("🎯 指定程序代理")
-        custom_title.setStyleSheet("font-size: 8pt; font-weight: bold;")
-        custom_title_row.addWidget(custom_title)
-        custom_title_row.addWidget(_make_help_btn(
-            "指定程序代理",
-            "指定程序代理说明",
-            "【功能说明】\n"
+        self._proxy_rules = self.settings.get("proxy_rules", [])
+        self._rule_rows = []
+        self._rule_list_widget = QWidget()
+        self._rule_list_layout = QVBoxLayout(self._rule_list_widget)
+        self._rule_list_layout.setContentsMargins(0, 0, 0, 0)
+        self._rule_list_layout.setSpacing(0)
+        self._refresh_proxy_rules_ui()
+        rr.addWidget(self._rule_list_widget)
+
+        self.rules_restart_hint = QLabel("⚠ 修改规则后需重启服务生效")
+        self.rules_restart_hint.setObjectName("restart-hint")
+        self.rules_restart_hint.setStyleSheet(f"color: {COLOR_ORANGE}; font-size: 8pt;")
+        self.rules_restart_hint.setVisible(bool(self._proxy_rules))
+        rr.addWidget(self.rules_restart_hint)
+
+        pmc.addWidget(rules_row)
+
+        # ========== 4. 程序代理 子卡片 ==========
+        app_row = QFrame()
+        app_row.setObjectName("switch-row")
+        ar = QVBoxLayout(app_row)
+        ar.setContentsMargins(14, 8, 14, 8)
+        ar.setSpacing(6)
+
+        ar_title = QHBoxLayout()
+        ar_title.setSpacing(4)
+        ar_title.addWidget(QLabel("🎯 程序代理"))
+        ar_title.itemAt(0).widget().setStyleSheet("font-size: 8pt; font-weight: bold;")
+        ar_title.addWidget(_make_help_btn(
+            "程序代理设置",
+            "程序代理说明",
+            "【程序代理】\n"
             "添加指定程序后，这些程序也会通过代理访问网络。\n"
             "适合需要让某些非浏览器应用也走代理的场景。\n\n"
             "【代理范围】\n"
             "全部指定程序：所有已添加的程序都会通过代理访问网络。\n"
-            "指定程序：仅从已添加的程序中选择部分程序走代理。\n\n"
+            "单个指定程序：仅从已添加的程序中选择部分程序走代理。\n\n"
             "【使用方法】\n"
             "1. 开启开关\n"
-            "2. 选择代理范围（全部/指定）\n"
+            "2. 选择代理范围（全部/单个）\n"
             "3. 点击「添加程序」选择exe文件\n"
             "4. 修改后需重启代理服务生效"
         ))
-        custom_title_row.addStretch()
-        custom_info.addLayout(custom_title_row)
-        custom_desc = QLabel("添加的程序也通过代理访问")
-        custom_desc.setObjectName("dim")
-        custom_desc.setStyleSheet("font-size: 8pt;")
-        custom_info.addWidget(custom_desc)
-        custom_header.addLayout(custom_info, stretch=1)
+        ar_title.addStretch()
         self.switch_custom_apps = ToggleSwitch("", default=self.settings.get("custom_apps_enabled", False))
-        self.switch_custom_apps.setFixedWidth(80)
+        self.switch_custom_apps.setFixedHeight(22)
+        self.switch_custom_apps.setFixedWidth(72)
+        self.switch_custom_apps.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.switch_custom_apps.toggled.connect(self._on_custom_apps_toggled)
-        custom_header.addWidget(self.switch_custom_apps, alignment=Qt.AlignmentFlag.AlignVCenter)
-        cl.addLayout(custom_header)
+        ar_title.addWidget(self.switch_custom_apps, alignment=Qt.AlignmentFlag.AlignVCenter)
+        ar.addLayout(ar_title)
 
-        custom_scope_row = QFrame()
-        custom_scope_row.setObjectName("switch-row")
-        csr = QHBoxLayout(custom_scope_row)
-        csr.setContentsMargins(14, 8, 14, 8)
-        custom_scope_lbl = QLabel("代理范围:")
-        custom_scope_lbl.setStyleSheet("font-size: 8pt; color: #999999;")
-        csr.addWidget(custom_scope_lbl)
+        app_scope_inner = QHBoxLayout()
+        app_scope_inner.setSpacing(8)
+        app_scope_lbl = QLabel("代理范围:")
+        app_scope_lbl.setStyleSheet("font-size: 8pt; color: #999999;")
+        app_scope_inner.addWidget(app_scope_lbl)
         self.custom_apps_scope_group = []
         self.all_custom_apps_rb = RadioButton("全部指定程序", default=self.settings.get("custom_apps_scope", "all") == "all")
         self.custom_apps_scope_group.append(self.all_custom_apps_rb)
-        csr.addWidget(self.all_custom_apps_rb)
-        self.spec_custom_apps_rb = RadioButton("指定程序", default=self.settings.get("custom_apps_scope", "all") == "specified")
+        app_scope_inner.addWidget(self.all_custom_apps_rb)
+        self.spec_custom_apps_rb = RadioButton("单个指定程序", default=self.settings.get("custom_apps_scope", "all") == "specified")
         self.custom_apps_scope_group.append(self.spec_custom_apps_rb)
-        csr.addWidget(self.spec_custom_apps_rb)
+        app_scope_inner.addWidget(self.spec_custom_apps_rb)
         self.all_custom_apps_rb.toggled.connect(lambda checked: self._on_custom_apps_scope_toggled("all", checked))
         self.spec_custom_apps_rb.toggled.connect(lambda checked: self._on_custom_apps_scope_toggled("specified", checked))
-        cl.addWidget(custom_scope_row)
+        ar.addLayout(app_scope_inner)
 
         self.specified_custom_apps_hint = QLabel("")
         self.specified_custom_apps_hint.setObjectName("dim")
         self.specified_custom_apps_hint.setStyleSheet(f"font-size: 8pt; color: {COLOR_RED_LIGHT};")
         self.specified_custom_apps_hint.setWordWrap(True)
         self._update_custom_apps_scope_hint()
-        cl.addWidget(self.specified_custom_apps_hint)
+        ar.addWidget(self.specified_custom_apps_hint)
 
         self.custom_restart_hint = QLabel("⚠ 修改后需重启服务生效")
         self.custom_restart_hint.setObjectName("restart-hint")
         self.custom_restart_hint.setStyleSheet(f"color: {COLOR_ORANGE}; font-size: 8pt;")
         self.custom_restart_hint.setVisible(False)
-        cl.addWidget(self.custom_restart_hint)
+        ar.addWidget(self.custom_restart_hint)
 
         app_combo_row = QHBoxLayout()
         app_combo_row.setSpacing(8)
-        app_combo_row.setContentsMargins(14, 0, 14, 0)
-        self.app_combo = QComboBox()
+        self.app_combo = UpComboBox()
         self.app_combo.setFixedHeight(28)
         for app_path in self.settings.get("custom_apps", []):
             self._add_app_item(app_path)
         app_combo_row.addWidget(self.app_combo, stretch=1)
-        add_btn = QPushButton("＋添加")
-        add_btn.setObjectName("small-blue")
-        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        add_btn.setFixedSize(60, 28)
-        add_btn.clicked.connect(self._on_add_app)
-        app_combo_row.addWidget(add_btn)
-        remove_btn = QPushButton("－删除")
-        remove_btn.setObjectName("small-red")
-        remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        remove_btn.setFixedSize(60, 28)
-        remove_btn.setStyleSheet(
+        add_app_btn = QPushButton("＋添加")
+        add_app_btn.setObjectName("small-blue")
+        add_app_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_app_btn.setFixedSize(60, 28)
+        add_app_btn.clicked.connect(self._on_add_app)
+        app_combo_row.addWidget(add_app_btn)
+        self.add_app_btn = add_app_btn
+        remove_app_btn = QPushButton("－删除")
+        remove_app_btn.setObjectName("small-red")
+        remove_app_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove_app_btn.setFixedSize(60, 28)
+        remove_app_btn.setStyleSheet(
             f"QPushButton {{ background-color: {COLOR_RED}; color: #FFFFFF; padding: 4px 12px; "
             f"font-size: 8pt; font-weight: bold; border-radius: 4px; border: none; }}"
             f"QPushButton:hover {{ background-color: {COLOR_RED_LIGHT}; }}"
         )
-        remove_btn.clicked.connect(self._on_remove_app)
-        app_combo_row.addWidget(remove_btn)
-        cl.addLayout(app_combo_row)
+        remove_app_btn.clicked.connect(self._on_remove_app)
+        app_combo_row.addWidget(remove_app_btn)
+        self.remove_app_btn = remove_app_btn
+        ar.addLayout(app_combo_row)
 
-        layout.addWidget(custom_card)
+        pmc.addWidget(app_row)
+
+        layout.addWidget(proxy_mode_card)
 
         self._update_proxy_ui_disabled_state()
 
@@ -3527,7 +3628,8 @@ class MainWindow(QMainWindow):
         autostart_info.addWidget(autostart_desc)
         asr.addLayout(autostart_info, stretch=1)
         self.switch_auto_start = ToggleSwitch("", default=self.settings.get("auto_start", True))
-        self.switch_auto_start.setFixedWidth(80)
+        self.switch_auto_start.setFixedHeight(22)
+        self.switch_auto_start.setFixedWidth(72)
         self.switch_auto_start.toggled.connect(self._on_auto_start_toggled)
         asr.addWidget(self.switch_auto_start, alignment=Qt.AlignmentFlag.AlignVCenter)
         sl.addWidget(autostart_row)
@@ -3671,10 +3773,33 @@ class MainWindow(QMainWindow):
         #       导致"列表只有一排"的 bug。直接让 layout 由 widgets sizeHint 决定。
         self._kernel_scroll.setWidget(self._kernel_scroll_content)
         self._kernel_scroll.setVisible(True)
-        # 默认紧凑 2 排高度（约 50px），点检查更新获取到结果后由 _show_kernel_list 调高
-        self._kernel_scroll.setMaximumHeight(50)
+        # 默认紧凑 5 排高度（约 160px），点检查更新获取到结果后由 _show_kernel_list 调高
+        self._kernel_scroll.setMaximumHeight(160)
         # 收起时不再 stretch，让卡片按内容自适应；展开时再 stretch
         kl.addWidget(self._kernel_scroll)
+
+        # 拖拽手柄：用户可拖拽调整内核列表高度
+        self._kernel_resize_handle = QFrame()
+        self._kernel_resize_handle.setFixedHeight(8)
+        self._kernel_resize_handle.setCursor(Qt.CursorShape.SizeVerCursor)
+        self._kernel_resize_handle.setStyleSheet(
+            f"QFrame {{ background-color: transparent; margin: 0 40px; }}"
+        )
+        self._kernel_resize_handle_label = QLabel("⋯")
+        self._kernel_resize_handle_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._kernel_resize_handle_label.setStyleSheet(
+            f"color: #555; font-size: 10pt; background: transparent; border: none;"
+        )
+        resize_handle_layout = QVBoxLayout(self._kernel_resize_handle)
+        resize_handle_layout.setContentsMargins(0, 0, 0, 0)
+        resize_handle_layout.addWidget(self._kernel_resize_handle_label)
+        self._kernel_resize_handle.mousePressEvent = self._on_kernel_resize_start
+        self._kernel_resize_handle.mouseMoveEvent = self._on_kernel_resize_move
+        self._kernel_resize_handle.mouseReleaseEvent = self._on_kernel_resize_end
+        self._kernel_resizing = False
+        self._kernel_resize_start_y = 0
+        self._kernel_resize_start_h = 160
+        kl.addWidget(self._kernel_resize_handle)
 
         # 保存为实例属性，便于 _show_kernel_list 动态调整最大高度
         self.kernel_card = kernel_card
@@ -4073,21 +4198,21 @@ class MainWindow(QMainWindow):
 
     def _update_status(self, running):
         if running:
-            self.svc_status_dot.setStyleSheet(f"font-size: 18px; color: {COLOR_GREEN};")
+            self.svc_status_dot.setStyleSheet(f"font-size: 14px; color: {COLOR_GREEN};")
             self.svc_status_label.setText("代理运行中")
-            self.svc_status_label.setStyleSheet(f"font-size: 11pt; font-weight: bold; color: {COLOR_GREEN};")
+            self.svc_status_label.setStyleSheet(f"font-size: 10pt; font-weight: bold; color: {COLOR_GREEN};")
             self.svc_detail_label.setText("代理服务已启动")
             self.svc_line_label.setText(f"线路: {self.current_line or '未知'}")
         else:
-            self.svc_status_dot.setStyleSheet(f"font-size: 18px; color: #FF6B80;")
+            self.svc_status_dot.setStyleSheet(f"font-size: 14px; color: #FF6B80;")
             if self.switch_proxy.isChecked():
                 self.svc_status_label.setText("代理未连接")
-                self.svc_status_label.setStyleSheet(f"font-size: 11pt; font-weight: bold; color: {COLOR_ORANGE};")
+                self.svc_status_label.setStyleSheet(f"font-size: 10pt; font-weight: bold; color: {COLOR_ORANGE};")
                 self.svc_detail_label.setText("代理服务已开启但未连接")
                 self.svc_line_label.setText("线路: 点击重连")
             else:
                 self.svc_status_label.setText("代理未启动")
-                self.svc_status_label.setStyleSheet(f"font-size: 11pt; font-weight: bold; color: {COLOR_TEXT};")
+                self.svc_status_label.setStyleSheet(f"font-size: 10pt; font-weight: bold; color: {COLOR_TEXT};")
                 self.svc_detail_label.setText("开启代理服务以访问外网")
                 self.svc_line_label.setText("线路: --")
             self.svc_latency_label.setText("延迟: --")
@@ -4229,6 +4354,8 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             return
         self._cleanup_worker()
+        # 启动前先注入所有 Yunji 规则（自定义规则 + 代理模式规则）
+        self._inject_all_rules()
         self.switch_proxy.setEnabled(False)
         self.svc_detail_label.setText("正在启动代理服务...")
         self.worker = ServiceWorker("start", quick_dir=self.quick_dir, current_line=self.current_line)
@@ -4361,6 +4488,16 @@ class MainWindow(QMainWindow):
                 return os.path.basename(browsers[0][1])
             return "系统浏览器"
 
+    def _on_address_proxy_toggled(self, checked):
+        self._save_setting("address_proxy_enabled", checked)
+        if is_proxy_running():
+            self._inject_all_rules()
+            self.rules_restart_hint.setText("⚠ 地址代理设置已应用，重启服务后生效")
+        else:
+            self.rules_restart_hint.setText("⚠ 地址代理设置已保存，将在下次启动服务时生效")
+        self.rules_restart_hint.setVisible(True)
+        log.info(f"地址代理: {'开启' if checked else '关闭'}")
+
     def _on_global_proxy_toggled(self, checked):
         self._save_setting("global_proxy", checked)
         if is_proxy_running():
@@ -4371,7 +4508,28 @@ class MainWindow(QMainWindow):
             self.global_restart_hint.setText("⚠ 设置已保存，将在下次启动服务时生效")
             self.global_restart_hint.setVisible(True)
         self._update_proxy_ui_disabled_state()
-        log.info(f"全局系统代理: {'开启' if checked else '关闭'}")
+        log.info(f"系统代理: {'开启' if checked else '关闭'}")
+
+    def _on_global_proxy_mode_toggled(self, mode, checked):
+        if not checked:
+            return
+        # 2 选 1：手动取消其他 RadioButton 选中
+        for rb in self.global_proxy_mode_group:
+            if rb is not self.sender():
+                rb._block_signal = True
+                rb.setChecked(False)
+                rb._block_signal = False
+        self._save_setting("global_proxy_mode", mode)
+        if is_proxy_running():
+            # 模式切换：注入对应的 GEOIP 规则
+            self._inject_proxy_mode_rules()
+            self.global_restart_hint.setText("⚠ 代理模式已应用，重启服务后生效")
+            self.global_restart_hint.setVisible(True)
+        else:
+            self.global_restart_hint.setText("⚠ 模式已保存，将在下次启动服务时生效")
+            self.global_restart_hint.setVisible(True)
+        mode_text = "全局系统代理" if mode == "all" else "绕过境内（仅代理境外）"
+        log.info(f"系统代理模式: {mode_text}")
 
     def _update_proxy_ui_disabled_state(self):
         is_global = self.settings.get("global_proxy", False)
@@ -4397,6 +4555,31 @@ class MainWindow(QMainWindow):
                 rb.setStyleSheet(f"opacity: {'0.5' if is_global else '1.0'}")
         if hasattr(self, 'app_combo'):
             self.app_combo.setEnabled(not is_global)
+        if hasattr(self, 'add_app_btn'):
+            self.add_app_btn.setEnabled(not is_global)
+            self.add_app_btn.setStyleSheet(f"opacity: {'0.5' if is_global else '1.0'}")
+        if hasattr(self, 'remove_app_btn'):
+            self.remove_app_btn.setEnabled(not is_global)
+            self.remove_app_btn.setStyleSheet(f"opacity: {'0.5' if is_global else '1.0'}")
+        # 地址代理子卡片：开关 + 规则类型 + 输入框 + 添加按钮 + 规则列表 + 提示
+        if hasattr(self, 'switch_address_proxy'):
+            self.switch_address_proxy.setEnabled(not is_global)
+            self.switch_address_proxy.setStyleSheet(
+                f"opacity: {'0.5' if is_global else '1.0'}"
+            )
+        if hasattr(self, 'rule_type_combo'):
+            self.rule_type_combo.setEnabled(not is_global)
+            self.rule_type_combo.setStyleSheet(f"opacity: {'0.5' if is_global else '1.0'}")
+        if hasattr(self, 'rule_value_input'):
+            self.rule_value_input.setEnabled(not is_global)
+            self.rule_value_input.setStyleSheet(f"opacity: {'0.5' if is_global else '1.0'}")
+        if hasattr(self, 'add_rule_btn'):
+            self.add_rule_btn.setEnabled(not is_global)
+            self.add_rule_btn.setStyleSheet(f"opacity: {'0.5' if is_global else '1.0'}")
+        if hasattr(self, '_rule_list_widget'):
+            self._rule_list_widget.setEnabled(not is_global)
+        if hasattr(self, 'rules_restart_hint') and is_global:
+            self.rules_restart_hint.setVisible(False)
         if hasattr(self, 'custom_apps_enabled') and hasattr(self, 'custom_apps_scope'):
             pass
 
@@ -4417,9 +4600,15 @@ class MainWindow(QMainWindow):
     def _on_custom_apps_scope_toggled(self, scope, checked):
         if not checked:
             return
+        # 2 选 1：手动取消其他 RadioButton 选中
+        for rb in self.custom_apps_scope_group:
+            if rb is not self.sender():
+                rb._block_signal = True
+                rb.setChecked(False)
+                rb._block_signal = False
         self._save_setting("custom_apps_scope", scope)
         self._update_custom_apps_scope_hint()
-        log.info(f"指定程序代理范围: {scope}")
+        log.info(f"程序代理范围: {scope}")
 
     def _update_custom_apps_scope_hint(self):
         mode = self.settings.get("custom_apps_scope", "all")
@@ -4445,10 +4634,207 @@ class MainWindow(QMainWindow):
             self._start_realtime_monitor()
         log.info(f"实时检测间隔: {value}秒")
 
-    def _on_update_freq_changed(self, index):
-        freq = self.update_freq_combo.itemData(index)
-        self._save_setting("update_config_freq", freq)
-        log.info(f"检测线路前更新配置频率: {freq}")
+    def _on_always_update_config_toggled(self, checked):
+        self._save_setting("always_update_config", checked)
+        log.info(f"检测线路前更新配置: {'开启' if checked else '关闭'}")
+
+    def _on_update_config_freq_changed(self, idx):
+        value = self.update_config_freq_combo.itemData(idx)
+        if value:
+            self._save_setting("update_config_freq", value)
+            freq_label = {"always": "每次", "daily": "每天", "weekly": "每周", "monthly": "每月"}.get(value, value)
+            log.info(f"配置更新频率: {freq_label}")
+
+    def _on_kernel_resize_start(self, event):
+        self._kernel_resizing = True
+        self._kernel_resize_start_y = event.globalPosition().toPoint().y()
+        self._kernel_resize_start_h = self._kernel_scroll.height()
+
+    def _on_kernel_resize_move(self, event):
+        if not self._kernel_resizing:
+            return
+        delta = event.globalPosition().toPoint().y() - self._kernel_resize_start_y
+        new_h = max(96, self._kernel_resize_start_h + delta)  # 最小3排
+        self._kernel_scroll.setMinimumHeight(new_h)
+        self._kernel_scroll.setMaximumHeight(new_h)
+
+    def _on_kernel_resize_end(self, event):
+        self._kernel_resizing = False
+
+    def _on_add_proxy_rule(self):
+        rule_type = self.rule_type_combo.currentData()
+        value = self.rule_value_input.text().strip()
+        if not value:
+            return
+        if any(r["type"] == rule_type and r["value"] == value for r in self._proxy_rules):
+            QMessageBox.warning(self, "提示", "该规则已存在")
+            return
+        self._proxy_rules.append({"type": rule_type, "value": value})
+        self._save_setting("proxy_rules", self._proxy_rules)
+        self.rule_value_input.clear()
+        self._refresh_proxy_rules_ui()
+        self.rules_restart_hint.setVisible(True)
+        self._inject_all_rules()
+        log.info(f"添加代理规则: {rule_type} {value}")
+
+    def _on_remove_proxy_rule(self, idx):
+        if 0 <= idx < len(self._proxy_rules):
+            removed = self._proxy_rules.pop(idx)
+            self._save_setting("proxy_rules", self._proxy_rules)
+            self._refresh_proxy_rules_ui()
+            self.rules_restart_hint.setVisible(bool(self._proxy_rules))
+            self._inject_all_rules()
+            log.info(f"删除代理规则: {removed.get('type')} {removed.get('value')}")
+
+    def _refresh_proxy_rules_ui(self):
+        # 清空现有行
+        for row in self._rule_rows:
+            row.setParent(None)
+            row.deleteLater()
+        self._rule_rows.clear()
+        # 重建
+        type_labels = {"DOMAIN-SUFFIX": "指定域名", "DOMAIN": "指定网址", "IP-CIDR": "IP段"}
+        type_colors = {"DOMAIN-SUFFIX": COLOR_BLUE, "DOMAIN": COLOR_GREEN, "IP-CIDR": COLOR_ORANGE}
+        for i, rule in enumerate(self._proxy_rules):
+            row = QFrame()
+            row.setStyleSheet(f"border-bottom: 1px solid {COLOR_BORDER};")
+            rh = QHBoxLayout(row)
+            rh.setContentsMargins(0, 4, 0, 4)
+            rh.setSpacing(8)
+            type_badge = QLabel(type_labels.get(rule["type"], rule["type"]))
+            type_badge.setStyleSheet(
+                f"font-size: 8pt; color: {type_colors.get(rule['type'], COLOR_TEXT)}; "
+                f"background-color: rgba(255,255,255,0.05); padding: 2px 6px; border-radius: 3px; font-weight: bold;"
+            )
+            type_badge.setFixedWidth(72)
+            rh.addWidget(type_badge)
+            value_lbl = QLabel(rule["value"])
+            value_lbl.setStyleSheet(f"font-size: 8pt; color: {COLOR_TEXT}; font-family: Consolas;")
+            rh.addWidget(value_lbl, stretch=1)
+            del_btn = QPushButton("删除")
+            del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            del_btn.setFixedSize(48, 22)
+            del_btn.setStyleSheet(
+                f"QPushButton {{ background-color: {COLOR_RED}; color: #FFFFFF; font-size: 7pt; "
+                f"font-weight: bold; border-radius: 4px; border: none; }}"
+                f"QPushButton:hover {{ background-color: {COLOR_RED_LIGHT}; }}"
+            )
+            del_btn.clicked.connect(lambda checked, idx=i: self._on_remove_proxy_rule(idx))
+            rh.addWidget(del_btn)
+            self._rule_list_layout.addWidget(row)
+            self._rule_rows.append(row)
+
+    def _inject_custom_rules(self):
+        """在mihomo的config.yaml中注入用户自定义的代理规则
+        若 address_proxy_enabled=False，则只保留空标记块，不注入实际规则
+        """
+        quick_dir = self.quick_dir
+        if not quick_dir:
+            return
+        config_path = os.path.join(quick_dir, "config.yaml")
+        if not os.path.isfile(config_path):
+            return
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            # 先移除之前注入的规则（标记为 # YUNJI_CUSTOM_RULES）
+            lines = content.split("\n")
+            filtered = []
+            skip = False
+            for line in lines:
+                if "# YUNJI_CUSTOM_RULES_START" in line:
+                    skip = True
+                    continue
+                if "# YUNJI_CUSTOM_RULES_END" in line:
+                    skip = False
+                    continue
+                if not skip:
+                    filtered.append(line)
+            content = "\n".join(filtered)
+            # 构建自定义规则行
+            custom_lines = ["  # YUNJI_CUSTOM_RULES_START"]
+            if self.settings.get("address_proxy_enabled", True):
+                for rule in (self._proxy_rules or []):
+                    rule_type = rule.get("type", "DOMAIN-SUFFIX")
+                    value = rule.get("value", "").strip()
+                    if value:
+                        custom_lines.append(f"  - {rule_type},{value},🚀 节点选择")
+            custom_lines.append("  # YUNJI_CUSTOM_RULES_END")
+            # 在rules:后面插入
+            rules_pattern = re.compile(r'^(rules:\s*)$', re.MULTILINE)
+            if rules_pattern.search(content):
+                content = rules_pattern.sub(r'\1\n' + "\n".join(custom_lines), content)
+            else:
+                content += "\nrules:\n" + "\n".join(custom_lines) + "\n"
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            rule_count = len([r for r in (self._proxy_rules or []) if r.get("value", "").strip()])
+            if self.settings.get("address_proxy_enabled", True):
+                log.info(f"已注入 {rule_count} 条自定义代理规则")
+            else:
+                log.info("地址代理已关闭，未注入自定义规则")
+        except Exception as e:
+            log.error(f"注入自定义代理规则失败: {e}")
+
+    def _inject_proxy_mode_rules(self):
+        """根据系统代理模式注入 GEOIP 规则
+        - global_proxy_mode == "all"     : 不注入 GEOIP，所有流量走代理
+        - global_proxy_mode == "foreign" : 注入 GEOIP,CN,DIRECT（仅代理境外）
+        """
+        quick_dir = self.quick_dir
+        if not quick_dir:
+            return
+        config_path = os.path.join(quick_dir, "config.yaml")
+        if not os.path.isfile(config_path):
+            return
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            # 先移除之前注入的模式规则（标记为 # YUNJI_PROXY_MODE）
+            lines = content.split("\n")
+            filtered = []
+            skip = False
+            for line in lines:
+                if "# YUNJI_PROXY_MODE_START" in line:
+                    skip = True
+                    continue
+                if "# YUNJI_PROXY_MODE_END" in line:
+                    skip = False
+                    continue
+                if not skip:
+                    filtered.append(line)
+            content = "\n".join(filtered)
+            # 构建模式规则行
+            mode = self.settings.get("global_proxy_mode", "all")
+            mode_lines = ["  # YUNJI_PROXY_MODE_START"]
+            if mode == "foreign":
+                # 绕过境内：国内IP直连，其他走代理
+                mode_lines.append("  - GEOIP,CN,DIRECT")
+            mode_lines.append("  # YUNJI_PROXY_MODE_END")
+            # 优先在自定义规则块之后插入，否则在 rules: 后插入
+            custom_end_pattern = re.compile(r'^(\s*# YUNJI_CUSTOM_RULES_END\s*\n)', re.MULTILINE)
+            rules_pattern = re.compile(r'^(rules:\s*)$', re.MULTILINE)
+            if custom_end_pattern.search(content):
+                content = custom_end_pattern.sub(
+                    r'\1' + "\n".join(mode_lines) + "\n", content, count=1
+                )
+            elif rules_pattern.search(content):
+                content = rules_pattern.sub(r'\1\n' + "\n".join(mode_lines), content)
+            else:
+                content += "\nrules:\n" + "\n".join(mode_lines) + "\n"
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            if mode == "foreign":
+                log.info("已注入 GEOIP,CN,DIRECT（绕过境内模式）")
+            else:
+                log.info("已注入代理模式规则（全局系统代理）")
+        except Exception as e:
+            log.error(f"注入代理模式规则失败: {e}")
+
+    def _inject_all_rules(self):
+        """注入所有 Yunji 规则：先自定义规则，后代理模式规则"""
+        self._inject_custom_rules()
+        self._inject_proxy_mode_rules()
 
     def _on_auto_line_switch_toggled(self, checked):
         self._save_setting("auto_line_switch", checked)
@@ -4540,7 +4926,8 @@ class MainWindow(QMainWindow):
             return saved_date == date.today().isoformat()
         elif freq == "weekly":
             saved_dt = datetime.fromisoformat(saved_date)
-            return saved_dt.isocalendar()[1] == date.today().isocalendar()[1] and saved_dt.year == saved_dt.year
+            return (saved_dt.isocalendar()[1] == date.today().isocalendar()[1]
+                    and saved_dt.year == date.today().year)
         elif freq == "monthly":
             saved_dt = datetime.fromisoformat(saved_date)
             return saved_dt.month == date.today().month and saved_dt.year == date.today().year
@@ -4558,7 +4945,8 @@ class MainWindow(QMainWindow):
             return saved_date != date.today().isoformat()
         elif freq == "weekly":
             saved_dt = datetime.fromisoformat(saved_date)
-            return not (saved_dt.isocalendar()[1] == date.today().isocalendar()[1] and saved_dt.year == saved_dt.year)
+            return not (saved_dt.isocalendar()[1] == date.today().isocalendar()[1]
+                        and saved_dt.year == date.today().year)
         elif freq == "monthly":
             saved_dt = datetime.fromisoformat(saved_date)
             return not (saved_dt.month == date.today().month and saved_dt.year == date.today().year)
@@ -4664,6 +5052,9 @@ class MainWindow(QMainWindow):
                 self.line_progress.setStyleSheet("font-size: 8pt; color: #FF6B80;")
                 return
 
+            # 检测完成后，重新注入所有 Yunji 规则（配置可能已被新数据覆盖）
+            self._inject_all_rules()
+
             worker = self.worker
             if not worker or "results" not in worker.kwargs:
                 self.line_progress.setText("检测结果异常")
@@ -4734,6 +5125,8 @@ class MainWindow(QMainWindow):
             self.current_line = name
             self._save_setting("current_line", name)
         self._update_active_line()
+        # 切换线路前先注入所有 Yunji 规则
+        self._inject_all_rules()
         data = self.line_results.get(name)
         if data:
             self.worker = ServiceWorker("use_line", name=name, data=data, quick_dir=self.quick_dir,
@@ -6454,10 +6847,7 @@ class MainWindow(QMainWindow):
     def _show_kernel_list(self):
         """展开内核版本列表（点检查更新获取到结果后/首次启动加载缓存后调用）
 
-        根据当前版本数量动态计算滚动区高度，保留最大 400px 上限：
-          - 版本少（<11）：完整显示所有行，无需滚动条
-          - 版本多（>=11）：出现垂直滚动条，可滚动浏览剩余版本
-
+        默认只显示5行内容（约160px），用户可通过拖拽手柄增加高度。
         不再硬卡 kernel_card 高度，让卡片随滚动区自然伸缩。
         """
         self._kernel_scroll_visible = True
@@ -6467,15 +6857,10 @@ class MainWindow(QMainWindow):
         # 表头同步显示（首次展开 / 重新展开都生效）
         if hasattr(self, '_kernel_header_row') and self._kernel_header_row is not None:
             self._kernel_header_row.setVisible(True)
-        # 动态计算目标高度：每张卡为单行 5 列结构（描述默认 1 行 + 省略号）
-        #   meta 列（版本/日期/状态/操作）：固定 1 行 ~22px（按钮高）
-        #   描述列：1 行 18px（ElidedLabel 单行省略号）
-        #   卡片实际高度 ≈ 32px（meta 居中 + 描述 1 行 + padding 10px）
-        # 取平均 32px，最小 130px，最大 460px（约 12 排）
-        n = len(getattr(self, '_kernel_releases', []))
-        target_h = min(460, max(130, n * 32 + 50))
-        self._kernel_scroll.setMinimumHeight(target_h)
-        self._kernel_scroll.setMaximumHeight(target_h)
+        # 默认5行高度（约160px），用户可拖拽调整
+        default_h = 160
+        self._kernel_scroll.setMinimumHeight(default_h)
+        self._kernel_scroll.setMaximumHeight(default_h)
         # 强制刷新 size hint，让卡片随列表内容自然伸缩
         if hasattr(self, 'kernel_card') and self.kernel_card is not None:
             self.kernel_card.updateGeometry()
