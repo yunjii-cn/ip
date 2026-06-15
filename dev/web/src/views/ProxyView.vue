@@ -72,6 +72,18 @@
           <div>启用指定程序代理</div>
           <van-switch v-model="customAppsEnabled" size="22px" active-color="#e74c3c" @change="onAppProxyChange" />
         </div>
+        <div class="setting-row">
+          <div class="proxy-scope-row">
+            <span class="scope-label">代理范围:</span>
+            <van-radio-group v-model="customAppsScope" direction="horizontal">
+              <van-radio name="all" checked-color="#e74c3c">全部指定程序</van-radio>
+              <van-radio name="specified" checked-color="#e74c3c">指定程序</van-radio>
+            </van-radio-group>
+          </div>
+        </div>
+        <div v-if="customAppsScope === 'specified'" class="scope-warning">
+          仅从已添加程序中选择的需要代理的程序会走代理
+        </div>
         <div class="restart-hint">
           ⚠ 修改后需重启服务生效
         </div>
@@ -253,6 +265,7 @@ const browserProxyOn = ref(true)
 const proxyScope = ref('all')
 const proxyMode = ref('global')
 const customAppsEnabled = ref(false)
+const customAppsScope = ref('all')
 const customApps = ref<string[]>([])
 const selectedApp = ref('')
 const selectedAppName = ref('')
@@ -293,7 +306,7 @@ const helpMessages: Record<string, { title: string; message: string }> = {
     title: '指定程序代理说明',
     message: isMobile
       ? '选择需要通过代理访问的应用。添加后，所选应用将通过VPN代理服务器转发网络请求。\n\n修改后需要重启代理服务才能生效。'
-      : '添加需要通过代理访问的程序。启用后，添加的程序也将通过代理服务器转发网络请求。\n\n修改后需要重启代理服务才能生效。',
+      : '添加需要通过代理访问的程序。启用后，可通过"代理范围"选择：\n\n• 全部指定程序：所有已添加的程序都会通过代理服务器转发网络请求\n• 指定程序：仅从列表中手动选择需要代理的程序\n\n修改后需要重启代理服务才能生效。',
   },
   startup: {
     title: '启动设置说明',
@@ -352,7 +365,9 @@ async function saveProxyConfig() {
       await proxyApi.saveConfig({
         global_proxy: proxyStore.globalProxy,
         custom_apps_enabled: customAppsEnabled.value,
+        custom_apps_scope: customAppsScope.value,
         custom_apps: customApps.value,
+        browser_proxy: browserProxyOn.value,
         browser_proxy_mode: proxyScope.value,
       })
     }
@@ -508,6 +523,10 @@ watch(proxyScope, () => {
   if (!isMobile) saveProxyConfig()
 })
 
+watch(customAppsScope, () => {
+  if (!isMobile) saveProxyConfig()
+})
+
 onMounted(async () => {
   await Promise.all([
     proxyStore.fetchStatus(),
@@ -546,6 +565,7 @@ async function loadConfig() {
       proxyScope.value = data.browser_proxy_mode || 'all'
       browserProxyOn.value = data.browser_proxy ?? true
       customAppsEnabled.value = data.custom_apps_enabled || false
+      customAppsScope.value = data.custom_apps_scope || 'all'
       customApps.value = data.custom_apps || []
       if (customApps.value.length > 0) {
         selectedApp.value = customApps.value[0]
