@@ -15,6 +15,7 @@ import urllib.request
 import subprocess
 import re
 import ctypes
+import ctypes.wintypes
 import queue
 import tempfile
 import zipfile
@@ -8058,6 +8059,8 @@ class MainWindow(QMainWindow):
         # 隐藏托盘图标，避免退出后托盘残留
         if self._tray:
             self._tray.hide()
+        # 真正退出时释放单实例互斥体（最小化到托盘不释放，新进程要杀的就是隐藏态的我们）
+        _cleanup_single_instance()
         QApplication.instance().quit()
 
     def _finish_splash(self):
@@ -8099,7 +8102,180 @@ def _global_exception_handler(exc_type, exc_value, exc_tb):
         pass
 
 
+# ══════════════════════════════════════════════════════════════
+# 单实例控制（架构参照 云集智能编程工作站/1.PC v2.0）
+# 杀同名前缀的旧 EXE / 旧 python main.py 进程 → 创建命名 mutex 占位
+# ══════════════════════════════════════════════════════════════
+
+_k32 = ctypes.windll.kernel32
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+_TH32CS_SNAPPROCESS = 0x00000002
+
+# 固定字符串 mutex 名（不带版本号）：升级是"关旧开新"，不存在同时跑
+_MUTEX_NAME = "YunJi_NetworkProxy_SingleInstance"
+_instance_mutex = None
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", ctypes.wintypes.DWORD),
+        ("cntUsage", ctypes.wintypes.DWORD),
+        ("th32ProcessID", ctypes.wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+        ("th32ModuleID", ctypes.wintypes.DWORD),
+        ("cntThreads", ctypes.wintypes.DWORD),
+        ("th32ParentProcessID", ctypes.wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", ctypes.wintypes.DWORD),
+        ("szExeFile", ctypes.c_wchar * 260),
+    ]
+
+
+def _kill_same_name_processes():
+    """杀掉所有同名旧进程，确保单实例。
+
+    - 冻结模式（运行的是 .exe）：按 EXE 文件名前缀匹配 BRAND_NAME
+    - 开发模式（运行的是 python.exe / pythonw.exe）：用 psutil 取命令行，
+      包含 main.py 即视为本项目进程
+
+    同时跳过「当前进程 + 祖先链」，防止杀到自己的父/祖父导致自己被连带结束。
+    """
+    if sys.platform != 'win32':
+        return
+
+    my_pid = _k32.GetCurrentProcessId()
+    is_frozen = getattr(sys, 'frozen', False)
+    base_prefix = APP_NAME.lower()
+
+    # 1. 收集当前进程的祖先链（防止杀到自己的父进程把自己也带走）
+    my_ancestor_pids = set()
+    try:
+        import psutil as _ps_anc
+        cur = _ps_anc.Process(my_pid)
+        while True:
+            par = cur.parent()
+            if par is None or par.pid == 0:
+                break
+            my_ancestor_pids.add(par.pid)
+            cur = par
+    except Exception:
+        pass
+
+    # 2. 创建进程快照
+    snap = _k32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    if snap == _INVALID_HANDLE_VALUE:
+        return
+
+    entry = _PROCESSENTRY32W()
+    entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+    pids_to_kill = []
+
+    if _k32.Process32FirstW(snap, ctypes.byref(entry)):
+        while True:
+            pid = entry.th32ProcessID
+            if pid != my_pid and pid not in my_ancestor_pids:
+                exe_name = (entry.szExeFile or "").lower()
+                should_kill = False
+                if is_frozen:
+                    # 冻结模式：按 EXE 文件名前缀匹配
+                    should_kill = (
+                        exe_name.startswith(base_prefix)
+                        and exe_name.endswith('.exe')
+                    )
+                else:
+                    # 开发模式：python.exe / pythonw.exe + cmdline 含 main.py
+                    if exe_name in ('python.exe', 'pythonw.exe'):
+                        try:
+                            import psutil
+                            cmdline = ' '.join(psutil.Process(pid).cmdline()).lower()
+                            if 'main.py' in cmdline:
+                                should_kill = True
+                        except Exception:
+                            pass
+                if should_kill:
+                    pids_to_kill.append(pid)
+
+            entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+            if not _k32.Process32NextW(snap, ctypes.byref(entry)):
+                break
+
+    _k32.CloseHandle(snap)
+
+    # 3. 杀进程（TerminateProcess 是异步的，调用后立即返回）
+    PROCESS_TERMINATE = 0x0001
+    for pid in pids_to_kill:
+        h = _k32.OpenProcess(PROCESS_TERMINATE, False, pid)
+        if h:
+            _k32.TerminateProcess(h, 0)
+            _k32.CloseHandle(h)
+
+    # 4. 等被杀进程真正退出（≤2s），否则 mutex 占位会冲突
+    if pids_to_kill:
+        STILL_ACTIVE = 259
+        for _ in range(20):
+            time.sleep(0.1)
+            still_alive = []
+            for pid in pids_to_kill:
+                h = _k32.OpenProcess(0x00100000, False, pid)
+                if h:
+                    exit_code = ctypes.c_ulong()
+                    if _k32.GetExitCodeProcess(h, ctypes.byref(exit_code)) and exit_code.value == STILL_ACTIVE:
+                        still_alive.append(pid)
+                    _k32.CloseHandle(h)
+            if not still_alive:
+                break
+
+
+def _ensure_single_instance():
+    """单实例控制：杀同名进程 → mutex 占位（防 race）。"""
+    global _instance_mutex
+    if sys.platform != 'win32':
+        return
+
+    # 1. 杀所有同名旧进程
+    _kill_same_name_processes()
+
+    # 2. 创建 mutex 占位
+    _instance_mutex = _k32.CreateMutexW(None, True, _MUTEX_NAME)
+    ERROR_ALREADY_EXISTS = 183
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        # 兜底：race 时再杀一次
+        _k32.CloseHandle(_instance_mutex)
+        _instance_mutex = None
+        _kill_same_name_processes()
+        _instance_mutex = _k32.CreateMutexW(None, True, _MUTEX_NAME)
+        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+            _k32.CloseHandle(_instance_mutex)
+            _instance_mutex = None
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                f"{APP_NAME} 旧实例未能退出，请手动结束进程后重试。",
+                "提示",
+                0x40
+            )
+            sys.exit(0)
+
+
+def _cleanup_single_instance():
+    """清理单实例资源（仅在真正退出时调用，最小化到托盘不释放）。"""
+    global _instance_mutex
+    if _instance_mutex:
+        try:
+            _k32.ReleaseMutex(_instance_mutex)
+        except Exception:
+            pass
+        try:
+            _k32.CloseHandle(_instance_mutex)
+        except Exception:
+            pass
+        _instance_mutex = None
+
+
 def main():
+    # 单实例控制：杀同名前缀的旧 EXE / 旧 python main.py → mutex 占位
+    # 这是整个进程生命周期的第一步，必须在任何 QApplication 资源创建之前完成
+    _ensure_single_instance()
+
     sys.excepthook = _global_exception_handler
 
     # 高精度DPI缩放：PassThrough不取整缩放因子，保证各分辨率下界面比例一致
