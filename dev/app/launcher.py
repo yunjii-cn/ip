@@ -38,15 +38,18 @@ _verify_brand()
 
 
 def _kill_old_instances():
-    if sys.platform != 'win32' or not getattr(sys, 'frozen', False):
+    """杀掉所有同名旧 EXE 进程，确保单实例。
+
+    同时覆盖：
+    - 冻结模式（运行的是 .exe）：按 EXE 文件名前缀匹配 BRAND_NAME
+    - 开发模式（运行的是 python.exe / pythonw.exe）：用 psutil 取命令行，
+      检查是否包含 main.py 与本项目 dev/app 目录标记，避免误杀其他 Python 程序
+    """
+    if sys.platform != 'win32':
         return
 
-    my_exe = os.path.normcase(os.path.abspath(sys.executable))
-    my_name = os.path.basename(my_exe)
     my_pid = ctypes.windll.kernel32.GetCurrentProcessId()
-
-    base_prefix = BRAND_NAME
-
+    is_frozen = getattr(sys, 'frozen', False)
     kernel32 = ctypes.windll.kernel32
 
     TH32CS_SNAPPROCESS = 0x00000002
@@ -74,13 +77,38 @@ def _kill_old_instances():
     entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
 
     pids_to_kill = []
+    base_prefix = BRAND_NAME.lower()
+    # 本项目的源码目录标记：dev/app（兼容 \\ 和 / 两种路径分隔符）
+    dev_markers = ('dev\\app', 'dev/app')
 
     if kernel32.Process32FirstW(snap, ctypes.byref(entry)):
         while True:
             pid = entry.th32ProcessID
-            exe_name = entry.szExeFile.lower()
-            if pid != my_pid and exe_name.startswith(base_prefix.lower()) and exe_name.endswith('.exe'):
-                pids_to_kill.append(pid)
+            if pid != my_pid:
+                exe_name = (entry.szExeFile or "").lower()
+                should_kill = False
+                if is_frozen:
+                    # 冻结模式：按 EXE 文件名前缀匹配
+                    should_kill = (
+                        exe_name.startswith(base_prefix)
+                        and exe_name.endswith('.exe')
+                    )
+                else:
+                    # 开发模式：只针对 python.exe / pythonw.exe
+                    # 通过 psutil 取命令行，检查是否在跑本项目的 main.py
+                    if exe_name in ('python.exe', 'pythonw.exe'):
+                        try:
+                            import psutil
+                            proc = psutil.Process(pid)
+                            cmdline = proc.cmdline()
+                            cmdline_str = ' '.join(cmdline).lower()
+                            if 'main.py' in cmdline_str and any(m in cmdline_str for m in dev_markers):
+                                should_kill = True
+                        except Exception:
+                            pass
+                if should_kill:
+                    pids_to_kill.append(pid)
+
             entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
             if not kernel32.Process32NextW(snap, ctypes.byref(entry)):
                 break
@@ -88,14 +116,29 @@ def _kill_old_instances():
     kernel32.CloseHandle(snap)
 
     PROCESS_TERMINATE = 0x0001
+    killed = []
     for pid in pids_to_kill:
         handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
         if handle:
-            kernel32.TerminateProcess(handle, 0)
+            if kernel32.TerminateProcess(handle, 0):
+                killed.append(pid)
             kernel32.CloseHandle(handle)
 
-    if pids_to_kill:
-        time.sleep(0.5)
+    # 等待被杀进程完全退出，避免新进程立刻占用同一资源（端口 / 文件锁）冲突
+    if killed:
+        for _ in range(20):
+            time.sleep(0.1)
+            still_alive = []
+            for pid in killed:
+                h = kernel32.OpenProcess(0x00100000, False, pid)
+                if h:
+                    STILL_ACTIVE = 259
+                    exit_code = ctypes.c_ulong()
+                    if kernel32.GetExitCodeProcess(h, ctypes.byref(exit_code)) and exit_code.value == STILL_ACTIVE:
+                        still_alive.append(pid)
+                    kernel32.CloseHandle(h)
+            if not still_alive:
+                break
 
 
 _kill_old_instances()
