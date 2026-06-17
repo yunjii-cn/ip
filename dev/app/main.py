@@ -1310,6 +1310,10 @@ def load_settings():
         "address_proxy_enabled": True,
         "address_proxy_scope": "all",
         "address_proxy_selected": 0,
+        "tun_enabled": False,
+        "tun_stack": "gvisor",
+        "tls_fingerprint": "none",
+        "sniffing_enabled": False,
         "current_line": "",
         "proxy_enabled": False,
         "proxy_host": "127.0.0.1",
@@ -3541,6 +3545,150 @@ class MainWindow(QMainWindow):
         pm_title_row.addWidget(self.restart_apply_btn)
         pmc.addLayout(pm_title_row)
 
+        # ========== 0. TUN 模式 子卡片（最顶部，独立开关） ==========
+        tun_row = QFrame()
+        tun_row.setObjectName("switch-row")
+        tr = QVBoxLayout(tun_row)
+        tr.setContentsMargins(14, 8, 14, 8)
+        tr.setSpacing(6)
+
+        tr_title = QHBoxLayout()
+        tr_title.setSpacing(4)
+        tr_title.addWidget(QLabel("🛡️ TUN 模式"))
+        tr_title.itemAt(0).widget().setStyleSheet("font-size: 8pt; font-weight: bold;")
+        tr_title.addWidget(_make_help_btn(
+            "TUN 模式设置",
+            "TUN 模式说明",
+            "【TUN 模式】\n"
+            "通过虚拟网卡接管全部网络流量（含不遵守系统代理的 AI 软件、游戏等）。\n"
+            "开启后系统代理、浏览器代理等设置将被忽略。\n\n"
+            "【TUN 栈】\n"
+            "gvisor：用户态网络栈，免驱动，兼容性好（推荐）\n"
+            "system：系统协议栈，性能更高，需要 wintun.dll\n\n"
+            "【管理员权限】\n"
+            "TUN 模式需要管理员权限运行，否则无法创建虚拟网卡。\n\n"
+            "修改后需要重启代理服务才能生效。"
+        ))
+        tr_title.addStretch()
+        self.switch_tun = ToggleSwitch("", default=self.settings.get("tun_enabled", False))
+        self.switch_tun.setFixedHeight(22)
+        self.switch_tun.setFixedWidth(72)
+        self.switch_tun.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.switch_tun.toggled.connect(self._on_tun_toggled)
+        tr_title.addWidget(self.switch_tun, alignment=Qt.AlignmentFlag.AlignVCenter)
+        tr.addLayout(tr_title)
+
+        # TUN 栈选择行
+        tun_stack_inner = QHBoxLayout()
+        tun_stack_inner.setSpacing(8)
+        tun_stack_lbl = QLabel("TUN 栈:")
+        tun_stack_lbl.setStyleSheet("font-size: 8pt; color: #999999;")
+        tun_stack_inner.addWidget(tun_stack_lbl)
+        self.tun_stack_group = []
+        self.tun_gvisor_rb = RadioButton("gvisor（免驱动）", default=self.settings.get("tun_stack", "gvisor") == "gvisor")
+        self.tun_stack_group.append(self.tun_gvisor_rb)
+        tun_stack_inner.addWidget(self.tun_gvisor_rb)
+        self.tun_system_rb = RadioButton("system（需wintun）", default=self.settings.get("tun_stack", "gvisor") == "system")
+        self.tun_stack_group.append(self.tun_system_rb)
+        tun_stack_inner.addWidget(self.tun_system_rb)
+        self.tun_gvisor_rb.toggled.connect(lambda checked: self._on_tun_stack_toggled("gvisor", checked))
+        self.tun_system_rb.toggled.connect(lambda checked: self._on_tun_stack_toggled("system", checked))
+        tr.addLayout(tun_stack_inner)
+
+        # 管理员权限提示
+        self._is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+        self.tun_admin_hint = QLabel()
+        if not self._is_admin:
+            self.tun_admin_hint.setText("⚠ TUN 模式需要管理员权限，请以管理员身份运行本程序")
+            self.tun_admin_hint.setStyleSheet(f"font-size: 8pt; color: {COLOR_RED_LIGHT};")
+        else:
+            self.tun_admin_hint.setText("✓ 已获得管理员权限")
+            self.tun_admin_hint.setStyleSheet(f"font-size: 8pt; color: {COLOR_GREEN};")
+        self.tun_admin_hint.setVisible(self.settings.get("tun_enabled", False))
+        tr.addWidget(self.tun_admin_hint)
+
+        self.tun_restart_hint = QLabel("⚠ 修改后需重启服务生效")
+        self.tun_restart_hint.setObjectName("restart-hint")
+        self.tun_restart_hint.setStyleSheet(f"color: {COLOR_ORANGE}; font-size: 8pt;")
+        self.tun_restart_hint.setVisible(False)
+        tr.addWidget(self.tun_restart_hint)
+
+        pmc.addWidget(tun_row)
+
+        # ========== 0.5 高级设置 子卡片（TLS指纹 + 域名嗅探） ==========
+        adv_row = QFrame()
+        adv_row.setObjectName("switch-row")
+        ar = QVBoxLayout(adv_row)
+        ar.setContentsMargins(14, 8, 14, 8)
+        ar.setSpacing(6)
+
+        ar_title = QHBoxLayout()
+        ar_title.setSpacing(4)
+        ar_title.addWidget(QLabel("🛡️ 高级设置"))
+        ar_title.itemAt(0).widget().setStyleSheet("font-size: 8pt; font-weight: bold;")
+        ar_title.addWidget(_make_help_btn(
+            "高级设置",
+            "高级设置说明",
+            "【TLS 指纹伪装】\n"
+            "将代理连接的 TLS 指纹伪装为常见浏览器特征，防止流量被识别为代理。\n"
+            "• Chrome：伪装为 Chrome 浏览器（推荐）\n"
+            "• Firefox：伪装为 Firefox 浏览器\n"
+            "• Safari：伪装为 Safari 浏览器\n"
+            "• 随机：每次随机选择\n\n"
+            "【域名嗅探】\n"
+            "从 IP 流量中还原出真实域名，让代理规则基于域名而非 IP 匹配，更精准。\n"
+            "适用于 TUN 模式或部分不携带域名信息的流量。\n\n"
+            "修改后需要重启代理服务才能生效。"
+        ))
+        ar_title.addStretch()
+        ar.addLayout(ar_title)
+
+        # TLS 指纹选择行
+        fp_inner = QHBoxLayout()
+        fp_inner.setSpacing(8)
+        fp_lbl = QLabel("TLS 指纹:")
+        fp_lbl.setStyleSheet("font-size: 8pt; color: #999999;")
+        fp_inner.addWidget(fp_lbl)
+        self.tls_fingerprint_combo = QComboBox()
+        self.tls_fingerprint_combo.addItem("不伪装", "none")
+        self.tls_fingerprint_combo.addItem("Chrome", "chrome")
+        self.tls_fingerprint_combo.addItem("Firefox", "firefox")
+        self.tls_fingerprint_combo.addItem("Safari", "safari")
+        self.tls_fingerprint_combo.addItem("随机", "random")
+        # 设置当前值
+        current_fp = self.settings.get("tls_fingerprint", "none")
+        for i in range(self.tls_fingerprint_combo.count()):
+            if self.tls_fingerprint_combo.itemData(i) == current_fp:
+                self.tls_fingerprint_combo.setCurrentIndex(i)
+                break
+        self.tls_fingerprint_combo.setFixedHeight(26)
+        self.tls_fingerprint_combo.currentIndexChanged.connect(self._on_tls_fingerprint_changed)
+        fp_inner.addWidget(self.tls_fingerprint_combo)
+        fp_inner.addStretch()
+        ar.addLayout(fp_inner)
+
+        # 域名嗅探开关行
+        sniff_inner = QHBoxLayout()
+        sniff_inner.setSpacing(4)
+        sniff_inner.addWidget(QLabel("🔍 域名嗅探"))
+        sniff_inner.itemAt(0).widget().setStyleSheet("font-size: 8pt; font-weight: bold;")
+        sniff_inner.addStretch()
+        self.switch_sniffing = ToggleSwitch("", default=self.settings.get("sniffing_enabled", False))
+        self.switch_sniffing.setFixedHeight(22)
+        self.switch_sniffing.setFixedWidth(72)
+        self.switch_sniffing.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.switch_sniffing.toggled.connect(self._on_sniffing_toggled)
+        sniff_inner.addWidget(self.switch_sniffing, alignment=Qt.AlignmentFlag.AlignVCenter)
+        ar.addLayout(sniff_inner)
+
+        self.adv_restart_hint = QLabel("⚠ 修改后需重启服务生效")
+        self.adv_restart_hint.setObjectName("restart-hint")
+        self.adv_restart_hint.setStyleSheet(f"color: {COLOR_ORANGE}; font-size: 8pt;")
+        self.adv_restart_hint.setVisible(False)
+        ar.addWidget(self.adv_restart_hint)
+
+        pmc.addWidget(adv_row)
+
         # ========== 1. 系统代理 子卡片 ==========
         global_row = QFrame()
         global_row.setObjectName("switch-row")
@@ -4647,7 +4795,8 @@ class MainWindow(QMainWindow):
     def _show_restart_applied_hints(self):
         """重启生效后，将所有提示改为'当前设置已生效'，10秒后消失"""
         green_style = f"color: {COLOR_GREEN}; font-size: 8pt;"
-        for hint in (self.global_restart_hint, self.rules_restart_hint, self.custom_restart_hint):
+        for hint in (self.global_restart_hint, self.rules_restart_hint, self.custom_restart_hint,
+                     self.tun_restart_hint, self.adv_restart_hint):
             hint.setText("✓ 当前设置已生效")
             hint.setStyleSheet(green_style)
             hint.setVisible(True)
@@ -4657,7 +4806,8 @@ class MainWindow(QMainWindow):
     def _hide_restart_hints(self):
         """隐藏所有重启提示"""
         orange_style = f"color: {COLOR_ORANGE}; font-size: 8pt;"
-        for hint in (self.global_restart_hint, self.rules_restart_hint, self.custom_restart_hint):
+        for hint in (self.global_restart_hint, self.rules_restart_hint, self.custom_restart_hint,
+                     self.tun_restart_hint, self.adv_restart_hint):
             hint.setVisible(False)
             hint.setStyleSheet(orange_style)
 
@@ -4667,6 +4817,13 @@ class MainWindow(QMainWindow):
                 "未找到代理内核！\n\n"
                 f"基础目录: {get_base_dir()}\n\n"
                 "请确保 app/Quick/ 目录中包含 quick.exe。")
+            return
+        # TUN 模式需要管理员权限
+        if self.settings.get("tun_enabled", False) and not self._is_admin:
+            QMessageBox.warning(self, "权限不足",
+                "TUN 模式需要管理员权限运行。\n\n"
+                "请以管理员身份重新启动本程序，或关闭 TUN 模式后重试。")
+            self.switch_proxy.setChecked(False)
             return
         if self.worker and self.worker.isRunning():
             return
@@ -4824,7 +4981,10 @@ class MainWindow(QMainWindow):
         """判断当前设置是否需要开启系统代理
         全局系统代理、地址代理、程序代理开启时均需要系统代理，
         以保证流量经过 mihomo 内核。
+        TUN 模式下不需要系统代理（虚拟网卡接管全部流量）。
         """
+        if self.settings.get("tun_enabled", False):
+            return False
         if self.settings.get("global_proxy", False):
             return True
         if self.settings.get("address_proxy_enabled", False):
@@ -4849,6 +5009,57 @@ class MainWindow(QMainWindow):
             self.rules_restart_hint.setText("⚠ 地址代理设置已保存，将在下次启动服务时生效")
         self.rules_restart_hint.setVisible(True)
         log.info(f"地址代理: {'开启' if checked else '关闭'}")
+
+    def _on_tun_toggled(self, checked):
+        """TUN 模式开关"""
+        if checked and not self._is_admin:
+            # 未获得管理员权限，阻止开启
+            self.switch_tun.blockSignals(True)
+            self.switch_tun.setChecked(False)
+            self.switch_tun.blockSignals(False)
+            QMessageBox.warning(self, "权限不足", "TUN 模式需要管理员权限运行。\n请以管理员身份重新启动本程序。")
+            return
+        self._save_setting("tun_enabled", checked)
+        self.tun_admin_hint.setVisible(checked)
+        if is_proxy_running():
+            self._inject_all_rules()
+            self.tun_restart_hint.setText("⚠ TUN 设置已应用，重启服务后完全生效")
+            self.tun_restart_hint.setVisible(True)
+        else:
+            self.tun_restart_hint.setText("⚠ 设置已保存，将在下次启动服务时生效")
+            self.tun_restart_hint.setVisible(True)
+        self._update_proxy_ui_disabled_state()
+        log.info(f"TUN 模式: {'开启' if checked else '关闭'}")
+
+    def _on_tun_stack_toggled(self, stack, checked):
+        """TUN 栈选择"""
+        if not checked:
+            return
+        for rb in self.tun_stack_group:
+            if rb != self.tun_stack_group[0] or stack != "gvisor":
+                pass
+        self._save_setting("tun_stack", stack)
+        if is_proxy_running():
+            self._inject_all_rules()
+            self.tun_restart_hint.setVisible(True)
+        log.info(f"TUN 栈: {stack}")
+
+    def _on_tls_fingerprint_changed(self):
+        """TLS 指纹伪装选择"""
+        fp = self.tls_fingerprint_combo.currentData()
+        self._save_setting("tls_fingerprint", fp)
+        if is_proxy_running():
+            self._inject_all_rules()
+            self.adv_restart_hint.setVisible(True)
+        log.info(f"TLS 指纹: {fp}")
+
+    def _on_sniffing_toggled(self, checked):
+        """域名嗅探开关"""
+        self._save_setting("sniffing_enabled", checked)
+        if is_proxy_running():
+            self._inject_all_rules()
+            self.adv_restart_hint.setVisible(True)
+        log.info(f"域名嗅探: {'开启' if checked else '关闭'}")
 
     def _on_global_proxy_toggled(self, checked):
         self._save_setting("global_proxy", checked)
@@ -4893,61 +5104,75 @@ class MainWindow(QMainWindow):
 
     def _update_proxy_ui_disabled_state(self):
         is_global = self.settings.get("global_proxy", False)
+        is_tun = self.settings.get("tun_enabled", False)
+        # 全局系统代理开启时禁用其他代理方式（注册表级别强制接管，规则失效）
+        # TUN 模式开启时只禁用系统代理（地址/程序代理可与 TUN 协作，用规则过滤流量）
+        disable_all_others = is_global
+        disable_browser = is_global
+        disable_system_proxy = is_tun  # TUN 模式下系统代理无意义
         if hasattr(self, 'switch_browser_proxy'):
-            self.switch_browser_proxy.setEnabled(not is_global)
+            self.switch_browser_proxy.setEnabled(not disable_browser)
             self.switch_browser_proxy.setStyleSheet(
-                f"opacity: {'0.5' if is_global else '1.0'}"
+                f"opacity: {'0.5' if disable_browser else '1.0'}"
             )
         if hasattr(self, 'browser_proxy_scope_group') and self.browser_proxy_scope_group:
             for rb in self.browser_proxy_scope_group:
-                rb.setEnabled(not is_global)
-                rb.setStyleSheet(f"opacity: {'0.5' if is_global else '1.0'}")
+                rb.setEnabled(not disable_browser)
+                rb.setStyleSheet(f"opacity: {'0.5' if disable_browser else '1.0'}")
         if hasattr(self, 'specified_browser_hint'):
-            self.specified_browser_hint.setVisible(not is_global)
+            self.specified_browser_hint.setVisible(not disable_browser)
         if hasattr(self, 'switch_custom_apps'):
-            self.switch_custom_apps.setEnabled(not is_global)
+            self.switch_custom_apps.setEnabled(not disable_all_others)
             self.switch_custom_apps.setStyleSheet(
-                f"opacity: {'0.5' if is_global else '1.0'}"
+                f"opacity: {'0.5' if disable_all_others else '1.0'}"
             )
         if hasattr(self, 'custom_apps_scope_group') and self.custom_apps_scope_group:
             for rb in self.custom_apps_scope_group:
-                rb.setEnabled(not is_global)
-                rb.setStyleSheet(f"opacity: {'0.5' if is_global else '1.0'}")
+                rb.setEnabled(not disable_all_others)
+                rb.setStyleSheet(f"opacity: {'0.5' if disable_all_others else '1.0'}")
         if hasattr(self, 'app_combo'):
-            self.app_combo.setEnabled(not is_global)
+            self.app_combo.setEnabled(not disable_all_others)
         if hasattr(self, 'add_app_btn'):
-            self.add_app_btn.setEnabled(not is_global)
-            self.add_app_btn.setStyleSheet(f"opacity: {'0.5' if is_global else '1.0'}")
+            self.add_app_btn.setEnabled(not disable_all_others)
+            self.add_app_btn.setStyleSheet(f"opacity: {'0.5' if disable_all_others else '1.0'}")
         if hasattr(self, 'remove_app_btn'):
-            self.remove_app_btn.setEnabled(not is_global)
-            self.remove_app_btn.setStyleSheet(f"opacity: {'0.5' if is_global else '1.0'}")
-        # 地址代理子卡片：开关 + 代理范围 + 规则类型 + 输入框 + 添加按钮 + 规则列表 + 提示
+            self.remove_app_btn.setEnabled(not disable_all_others)
+            self.remove_app_btn.setStyleSheet(f"opacity: {'0.5' if disable_all_others else '1.0'}")
+        # 地址代理子卡片：TUN 模式下保留可用（地址规则可在 TUN 接管后过滤流量）
         if hasattr(self, 'switch_address_proxy'):
-            self.switch_address_proxy.setEnabled(not is_global)
+            self.switch_address_proxy.setEnabled(not disable_all_others)
             self.switch_address_proxy.setStyleSheet(
-                f"opacity: {'0.5' if is_global else '1.0'}"
+                f"opacity: {'0.5' if disable_all_others else '1.0'}"
             )
         if hasattr(self, 'address_proxy_scope_group') and self.address_proxy_scope_group:
             for rb in self.address_proxy_scope_group:
-                rb.setEnabled(not is_global)
-                rb.setStyleSheet(f"opacity: {'0.5' if is_global else '1.0'}")
+                rb.setEnabled(not disable_all_others)
+                rb.setStyleSheet(f"opacity: {'0.5' if disable_all_others else '1.0'}")
         if hasattr(self, 'address_select_combo'):
-            self.address_select_combo.setEnabled(not is_global)
+            self.address_select_combo.setEnabled(not disable_all_others)
         if hasattr(self, 'rule_type_combo'):
-            self.rule_type_combo.setEnabled(not is_global)
-            self.rule_type_combo.setStyleSheet(f"opacity: {'0.5' if is_global else '1.0'}")
+            self.rule_type_combo.setEnabled(not disable_all_others)
+            self.rule_type_combo.setStyleSheet(f"opacity: {'0.5' if disable_all_others else '1.0'}")
         if hasattr(self, 'rule_value_input'):
-            self.rule_value_input.setEnabled(not is_global)
-            self.rule_value_input.setStyleSheet(f"opacity: {'0.5' if is_global else '1.0'}")
+            self.rule_value_input.setEnabled(not disable_all_others)
+            self.rule_value_input.setStyleSheet(f"opacity: {'0.5' if disable_all_others else '1.0'}")
         if hasattr(self, 'add_rule_btn'):
-            self.add_rule_btn.setEnabled(not is_global)
-            self.add_rule_btn.setStyleSheet(f"opacity: {'0.5' if is_global else '1.0'}")
+            self.add_rule_btn.setEnabled(not disable_all_others)
+            self.add_rule_btn.setStyleSheet(f"opacity: {'0.5' if disable_all_others else '1.0'}")
         if hasattr(self, '_rule_list_widget'):
-            self._rule_list_widget.setEnabled(not is_global)
-        if hasattr(self, 'rules_restart_hint') and is_global:
+            self._rule_list_widget.setEnabled(not disable_all_others)
+        if hasattr(self, 'rules_restart_hint') and disable_all_others:
             self.rules_restart_hint.setVisible(False)
-        if hasattr(self, 'custom_apps_enabled') and hasattr(self, 'custom_apps_scope'):
-            pass
+        # TUN 模式下禁用系统代理开关
+        if hasattr(self, 'switch_global_proxy'):
+            self.switch_global_proxy.setEnabled(not disable_system_proxy)
+            self.switch_global_proxy.setStyleSheet(
+                f"opacity: {'0.5' if disable_system_proxy else '1.0'}"
+            )
+        if hasattr(self, 'global_proxy_mode_group') and self.global_proxy_mode_group:
+            for rb in self.global_proxy_mode_group:
+                rb.setEnabled(not disable_system_proxy)
+                rb.setStyleSheet(f"opacity: {'0.5' if disable_system_proxy else '1.0'}")
 
     def _on_browser_proxy_toggled(self, checked):
         self._save_setting("browser_proxy_enabled", checked)
@@ -5343,10 +5568,125 @@ class MainWindow(QMainWindow):
             log.error(f"注入最终规则失败: {e}")
 
     def _inject_all_rules(self):
-        """注入所有 Yunji 规则：先自定义规则，后代理模式规则，最后最终规则"""
+        """注入所有 Yunji 规则：先自定义规则，后代理模式规则，最后最终规则，最后高级配置"""
         self._inject_custom_rules()
         self._inject_proxy_mode_rules()
         self._inject_final_rule()
+        self._inject_advanced_config()
+
+    def _inject_advanced_config(self):
+        """注入高级配置：TUN模式、DNS、域名嗅探、TLS指纹伪装
+
+        根据用户设置，在下载的远程 config.yaml 基础上覆盖/注入以下配置段：
+        - tun_enabled=True 时注入 tun: 段和 dns: 段（TUN 模式必须配 DNS）
+        - tls_fingerprint 非 none 时注入 global-client-fingerprint
+        - sniffing_enabled 时注入 sniffing: 段
+        """
+        tun_enabled = self.settings.get("tun_enabled", False)
+        tls_fingerprint = self.settings.get("tls_fingerprint", "none")
+        sniffing_enabled = self.settings.get("sniffing_enabled", False)
+
+        # 如果没有任何高级配置需要注入，直接返回
+        if not tun_enabled and tls_fingerprint == "none" and not sniffing_enabled:
+            return
+
+        quick_dir = self.quick_dir
+        if not quick_dir:
+            return
+        config_path = os.path.join(quick_dir, "config.yaml")
+        if not os.path.isfile(config_path):
+            return
+
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # ── 1. 移除远程配置中已有的高级段（避免重复/冲突）──
+            content = self._remove_top_level_section(content, "tun")
+            content = self._remove_top_level_section(content, "dns")
+            content = self._remove_top_level_section(content, "sniffing")
+            content = re.sub(r'^global-client-fingerprint\s*:.*$\n?', '', content, flags=re.MULTILINE)
+
+            # ── 2. 构建高级配置段 ──
+            advanced_blocks = []
+
+            # TUN 模式配置
+            if tun_enabled:
+                tun_stack = self.settings.get("tun_stack", "gvisor")
+                tun_block = (
+                    f"tun:\n"
+                    f"  enable: true\n"
+                    f"  stack: {tun_stack}\n"
+                    f"  dns-hijack:\n"
+                    f"    - any:53\n"
+                    f"  auto-route: true\n"
+                    f"  auto-detect-interface: true\n"
+                )
+                advanced_blocks.append(tun_block)
+
+                # TUN 模式必须配置 DNS（fake-ip 模式，防止 DNS 泄漏和污染）
+                dns_block = (
+                    "dns:\n"
+                    "  enable: true\n"
+                    "  listen: 0.0.0.0:1053\n"
+                    "  enhanced-mode: fake-ip\n"
+                    "  fake-ip-range: 198.18.0.1/16\n"
+                    "  nameserver:\n"
+                    "    - https://dns.alidns.com/dns-query\n"
+                    "    - https://doh.pub/dns-query\n"
+                    "  fallback:\n"
+                    "    - https://1.1.1.1/dns-query\n"
+                    "    - https://dns.google/dns-query\n"
+                    "  fallback-filter:\n"
+                    "    geoip: true\n"
+                    "    geoip-code: CN\n"
+                )
+                advanced_blocks.append(dns_block)
+
+            # 域名嗅探（从 IP 流量中还原域名，让规则更精准）
+            if sniffing_enabled:
+                sniffing_block = (
+                    "sniffing:\n"
+                    "  enable: true\n"
+                    "  sniff:\n"
+                    "    HTTP:\n"
+                    "      ports: [80, 8080-8880]\n"
+                    "      override-destination: true\n"
+                    "    TLS:\n"
+                    "      ports: [443, 8443]\n"
+                    "    QUIC:\n"
+                    "      ports: [443, 8443]\n"
+                    "  force-domain:\n"
+                    "    - '+'\n"
+                    "  skip-domain:\n"
+                    "    - 'Mijia Cloud'\n"
+                    "    - '+.push.apple.com'\n"
+                )
+                advanced_blocks.append(sniffing_block)
+
+            # TLS 指纹伪装（全局，覆盖所有代理节点）
+            if tls_fingerprint != "none":
+                advanced_blocks.append(f"global-client-fingerprint: {tls_fingerprint}\n")
+
+            # ── 3. 在文件开头插入高级配置（确保 tun/dns 在其他段之前）──
+            if advanced_blocks:
+                content = content.lstrip('\n')
+                advanced_text = "\n".join(advanced_blocks)
+                content = advanced_text + "\n" + content
+
+                with open(config_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                log.info(f"已注入高级配置: tun={tun_enabled}, fingerprint={tls_fingerprint}, sniffing={sniffing_enabled}")
+        except Exception as e:
+            log.error(f"注入高级配置失败: {e}")
+
+    def _remove_top_level_section(self, content, section_name):
+        """移除 YAML 中的顶层段（如 tun:/dns:/sniffing:），直到下一个顶层键或文件末尾"""
+        pattern = re.compile(
+            r'^' + re.escape(section_name) + r'\s*:.*\n(?:  [^\n]*\n)*',
+            re.MULTILINE
+        )
+        return pattern.sub('', content)
 
     def _on_auto_line_switch_toggled(self, checked):
         self._save_setting("auto_line_switch", checked)

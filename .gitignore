@@ -70,21 +70,23 @@ venv/
 
 # ========== node_modules（前端依赖） ==========
 **/node_modules/
-dev/web/node_modules/
+web/frontend/node_modules/
 
 # ========== 前端自动生成文件 ==========
-dev/web/components.d.ts
-dev/web/env.d.ts
-dev/web/tsconfig.tsbuildinfo
+web/frontend/components.d.ts
+web/frontend/env.d.ts
+web/frontend/tsconfig.tsbuildinfo
 
 # ========== Android构建产物 ==========
 android/app/build/
-dev/web/android/
-dev/apk/
+web/frontend/android/
 
 # ========== iOS构建产物 ==========
 ios/App/build/
-dev/web/ios/App/build/
+web/frontend/ios/App/build/
+
+# ========== Web 后端（私有，不上传公开仓库） ==========
+web/backend/
 
 # ========== APK文件（通过Releases分发） ==========
 *.apk
