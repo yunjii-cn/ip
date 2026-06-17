@@ -8504,7 +8504,12 @@ def _kill_same_name_processes():
 
     my_pid = _k32.GetCurrentProcessId()
     is_frozen = getattr(sys, 'frozen', False)
-    base_prefix = APP_NAME.lower()
+    # 关键：用 BRAND_NAME（不含版本号）作前缀，因为 EXE 文件名可能是
+    #   云集智能网联代理专家.exe                    （简化名）
+    #   云集智能网联代理专家-v2026.06.17.2025.exe  （带版本号，-v 不是 " v"）
+    #   云集智能网联代理专家 v2026.06.17.2025.exe  （理论上不会出现）
+    # APP_NAME 形如 "云集智能网联代理专家 v2026.06.17.2025" 永远 startswith 不上。
+    base_prefix = BRAND_NAME.lower()
 
     # 1. 收集当前进程的祖先链（防止杀到自己的父进程把自己也带走）
     my_ancestor_pids = set()
