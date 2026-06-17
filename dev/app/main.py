@@ -647,7 +647,13 @@ def _self_deploy(exe_dir):
             shutil.copy2(target_exe, entry_exe)
 
     # 在桌面创建硬链接快捷方式（必须完全静默，不能出现任何窗口）
-    _create_desktop_shortcut(entry_exe)
+    # 用守护线程异步执行，不阻塞新进程的启动，让进度条更快出现
+    import threading
+    threading.Thread(
+        target=_create_desktop_shortcut,
+        args=(entry_exe,),
+        daemon=True,
+    ).start()
 
     # 启动新进程并等待其进度条显示出来，再彻底退出原进程
     subprocess.Popen([entry_exe, f"--cleanup={src_exe}"], **_silent_popen_kwargs)

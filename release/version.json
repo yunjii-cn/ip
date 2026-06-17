@@ -1,6 +1,26 @@
 {
-    "latest": "2026.06.15.2351",
+    "latest": "2026.06.17.0452",
     "versions": [
+        {
+            "version": "2026.06.17.0452",
+            "date": "2026-06-17",
+            "filename": "云集智能网联代理专家-v2026.06.17.0452.exe",
+            "size_mb": 0,
+            "changes": [
+                "新增系统托盘支持：QSystemTrayIcon 入口菜单（显示/隐藏主窗口/退出），关闭按钮默认最小化到托盘",
+                "进程管理架构重构（参照 1.PC v2.0）：进程控制从 launcher.py 迁移到 main.py 入口统一处理",
+                "新增 _ensure_single_instance()：杀同名前缀旧进程 → CreateMutexW 占位，最小化到托盘不释放 mutex",
+                "新增 _kill_same_name_processes()：冻结模式按 EXE 前缀匹配，开发模式按 cmdline 含 main.py 匹配",
+                "跳过当前进程 + 祖先链（防 PowerShell/IDE conhost 包装层被误杀）",
+                "launcher.py 退化为纯 EXE 入口：stdout 抑制 + 品牌校验，BAT 直接运行 python main.py",
+                "新增自部署清理机制：--cleanup 参数删除上一代原始 EXE，轮询重试应对文件句柄延迟释放",
+                "桌面快捷方式创建改为守护线程异步执行，不阻塞新进程启动，进度条更快出现",
+                "修复 PyQt6 QAction 导入位置（QtGui 而非 QtWidgets）",
+                "主窗口默认高度调整为 750px，1080P 屏幕友好",
+                "软件更新页面 scroll_area 与 log_text 改用 setMinimumHeight 允许展开",
+                "代理设置栏目下拉框/输入框背景色统一"
+            ]
+        },
         {
             "version": "2026.06.15.2351",
             "date": "2026-06-15",
