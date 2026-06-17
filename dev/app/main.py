@@ -5538,9 +5538,13 @@ class MainWindow(QMainWindow):
             content = "\n".join(filtered)
             # 判断是否需要注入 MATCH,DIRECT
             global_proxy = self.settings.get("global_proxy", False)
+            is_tun = self.settings.get("tun_enabled", False)
             address_proxy = self.settings.get("address_proxy_enabled", False)
-            # 仅当地址代理开启，且全局系统代理未开启时，注入 MATCH,DIRECT
-            need_direct_match = address_proxy and not global_proxy
+            # 仅当「地址代理开启」+「无全局系统代理」+「无 TUN」时，注入 MATCH,DIRECT
+            #   - 全局/绕过境内：保持原始 MATCH 走代理
+            #   - TUN 模式：TUN 已经接管全部流量，原始 MATCH 走代理才能让非地址规则的流量也走代理
+            #   - 仅地址代理：故意让未匹配规则的流量走 DIRECT（白名单语义）
+            need_direct_match = address_proxy and not global_proxy and not is_tun
             if need_direct_match:
                 # 注释掉原始的 MATCH 规则（非 YUNJI 注入的）
                 content = re.sub(
