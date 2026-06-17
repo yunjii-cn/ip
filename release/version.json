@@ -1,6 +1,32 @@
 {
-    "latest": "2026.06.18.0052",
+    "latest": "2026.06.18.0115",
     "versions": [
+        {
+            "version": "2026.06.18.0115",
+            "date": "2026-06-18",
+            "filename": "云集智能网联代理专家-v2026.06.18.0115.exe",
+            "size_mb": 0,
+            "changes": [
+                "修复 TUN「仅指定（白名单）」模式失效 Bug：sniffing 默认关闭导致 HTTPS 流量被识别为 IP、DOMAIN-SUFFIX 规则全失效",
+                "_inject_advanced_config 增加 TUN 模式强制开启 sniffing 的逻辑（覆盖用户设置）",
+                "TUN 模式时域名嗅探开关自动置为 ON 并灰掉（避免用户误关）",
+                "现在 TUN + 地址代理（DOMAIN-SUFFIX）/程序代理（PROCESS-NAME）规则都能正确匹配",
+                "PROCESS-NAME 规则本身不依赖 sniffing（按进程名匹配），TUN 模式下也可工作"
+            ]
+        },
+        {
+            "version": "2026.06.18.0245",
+            "date": "2026-06-18",
+            "filename": "云集智能网联代理专家-v2026.06.18.0245.exe",
+            "size_mb": 0,
+            "changes": [
+                "修复 TUN「仅指定（白名单）」模式失效 Bug：sniffing 默认关闭导致 HTTPS 流量被识别为 IP、DOMAIN-SUFFIX 规则全失效",
+                "_inject_advanced_config 增加 TUN 模式强制开启 sniffing 的逻辑（覆盖用户设置）",
+                "TUN 模式时域名嗅探开关自动置为 ON 并灰掉（避免用户误关）",
+                "现在 TUN + 地址代理（DOMAIN-SUFFIX）/程序代理（PROCESS-NAME）规则都能正确匹配",
+                "PROCESS-NAME 规则本身不依赖 sniffing（按进程名匹配），TUN 模式下也可工作"
+            ]
+        },
         {
             "version": "2026.06.18.0052",
             "date": "2026-06-18",
