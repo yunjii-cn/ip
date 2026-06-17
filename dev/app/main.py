@@ -1318,6 +1318,7 @@ def load_settings():
         "address_proxy_selected": 0,
         "tun_enabled": False,
         "tun_stack": "gvisor",
+        "tun_proxy_mode": "all",
         "tls_fingerprint": "none",
         "sniffing_enabled": False,
         "current_line": "",
@@ -3601,6 +3602,29 @@ class MainWindow(QMainWindow):
         self.tun_system_rb.toggled.connect(lambda checked: self._on_tun_stack_toggled("system", checked))
         tr.addLayout(tun_stack_inner)
 
+        # TUN 代理范围（3 选 1）：全部代理 / 绕过境内 / 仅指定
+        tun_range_row = QHBoxLayout()
+        tun_range_row.setSpacing(8)
+        tun_range_label = QLabel("代理范围：")
+        tun_range_label.setStyleSheet("font-size: 9pt;")
+        tun_range_row.addWidget(tun_range_label)
+        self.tun_range_group = []
+        default_tun_range = self.settings.get("tun_proxy_mode", "all")
+        self.tun_range_all_rb = RadioButton("全部代理", default=default_tun_range == "all")
+        self.tun_range_group.append(self.tun_range_all_rb)
+        tun_range_row.addWidget(self.tun_range_all_rb)
+        self.tun_range_foreign_rb = RadioButton("绕过境内（仅代理境外）", default=default_tun_range == "foreign")
+        self.tun_range_group.append(self.tun_range_foreign_rb)
+        tun_range_row.addWidget(self.tun_range_foreign_rb)
+        self.tun_range_specified_rb = RadioButton("仅指定（白名单）", default=default_tun_range == "specified")
+        self.tun_range_group.append(self.tun_range_specified_rb)
+        tun_range_row.addWidget(self.tun_range_specified_rb)
+        tun_range_row.addStretch(1)
+        self.tun_range_all_rb.toggled.connect(lambda c: self._on_tun_proxy_mode_toggled("all", c))
+        self.tun_range_foreign_rb.toggled.connect(lambda c: self._on_tun_proxy_mode_toggled("foreign", c))
+        self.tun_range_specified_rb.toggled.connect(lambda c: self._on_tun_proxy_mode_toggled("specified", c))
+        tr.addLayout(tun_range_row)
+
         # 管理员权限提示
         self._is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
         self.tun_admin_hint = QLabel()
@@ -5053,6 +5077,21 @@ class MainWindow(QMainWindow):
             self.tun_restart_hint.setVisible(True)
         log.info(f"TUN 栈: {stack}")
 
+    def _on_tun_proxy_mode_toggled(self, mode, checked):
+        """TUN 代理范围（3 选 1 互斥）：all / foreign / specified"""
+        if not checked:
+            return
+        for rb in self.tun_range_group:
+            if rb is not self.sender():
+                rb._block_signal = True
+                rb.setChecked(False)
+                rb._block_signal = False
+        self._save_setting("tun_proxy_mode", mode)
+        if is_proxy_running():
+            self._inject_all_rules()
+            self.tun_restart_hint.setVisible(True)
+        log.info(f"TUN 代理范围: {mode}")
+
     def _on_tls_fingerprint_changed(self):
         """TLS 指纹伪装选择"""
         fp = self.tls_fingerprint_combo.currentData()
@@ -5186,6 +5225,11 @@ class MainWindow(QMainWindow):
             # TUN 模式下调整标签：「全局系统代理」→「全局」（避免误导）
             if hasattr(self, 'all_mode_rb'):
                 self.all_mode_rb.setText("全局" if is_tun else "全局系统代理")
+        # TUN 代理范围 radio：仅 TUN 开启时可用
+        if hasattr(self, 'tun_range_group') and self.tun_range_group:
+            for rb in self.tun_range_group:
+                rb.setEnabled(is_tun)
+                rb.setStyleSheet(f"opacity: {'1.0' if is_tun else '0.5'}")
 
     def _on_browser_proxy_toggled(self, checked):
         self._save_setting("browser_proxy_enabled", checked)
@@ -5454,9 +5498,14 @@ class MainWindow(QMainWindow):
             log.error(f"注入自定义代理规则失败: {e}")
 
     def _inject_proxy_mode_rules(self):
-        """根据系统代理模式注入 GEOIP 规则
-        - global_proxy_mode == "all"     : 不注入 GEOIP，所有流量走代理
-        - global_proxy_mode == "foreign" : 注入 GEOIP,CN,DIRECT（仅代理境外）
+        """根据当前代理模式注入 GEOIP 规则
+        - 全局系统代理：
+            - global_proxy_mode == "all"     : 不注入 GEOIP，所有流量走代理
+            - global_proxy_mode == "foreign" : 注入 GEOIP,CN,DIRECT（仅代理境外）
+        - TUN 模式：
+            - tun_proxy_mode == "all"        : 不注入 GEOIP，TUN 接管全部流量
+            - tun_proxy_mode == "foreign"    : 注入 GEOIP,CN,DIRECT（仅代理境外）
+            - tun_proxy_mode == "specified"  : 不注入 GEOIP（白名单语义由 _inject_final_rule 注入 MATCH,DIRECT 实现）
         """
         quick_dir = self.quick_dir
         if not quick_dir:
@@ -5481,8 +5530,14 @@ class MainWindow(QMainWindow):
                 if not skip:
                     filtered.append(line)
             content = "\n".join(filtered)
-            # 构建模式规则行
-            mode = self.settings.get("global_proxy_mode", "all")
+            # 根据当前模式选择 mode 设置
+            is_tun = self.settings.get("tun_enabled", False)
+            if is_tun:
+                mode = self.settings.get("tun_proxy_mode", "all")
+                mode_label = "TUN"
+            else:
+                mode = self.settings.get("global_proxy_mode", "all")
+                mode_label = "全局系统代理"
             mode_lines = ["  # YUNJI_PROXY_MODE_START"]
             if mode == "foreign":
                 # 绕过境内：国内IP直连，其他走代理
@@ -5502,16 +5557,18 @@ class MainWindow(QMainWindow):
             with open(config_path, "w", encoding="utf-8") as f:
                 f.write(content)
             if mode == "foreign":
-                log.info("已注入 GEOIP,CN,DIRECT（绕过境内模式）")
+                log.info(f"已注入 GEOIP,CN,DIRECT（{mode_label} · 绕过境内模式）")
             else:
-                log.info("已注入代理模式规则（全局系统代理）")
+                log.info(f"已注入代理模式规则（{mode_label} · {mode}）")
         except Exception as e:
             log.error(f"注入代理模式规则失败: {e}")
 
     def _inject_final_rule(self):
         """根据代理模式注入最终的 MATCH 规则
-        - 仅地址代理开启（无全局系统代理）时：注入 MATCH,DIRECT，注释掉原始 MATCH 规则
-        - 全局系统代理或绕过境内开启时：不注入，恢复原始 MATCH 规则
+        需要注入 MATCH,DIRECT 的场景（白名单语义）：
+        1. 仅地址代理（无全局、无 TUN）
+        2. TUN 模式 + 代理范围 = "specified"（白名单：只代理指定地址/程序）
+        其他场景：保持原始 MATCH 走代理
         """
         quick_dir = self.quick_dir
         if not quick_dir:
@@ -5539,12 +5596,15 @@ class MainWindow(QMainWindow):
             # 判断是否需要注入 MATCH,DIRECT
             global_proxy = self.settings.get("global_proxy", False)
             is_tun = self.settings.get("tun_enabled", False)
+            tun_proxy_mode = self.settings.get("tun_proxy_mode", "all")
             address_proxy = self.settings.get("address_proxy_enabled", False)
-            # 仅当「地址代理开启」+「无全局系统代理」+「无 TUN」时，注入 MATCH,DIRECT
-            #   - 全局/绕过境内：保持原始 MATCH 走代理
-            #   - TUN 模式：TUN 已经接管全部流量，原始 MATCH 走代理才能让非地址规则的流量也走代理
-            #   - 仅地址代理：故意让未匹配规则的流量走 DIRECT（白名单语义）
-            need_direct_match = address_proxy and not global_proxy and not is_tun
+            # 需要注入 MATCH,DIRECT 的两种场景：
+            #   ① 仅地址代理（address_proxy + 无全局 + 无 TUN）→ 白名单
+            #   ② TUN + 代理范围=specified → TUN 模式下白名单
+            need_direct_match = (
+                (address_proxy and not global_proxy and not is_tun)
+                or (is_tun and tun_proxy_mode == "specified")
+            )
             if need_direct_match:
                 # 注释掉原始的 MATCH 规则（非 YUNJI 注入的）
                 content = re.sub(
