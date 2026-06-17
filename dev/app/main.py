@@ -491,6 +491,12 @@ class RadioButton(QWidget):
                 self.toggled.emit(checked)
             self.update()
 
+    def setText(self, text):
+        """动态更新标签文本"""
+        if self._label != text:
+            self._label = text
+            self.update()
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             if self._block_signal:
@@ -5032,12 +5038,15 @@ class MainWindow(QMainWindow):
         log.info(f"TUN 模式: {'开启' if checked else '关闭'}")
 
     def _on_tun_stack_toggled(self, stack, checked):
-        """TUN 栈选择"""
+        """TUN 栈选择（2 选 1 互斥）"""
         if not checked:
             return
+        # 手动取消其他 RadioButton 选中，确保互斥
         for rb in self.tun_stack_group:
-            if rb != self.tun_stack_group[0] or stack != "gvisor":
-                pass
+            if rb is not self.sender():
+                rb._block_signal = True
+                rb.setChecked(False)
+                rb._block_signal = False
         self._save_setting("tun_stack", stack)
         if is_proxy_running():
             self._inject_all_rules()
@@ -5163,16 +5172,20 @@ class MainWindow(QMainWindow):
             self._rule_list_widget.setEnabled(not disable_all_others)
         if hasattr(self, 'rules_restart_hint') and disable_all_others:
             self.rules_restart_hint.setVisible(False)
-        # TUN 模式下禁用系统代理开关
+        # TUN 模式下禁用系统代理开关本身（避免冲突），但代理模式（全/绕过境内）仍可选
         if hasattr(self, 'switch_global_proxy'):
             self.switch_global_proxy.setEnabled(not disable_system_proxy)
             self.switch_global_proxy.setStyleSheet(
                 f"opacity: {'0.5' if disable_system_proxy else '1.0'}"
             )
+        # 代理模式（all/foreign）始终可用：TUN 模式下「foreign」仍可注入 GEOIP 规则
         if hasattr(self, 'global_proxy_mode_group') and self.global_proxy_mode_group:
             for rb in self.global_proxy_mode_group:
-                rb.setEnabled(not disable_system_proxy)
-                rb.setStyleSheet(f"opacity: {'0.5' if disable_system_proxy else '1.0'}")
+                rb.setEnabled(True)
+                rb.setStyleSheet("opacity: 1.0")
+            # TUN 模式下调整标签：「全局系统代理」→「全局」（避免误导）
+            if hasattr(self, 'all_mode_rb'):
+                self.all_mode_rb.setText("全局" if is_tun else "全局系统代理")
 
     def _on_browser_proxy_toggled(self, checked):
         self._save_setting("browser_proxy_enabled", checked)
