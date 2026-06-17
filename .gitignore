@@ -97,7 +97,15 @@ mihomo-build/
 
 # ========== 运行时应用目录 ==========
 app/
+!dev/app/main.py
+!dev/app/versions.json
+!dev/app/version_info.txt
+!dev/app/launcher_settings.json
 
 # ========== 本地脚本 ==========
 dev/运行Web.bat
 dev/运行PC.bat
+
+# Build/Publish temp scripts (local only)
+dev/build_now.py
+dev/publish_now.py

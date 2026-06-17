@@ -1043,13 +1043,14 @@ def download_all_configs():
 def save_config(quick_dir, config_data):
     config_path = os.path.join(quick_dir, "config.yaml")
     backup_path = os.path.join(quick_dir, "config.yaml_backup")
-    # 先读取已有的 YUNJI 注入规则
+    # 先读取已有的 YUNJI 注入规则和高级配置段
     yunji_blocks = []
+    advanced_text = ""  # 高级配置（tun / dns / sniffing / global-client-fingerprint）
     if os.path.isfile(config_path):
         if os.path.isfile(backup_path):
             os.remove(backup_path)
         shutil.copy2(config_path, backup_path)
-        # 提取所有 YUNJI 标记块
+        # 提取所有 YUNJI 标记块 和 高级配置段
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 old_content = f.read()
@@ -1072,13 +1073,28 @@ def save_config(quick_dir, config_data):
                         break
                 if block:
                     yunji_blocks.append((start_m, "\n".join(block)))
+            # 提取顶层高级配置段（tun / dns / sniffing）
+            # 关键：切线/换线后必须保留 TUN 段，否则 mihomo 不会接管流量，DOMAIN 规则失效
+            for section in ["tun", "dns", "sniffing"]:
+                # 匹配顶层 section 标题 + 任意缩进（2/4/6 空格）的子项
+                pattern = re.compile(
+                    r'^' + re.escape(section) + r'\s*:\s*\n((?:[ \t]+[^\n]*\n)*)',
+                    re.MULTILINE
+                )
+                m = pattern.search(old_content)
+                if m:
+                    advanced_text += m.group(0) + ("\n" if not m.group(0).endswith("\n") else "")
+            # global-client-fingerprint（单行）
+            fp_match = re.search(r'^global-client-fingerprint\s*:.*\n', old_content, re.MULTILINE)
+            if fp_match:
+                advanced_text += fp_match.group(0)
         except Exception:
             pass
     # 写入新配置
     with open(config_path, 'wb') as f:
         f.write(config_data)
-    # 恢复 YUNJI 注入规则
-    if yunji_blocks:
+    # 恢复 YUNJI 注入规则 + 高级配置
+    if yunji_blocks or advanced_text:
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -1095,11 +1111,21 @@ def save_config(quick_dir, config_data):
                 content = rules_pattern.sub(
                     r'\1\n' + "\n".join(all_blocks), content
                 )
+                # 高级配置放在文件顶部
+                if advanced_text:
+                    content = advanced_text + "\n" + content
                 with open(config_path, "w", encoding="utf-8") as f:
                     f.write(content)
-                log.info(f"已保留 {len(yunji_blocks)} 个 YUNJI 规则块")
+                log.info(f"已保留 {len(yunji_blocks)} 个 YUNJI 规则块 + 高级配置")
+            else:
+                # 没有 rules: 段（罕见情况），仍把高级配置写到顶部
+                if advanced_text:
+                    content = advanced_text + "\n" + content
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    log.info(f"已保留 {len(yunji_blocks)} 个 YUNJI 规则块 + 高级配置（无 rules 段）")
         except Exception as e:
-            log.warning(f"恢复 YUNJI 规则块失败: {e}")
+            log.warning(f"恢复 YUNJI 规则块和高级配置失败: {e}")
     log.info(f"配置已保存到 {config_path}")
 
 
@@ -5773,9 +5799,13 @@ class MainWindow(QMainWindow):
             log.error(f"注入高级配置失败: {e}")
 
     def _remove_top_level_section(self, content, section_name):
-        """移除 YAML 中的顶层段（如 tun:/dns:/sniffing:），直到下一个顶层键或文件末尾"""
+        """移除 YAML 中的顶层段（如 tun:/dns:/sniffing:），直到下一个顶层键或文件末尾
+
+        支持任意缩进级别（2/4/6 空格）的子项，避免漏掉嵌套列表
+        （如 tun.dns-hijack 下的 `- any:53`）。
+        """
         pattern = re.compile(
-            r'^' + re.escape(section_name) + r'\s*:.*\n(?:  [^\n]*\n)*',
+            r'^' + re.escape(section_name) + r'\s*:.*\n(?:[ \t]+[^\n]*\n)*',
             re.MULTILINE
         )
         return pattern.sub('', content)
