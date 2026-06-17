@@ -5050,6 +5050,17 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "权限不足", "TUN 模式需要管理员权限运行。\n请以管理员身份重新启动本程序。")
             return
         self._save_setting("tun_enabled", checked)
+        # TUN 开启时强制开启 sniffing（确保 DOMAIN 规则能匹配 HTTPS 流量）
+        # 用户可手动关闭 sniffing，但 _inject_advanced_config 会在 TUN 模式下强制覆盖
+        if hasattr(self, 'switch_sniffing'):
+            self.switch_sniffing.blockSignals(True)
+            self.switch_sniffing.setChecked(True)
+            self.switch_sniffing.blockSignals(False)
+            self.switch_sniffing.setEnabled(not checked)
+            if checked:
+                self.switch_sniffing.setStyleSheet("opacity: 0.6;")
+            else:
+                self.switch_sniffing.setStyleSheet("opacity: 1.0;")
         self.tun_admin_hint.setVisible(checked)
         if is_proxy_running():
             self._inject_all_rules()
@@ -5662,6 +5673,10 @@ class MainWindow(QMainWindow):
         tun_enabled = self.settings.get("tun_enabled", False)
         tls_fingerprint = self.settings.get("tls_fingerprint", "none")
         sniffing_enabled = self.settings.get("sniffing_enabled", False)
+        # 关键：TUN 模式必须开启 sniffing，否则 HTTPS 加密流量无法还原域名，
+        # 所有 DOMAIN/DOMAIN-SUFFIX 规则都会失效，「仅指定」白名单模式直接变全 DIRECT
+        if tun_enabled:
+            sniffing_enabled = True
 
         # 如果没有任何高级配置需要注入，直接返回
         if not tun_enabled and tls_fingerprint == "none" and not sniffing_enabled:
