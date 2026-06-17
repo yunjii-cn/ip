@@ -1,6 +1,28 @@
 {
-    "latest": "2026.06.17.2025",
+    "latest": "2026.06.17.2121",
     "versions": [
+        {
+            "version": "2026.06.17.2121",
+            "date": "2026-06-17",
+            "filename": "云集智能网联代理专家-v2026.06.17.2121.exe",
+            "size_mb": 0,
+            "changes": [
+                "修复 _kill_same_name_processes 永远杀不到同名 EXE 的 Bug：前缀用了 APP_NAME（含版本号），而 EXE 文件名格式是 云集智能网联代理专家-v2026.x.x.x.exe，startswith 永远不匹配",
+                "前缀改为 BRAND_NAME（不含版本号），兼容简化名/带版本号名/旧版本残留进程",
+                "现在打开第二个 EXE 会真正杀掉第一个并接管，不再依赖 mutex 闪退"
+            ]
+        },
+        {
+            "version": "2026.06.17.2110",
+            "date": "2026-06-17",
+            "filename": "云集智能网联代理专家-v2026.06.17.2110.exe",
+            "size_mb": 0,
+            "changes": [
+                "修复 _kill_same_name_processes 永远杀不到同名 EXE 的 Bug：前缀用了 APP_NAME（含版本号），而 EXE 文件名格式是 云集智能网联代理专家-v2026.x.x.x.exe，startswith 永远不匹配",
+                "前缀改为 BRAND_NAME（不含版本号），兼容简化名/带版本号名/旧版本残留进程",
+                "现在打开第二个 EXE 会真正杀掉第一个并接管，不再依赖 mutex 闪退"
+            ]
+        },
         {
             "version": "2026.06.17.2025",
             "date": "2026-06-17",
