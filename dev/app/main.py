@@ -21,9 +21,9 @@ import queue
 import tempfile
 import zipfile
 import base64
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from dataclasses import dataclass, asdict, field
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Any
 
 import yaml
 HAS_YAML = True
@@ -683,6 +683,183 @@ def filter_proxies_by_country(config_text: str, countries: List[str]) -> str:
     except Exception as e:
         log.error(f"序列化筛选后 config 失败: {e}")
         return config_text
+
+
+# =====================================================================
+# Batch 3: 节点健康度统计 (HealthDB)
+# =====================================================================
+HEALTH_DB_FILE = os.path.join(USER_DATA_DIR, "health.json")
+HEALTH_KEEP_DAYS = 30  # 最多保留 30 天
+
+
+@dataclass
+class HealthRecord:
+    """单次线路检测的健康度记录"""
+    ts: str           # ISO 时间戳 (e.g. "2026-06-18T21:00:00")
+    success: bool     # 至少一个 URL 测试通过
+    avg: float        # 平均延迟（秒），失败时为 -1
+    best: float       # 最佳延迟（秒），失败时为 -1
+    count: int        # 通过的测试 URL 数
+    total: int        # 总测试 URL 数
+
+
+class HealthDB:
+    """线路健康度数据库，存 dev/app/user_data/health.json
+
+    数据格式:
+    {
+        "线路1": [HealthRecord, ...],   # 按时间倒序
+        "线路2": [...],
+        ...
+    }
+    """
+
+    def __init__(self, db_path: str = HEALTH_DB_FILE):
+        self.db_path = db_path
+        self._data: Dict[str, List[Dict]] = {}
+        self._load()
+
+    def _load(self):
+        try:
+            if os.path.isfile(self.db_path):
+                with open(self.db_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict):
+                    self._data = raw
+        except Exception as e:
+            log.warning(f"加载健康度数据失败（已重置）: {e}")
+            self._data = {}
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+            with open(self.db_path, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.warning(f"保存健康度数据失败: {e}")
+
+    def append(self, line_name: str, record: HealthRecord):
+        """追加一条记录 + 自动 trim 30 天前数据"""
+        if not line_name:
+            return
+        records = self._data.get(line_name, [])
+        if not isinstance(records, list):
+            records = []
+        records.append({
+            "ts": record.ts,
+            "success": record.success,
+            "avg": record.avg,
+            "best": record.best,
+            "count": record.count,
+            "total": record.total,
+        })
+        # 按时间倒序
+        records.sort(key=lambda r: r.get("ts", ""), reverse=True)
+        # trim 30 天前
+        cutoff = datetime.now() - timedelta(days=HEALTH_KEEP_DAYS)
+        cutoff_iso = cutoff.isoformat(timespec="seconds")
+        records = [r for r in records if r.get("ts", "") >= cutoff_iso]
+        self._data[line_name] = records
+        self._save()
+
+    def get_records(self, line_name: str) -> List[Dict]:
+        return list(self._data.get(line_name, []))
+
+    def get_7d_success_rate(self, line_name: str) -> Optional[float]:
+        """获取近 7 天成功率（0.0 ~ 1.0），无数据时返回 None"""
+        records = self._data.get(line_name, [])
+        if not records:
+            return None
+        cutoff = (datetime.now() - timedelta(days=7)).isoformat(timespec="seconds")
+        recent = [r for r in records if r.get("ts", "") >= cutoff]
+        if not recent:
+            return None
+        succ = sum(1 for r in recent if r.get("success"))
+        return succ / len(recent)
+
+    def get_7d_avg_latency(self, line_name: str) -> Optional[float]:
+        """获取近 7 天平均延迟（仅成功样本），无数据时返回 None"""
+        records = self._data.get(line_name, [])
+        cutoff = (datetime.now() - timedelta(days=7)).isoformat(timespec="seconds")
+        recent = [r for r in records if r.get("ts", "") >= cutoff and r.get("success") and r.get("avg", -1) > 0]
+        if not recent:
+            return None
+        return sum(r["avg"] for r in recent) / len(recent)
+
+    def get_30d_history(self, line_name: str) -> List[Dict]:
+        """获取近 30 天历史记录（按时间正序）"""
+        records = self._data.get(line_name, [])
+        return sorted(records, key=lambda r: r.get("ts", ""))
+
+    def get_all_line_names(self) -> List[str]:
+        return list(self._data.keys())
+
+    def get_health_summary(self) -> Dict[str, Dict[str, Any]]:
+        """汇总所有线路的 7 天健康度，供 UI 一次性读取
+
+        返回: {line_name: {"rate": 0.85, "avg_latency": 0.42, "samples": 12, "last_ts": "..."}}
+        """
+        cutoff = (datetime.now() - timedelta(days=7)).isoformat(timespec="seconds")
+        summary = {}
+        for name, records in self._data.items():
+            if not isinstance(records, list) or not records:
+                continue
+            recent = [r for r in records if r.get("ts", "") >= cutoff]
+            if not recent:
+                continue
+            succ = [r for r in recent if r.get("success")]
+            rate = len(succ) / len(recent)
+            avg_lat = sum(r["avg"] for r in succ if r.get("avg", -1) > 0) / len(succ) if succ else None
+            summary[name] = {
+                "rate": rate,
+                "avg_latency": avg_lat,
+                "samples": len(recent),
+                "last_ts": max(r.get("ts", "") for r in recent),
+            }
+        return summary
+
+
+def get_health_db() -> HealthDB:
+    """全局单例 HealthDB"""
+    global _health_db
+    try:
+        return _health_db
+    except NameError:
+        _health_db = HealthDB()
+        return _health_db
+
+
+def format_health_bar(rate: float, width: int = 8) -> str:
+    """渲染健康度条形图（▁▂▃▄▅▆▇█ 8 档）
+
+    rate: 0.0 ~ 1.0
+    返回: 8 字符的 Unicode 条形图 + 百分数
+    """
+    if rate is None:
+        return "▱▱▱▱▱▱▱▱ -"
+    blocks = "▁▂▃▄▅▆▇█"
+    # rate → 0-7 档
+    level = max(0, min(7, int(rate * 8) - (1 if rate > 0 else 0)))
+    if rate >= 0.99:
+        level = 7
+    filled = blocks[level]
+    bar = filled * width
+    return f"{bar} {int(rate * 100)}%"
+
+
+def get_health_label(rate: Optional[float]) -> Tuple[str, str]:
+    """根据健康度返回 (文字, 颜色)
+
+    颜色: #4EBA65(绿) / #FF9800(橙) / #FF6B80(红) / #888(灰)
+    """
+    if rate is None:
+        return "无数据", "#888"
+    if rate >= 0.8:
+        return f"健康 {int(rate * 100)}%", COLOR_GREEN
+    if rate >= 0.5:
+        return f"一般 {int(rate * 100)}%", COLOR_ORANGE
+    return f"差 {int(rate * 100)}%", "#FF6B80"
+
 
 COLOR_RED = "#C62828"
 COLOR_RED_LIGHT = "#EF5350"
@@ -2660,6 +2837,15 @@ class ServiceWorker(QThread):
                 log.warning(f"{name} 代理未就绪，跳过延迟测试")
                 results.append((name, -1.0, -1.0, 0, data))
                 self.line_tested.emit(name, -1.0, False)
+                # Batch 3: 代理未就绪也算失败
+                try:
+                    get_health_db().append(name, HealthRecord(
+                        ts=datetime.now().isoformat(timespec="seconds"),
+                        success=False, avg=-1.0, best=-1.0,
+                        count=0, total=len(NODE_TEST_URLS),
+                    ))
+                except Exception as e:
+                    log.warning(f"写健康度记录失败 {name}: {e}")
                 continue
 
             latencies = []
@@ -2687,9 +2873,27 @@ class ServiceWorker(QThread):
                 best = min(latencies)
                 results.append((name, avg, best, len(latencies), data))
                 self.line_tested.emit(name, avg, True)
+                # Batch 3: 写健康度记录
+                try:
+                    get_health_db().append(name, HealthRecord(
+                        ts=datetime.now().isoformat(timespec="seconds"),
+                        success=True, avg=avg, best=best,
+                        count=len(latencies), total=len(NODE_TEST_URLS),
+                    ))
+                except Exception as e:
+                    log.warning(f"写健康度记录失败 {name}: {e}")
             else:
                 results.append((name, -1.0, -1.0, 0, data))
                 self.line_tested.emit(name, -1.0, False)
+                # Batch 3: 失败也记录
+                try:
+                    get_health_db().append(name, HealthRecord(
+                        ts=datetime.now().isoformat(timespec="seconds"),
+                        success=False, avg=-1.0, best=-1.0,
+                        count=0, total=len(NODE_TEST_URLS),
+                    ))
+                except Exception as e:
+                    log.warning(f"写健康度记录失败 {name}: {e}")
 
         proxy_enabled = self.kwargs.get("proxy_enabled", False)
         current_line = self.kwargs.get("current_line", "")
@@ -2734,7 +2938,11 @@ class ServiceWorker(QThread):
             with open(config_path, 'rb') as f:
                 original_config = f.read()
 
-        fastest_name, fastest_data, fastest_time = None, None, float('inf')
+        # Batch 3: 改为先测全部 → 用 (历史健康度 + 当前延迟) 联合打分
+        # 旧逻辑：单次最快直接选。问题：一次延迟 0.5s 的线路可能 7 天成功率 30%
+        # 新逻辑：综合 7d 成功率 (60%) + 当前延迟 (40%)
+        test_results = []  # [(name, elapsed, data, success)]
+        health_db = get_health_db()
         for name, data in downloaded:
             self.progress.emit(f"正在测试 {name}...")
             save_config(quick_dir, data)
@@ -2746,6 +2954,15 @@ class ServiceWorker(QThread):
             start_quick(quick_dir)
             if not wait_for_proxy(timeout=8):
                 log.warning(f"{name} 代理未就绪，跳过自动选择")
+                # 记录失败
+                try:
+                    health_db.append(name, HealthRecord(
+                        ts=datetime.now().isoformat(timespec="seconds"),
+                        success=False, avg=-1.0, best=-1.0,
+                        count=0, total=1,
+                    ))
+                except Exception:
+                    pass
                 continue
 
             try:
@@ -2758,15 +2975,60 @@ class ServiceWorker(QThread):
                 start = time.time()
                 resp = opener.open(req, timeout=NODE_TEST_TIMEOUT)
                 elapsed = time.time() - start
-                if resp.status in (200, 204) and elapsed < fastest_time:
-                    fastest_time = elapsed
-                    fastest_name = name
-                    fastest_data = data
+                if resp.status in (200, 204):
+                    test_results.append((name, elapsed, data, True))
                     log.info(f"{name} 自动选择测试成功, 延迟 {elapsed:.2f}s")
-                elif resp.status not in (200, 204):
+                    # 写健康度
+                    try:
+                        health_db.append(name, HealthRecord(
+                            ts=datetime.now().isoformat(timespec="seconds"),
+                            success=True, avg=elapsed, best=elapsed,
+                            count=1, total=1,
+                        ))
+                    except Exception:
+                        pass
+                else:
                     log.warning(f"{name} 自动选择测试返回非 200/204: {resp.status}")
+                    try:
+                        health_db.append(name, HealthRecord(
+                            ts=datetime.now().isoformat(timespec="seconds"),
+                            success=False, avg=-1.0, best=-1.0,
+                            count=0, total=1,
+                        ))
+                    except Exception:
+                        pass
             except Exception as e:
                 log.warning(f"{name} 自动选择测试失败: {type(e).__name__}: {e}")
+                try:
+                    health_db.append(name, HealthRecord(
+                        ts=datetime.now().isoformat(timespec="seconds"),
+                        success=False, avg=-1.0, best=-1.0,
+                        count=0, total=1,
+                    ))
+                except Exception:
+                    pass
+
+        # 联合打分：score = 0.6 * 7d_success_rate + 0.4 * (1 - normalized_latency)
+        # 无 7d 数据时降级为 score = 1.0 - normalized_latency
+        fastest_name, fastest_data = None, None
+        if test_results:
+            max_lat = max(r[1] for r in test_results) or 1.0
+            min_lat = min(r[1] for r in test_results)
+            best_score = -1.0
+            for name, elapsed, data, _ in test_results:
+                rate = health_db.get_7d_success_rate(name)
+                if rate is None:
+                    # 无历史数据：仅用当前延迟 (但加权稍低)
+                    score = 0.4 * (1 - (elapsed - min_lat) / max(max_lat - min_lat, 0.01))
+                else:
+                    lat_score = 1 - (elapsed - min_lat) / max(max_lat - min_lat, 0.01)
+                    score = 0.6 * rate + 0.4 * lat_score
+                log.info(f"自动选线评分: {name} rate={rate} elapsed={elapsed:.2f}s score={score:.3f}")
+                if score > best_score:
+                    best_score = score
+                    fastest_name = name
+                    fastest_data = data
+            log.info(f"自动选线: 选择 {fastest_name} (综合得分 {best_score:.3f})")
 
         proxy_enabled = self.kwargs.get("proxy_enabled", False)
         if proxy_enabled:
@@ -3814,6 +4076,13 @@ class MainWindow(QMainWindow):
         name_lbl.setFixedWidth(90 if is_custom else 50)
         name_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
         rh.addWidget(name_lbl)
+        # Batch 3: 健康度徽章
+        health_badge = QLabel("无数据")
+        health_badge.setObjectName("health-badge")
+        health_badge.setStyleSheet("color: #888; font-size: 7pt; padding: 0 4px;")
+        health_badge.setFixedWidth(150)
+        health_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        rh.addWidget(health_badge)
         # 状态
         status_lbl = QLabel("未检测")
         status_lbl.setObjectName("dim")
@@ -3832,7 +4101,7 @@ class MainWindow(QMainWindow):
         # 存储
         self.line_rows[name] = {
             "status": status_lbl, "use_btn": use_btn, "data": None, "row": row,
-            "is_custom": is_custom,
+            "is_custom": is_custom, "health_badge": health_badge,
         }
         return row
 
@@ -3860,6 +4129,8 @@ class MainWindow(QMainWindow):
             log.warning(f"重建线路行失败: {e}")
         # 拉伸项
         self._line_rows_layout.addStretch(1)
+        # Batch 3: 刷新健康度徽章
+        self._refresh_line_health_badges()
 
     def _build_country_filter_card(self):
         """国家筛选子卡片：选择需要代理的 IP 区域/国家，保存 config 时自动过滤节点
@@ -4222,6 +4493,19 @@ class MainWindow(QMainWindow):
         # 后续 _update_status() 访问 self.svc_line_label 时抛 RuntimeError。
         outer.addWidget(info_bar, stretch=1)
 
+        # Batch 3: 健康度详情按钮
+        self.btn_health_detail = QPushButton("📊 健康度")
+        self.btn_health_detail.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_health_detail.setFixedSize(80, 26)
+        self.btn_health_detail.setStyleSheet(
+            f"QPushButton {{ background-color: #2a2a2a; color: {COLOR_TEXT}; "
+            f"font-size: 8pt; border-radius: 4px; border: 1px solid {COLOR_BORDER}; }}"
+            f"QPushButton:hover {{ background-color: #3a3a3a; border-color: {COLOR_GREEN}; }}"
+        )
+        self.btn_health_detail.setToolTip("查看所有线路近 30 天健康度历史")
+        self.btn_health_detail.clicked.connect(self._on_open_health_detail)
+        outer.addWidget(self.btn_health_detail, alignment=Qt.AlignmentFlag.AlignVCenter)
+
         # 检测按钮
         self.btn_test = QPushButton("🔍 检测线路")
         self.btn_test.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -4235,6 +4519,39 @@ class MainWindow(QMainWindow):
         self.btn_test.clicked.connect(self._on_test_btn_clicked)
         outer.addWidget(self.btn_test, alignment=Qt.AlignmentFlag.AlignVCenter)
         return card
+
+    def _on_open_health_detail(self):
+        """打开健康度详情对话框（30 天历史）"""
+        dlg = HealthDetailDialog(self)
+        dlg.exec()
+
+    def _refresh_line_health_badges(self):
+        """刷新所有线路行的健康度徽章（启动/打开软件时调用一次）"""
+        try:
+            summary = get_health_db().get_health_summary()
+        except Exception:
+            summary = {}
+        for name, info in self.line_rows.items():
+            badge = info.get("health_badge")
+            if badge is None:
+                continue
+            data = summary.get(name)
+            if data is None:
+                badge.setText("无数据")
+                badge.setStyleSheet("color: #888; font-size: 7pt; padding: 0 4px;")
+                badge.setToolTip("还没有检测记录")
+            else:
+                rate = data.get("rate", 0)
+                avg = data.get("avg_latency")
+                samples = data.get("samples", 0)
+                txt, color = get_health_label(rate)
+                bar = format_health_bar(rate, width=6).split(" ")[0]  # 仅条形图部分
+                badge.setText(f"{bar} {txt}")
+                badge.setStyleSheet(f"color: {color}; font-size: 7pt; padding: 0 4px; font-weight: bold;")
+                tip = f"近 7 天 {samples} 次检测，{int(rate*100)}% 成功"
+                if avg is not None:
+                    tip += f"，平均延迟 {avg:.2f}s"
+                badge.setToolTip(tip)
 
     def _build_smart_line_card(self):
         """智能线路子卡片：分组小标题 + 3 个开关行（断线自动切换 / 定时切换最快线路 / 检测线路前更新配置）"""
@@ -6998,6 +7315,8 @@ class MainWindow(QMainWindow):
             info["status"].setText("超时")
             info["status"].setStyleSheet(f"color: #FF6B80; font-size: 9pt;")
             info["use_btn"].setEnabled(False)
+        # Batch 3: 实时刷新健康度徽章
+        self._refresh_line_health_badges()
 
     def _on_test_finished(self, ok, msg):
         self.btn_test.setEnabled(True)
@@ -7033,6 +7352,9 @@ class MainWindow(QMainWindow):
                     info["status"].setText("超时")
                     info["status"].setStyleSheet(f"color: #FF6B80; font-size: 9pt;")
                     info["use_btn"].setEnabled(False)
+
+            # Batch 3: 刷新健康度徽章（刚写入了新记录）
+            self._refresh_line_health_badges()
 
             valid = [r for r in results if r[1] >= 0]
             if valid:
@@ -9538,6 +9860,216 @@ class MainWindow(QMainWindow):
         except Exception:
             self.raise_()
             self.activateWindow()
+
+
+class HealthDetailDialog(QDialog):
+    """线路健康度详情对话框
+
+    - 顶部：所有线路 7d 健康度汇总表（按成功率排序）
+    - 选中线路后：下方显示该线路 30 天历史（每日一行：成功率 + 平均延迟）
+    - 底部：清空所有健康度数据按钮
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("线路健康度详情")
+        self.setMinimumSize(820, 580)
+        self.resize(900, 660)
+        self.setStyleSheet(
+            f"QDialog {{ background-color: {COLOR_BG}; color: {COLOR_TEXT}; }}"
+            f"QLabel {{ color: {COLOR_TEXT}; }}"
+        )
+        self._selected_line: Optional[str] = None
+        self._build_ui()
+        self._load_summary()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        # 顶部说明
+        tip = QLabel("近 7 天所有线路的成功率与平均延迟。点选线路可查看 30 天历史。")
+        tip.setStyleSheet("color: #aaa; font-size: 8pt;")
+        tip.setWordWrap(True)
+        root.addWidget(tip)
+
+        # 上半：7d 汇总表
+        header = QHBoxLayout()
+        h = QLabel("📊 7 天健康度")
+        h.setStyleSheet(f"font-size: 9pt; font-weight: bold; color: {COLOR_GREEN};")
+        header.addWidget(h)
+        header.addStretch()
+        clear_btn = QPushButton("🗑 清空所有记录")
+        clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear_btn.setFixedHeight(24)
+        clear_btn.setStyleSheet(
+            f"QPushButton {{ background-color: #2a1a1a; color: #FF6B80; "
+            f"font-size: 8pt; border-radius: 3px; border: 1px solid #5a2a2a; padding: 0 10px; }}"
+            f"QPushButton:hover {{ background-color: #5a2020; }}"
+        )
+        clear_btn.clicked.connect(self._on_clear_all)
+        header.addWidget(clear_btn)
+        root.addLayout(header)
+
+        self.summary_list = QListWidget()
+        self.summary_list.setStyleSheet(
+            f"QListWidget {{ background-color: {COLOR_CARD}; color: {COLOR_TEXT}; "
+            f"border: 1px solid {COLOR_BORDER}; border-radius: 4px; font-size: 9pt; }}"
+            f"QListWidget::item {{ padding: 6px 10px; border-bottom: 1px solid #222; }}"
+            f"QListWidget::item:selected {{ background-color: #1a3a5a; color: #fff; }}"
+            f"QListWidget::item:hover {{ background-color: #1a2a3a; }}"
+        )
+        self.summary_list.currentItemChanged.connect(self._on_line_selected)
+        root.addWidget(self.summary_list, stretch=1)
+
+        # 下半：30d 历史
+        h2 = QLabel("📅 30 天历史")
+        h2.setStyleSheet(f"font-size: 9pt; font-weight: bold; color: {COLOR_BLUE_LIGHT};")
+        root.addWidget(h2)
+        self.history_list = QListWidget()
+        self.history_list.setStyleSheet(
+            f"QListWidget {{ background-color: {COLOR_CARD}; color: {COLOR_TEXT}; "
+            f"border: 1px solid {COLOR_BORDER}; border-radius: 4px; font-family: Consolas; font-size: 8pt; }}"
+            f"QListWidget::item {{ padding: 4px 10px; }}"
+        )
+        self.history_list.setMaximumHeight(200)
+        root.addWidget(self.history_list)
+
+        # 底部按钮
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        close_btn = QPushButton("关闭")
+        close_btn.setFixedHeight(28)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; font-size: 9pt; "
+            f"font-weight: bold; border-radius: 4px; border: none; padding: 0 24px; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
+        )
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        root.addLayout(btn_row)
+
+    def _load_summary(self):
+        """加载 7d 汇总"""
+        self.summary_list.clear()
+        self.history_list.clear()
+        db = get_health_db()
+        summary = db.get_health_summary()
+        # 合并 7d 数据 + 内置/订阅名单（即使没数据也显示）
+        all_names = set()
+        for name, _, _ in CONFIG_URLS:
+            all_names.add(name)
+        try:
+            for sub in get_subscription_manager().get_all():
+                all_names.add(sub.name)
+        except Exception:
+            pass
+        all_names.update(summary.keys())
+
+        if not all_names:
+            empty = QListWidgetItem("（暂无任何线路，检测一次线路即可开始记录健康度）")
+            empty.setForeground(QColor("#888"))
+            self.summary_list.addItem(empty)
+            return
+
+        # 按 7d 成功率排序（无数据排后面）
+        def sort_key(name):
+            data = summary.get(name)
+            if data is None:
+                return (1, 0, name)
+            return (0, -data["rate"], name)
+        sorted_names = sorted(all_names, key=sort_key)
+        for name in sorted_names:
+            data = summary.get(name)
+            if data is None:
+                txt = f"  {name:30s}  ⬜ 尚无记录"
+                color = "#888"
+            else:
+                rate = data["rate"]
+                avg = data.get("avg_latency")
+                samples = data["samples"]
+                bar = format_health_bar(rate, width=6).split(" ")[0]
+                avg_txt = f"延迟 {avg:.2f}s" if avg is not None else "无延迟数据"
+                txt = f"  {name:24s}  {bar}  {int(rate*100):3d}%  ({samples}次)  {avg_txt}"
+                color = get_health_label(rate)[1]
+            item = QListWidgetItem(txt)
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            item.setForeground(QColor(color))
+            self.summary_list.addItem(item)
+        # 默认选中第一行
+        if self.summary_list.count() > 0:
+            self.summary_list.setCurrentRow(0)
+
+    def _on_line_selected(self, current, previous):
+        if current is None:
+            self.history_list.clear()
+            return
+        name = current.data(Qt.ItemDataRole.UserRole)
+        if not name:
+            return
+        self._selected_line = name
+        self._load_history(name)
+
+    def _load_history(self, name: str):
+        self.history_list.clear()
+        records = get_health_db().get_30d_history(name)
+        if not records:
+            empty = QListWidgetItem(f"（{name} 暂无历史记录）")
+            empty.setForeground(QColor("#888"))
+            self.history_list.addItem(empty)
+            return
+        # 按日期聚合（多条同日的取最后一条）
+        by_day: Dict[str, Dict] = {}
+        for r in records:
+            day = r.get("ts", "")[:10]
+            if not day:
+                continue
+            # 后写入的覆盖先写入的（已经按时间正序）
+            by_day[day] = r
+        if not by_day:
+            return
+        # 按日期倒序显示
+        for day in sorted(by_day.keys(), reverse=True):
+            r = by_day[day]
+            if r.get("success"):
+                avg = r.get("avg", -1)
+                avg_txt = f"{avg:.2f}s" if avg > 0 else "n/a"
+                line = f"  {day}  ✅ 成功  延迟 {avg_txt}  ({r.get('count',0)}/{r.get('total',0)} URL)"
+                color = COLOR_GREEN
+            else:
+                line = f"  {day}  ❌ 失败  (0/{r.get('total',0)} URL)"
+                color = "#FF6B80"
+            item = QListWidgetItem(line)
+            item.setForeground(QColor(color))
+            self.history_list.addItem(item)
+
+    def _on_clear_all(self):
+        ret = QMessageBox.question(
+            self, "确认清空",
+            "确定要清空所有线路的健康度数据吗？\n此操作不可撤销。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            db = get_health_db()
+            for name in list(db.get_all_line_names()):
+                db._data[name] = []
+            db._save()
+        except Exception as e:
+            QMessageBox.critical(self, "失败", f"清空失败: {e}")
+            return
+        self._load_summary()
+        # 通知主窗口刷新
+        try:
+            if self.parent() and hasattr(self.parent(), "_refresh_line_health_badges"):
+                self.parent()._refresh_line_health_badges()
+        except Exception:
+            pass
+        QMessageBox.information(self, "已清空", "已清空所有健康度数据。")
 
 
 class CountryFilterDialog(QDialog):
