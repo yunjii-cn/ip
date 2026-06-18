@@ -1,0 +1,107 @@
+205 INFO: PyInstaller: 6.20.0, contrib hooks: 2026.5
+206 INFO: Python: 3.12.10
+263 INFO: Platform: Windows-11-10.0.26100-SP0
+263 INFO: Python environment: D:\Programs\Python312
+264 INFO: wrote E:\软件开发\云集智能网联代理专家\build\v2026.06.19.0049\build\云集智能网联代理专家-v2026.06.19.0049.spec
+267 INFO: Removing temporary files and cleaning cache in C:\Users\Administrator\AppData\Local\pyinstaller
+269 INFO: Module search paths (PYTHONPATH):
+['E:\\软件开发\\云集智能网联代理专家\\dev\\app',
+ 'D:\\Programs\\Python312\\python312.zip',
+ 'D:\\Programs\\Python312\\DLLs',
+ 'D:\\Programs\\Python312\\Lib',
+ 'D:\\Programs\\Python312',
+ 'D:\\Programs\\Python312\\Lib\\site-packages',
+ 'E:\\软件开发\\云集智能网联代理专家\\dev\\app']
+827 INFO: Appending 'datas' from .spec
+840 INFO: checking Analysis
+840 INFO: Building Analysis because Analysis-00.toc is non existent
+840 INFO: Looking for Python shared library...
+841 INFO: Using Python shared library: D:\Programs\Python312\python312.dll
+841 INFO: Running Analysis Analysis-00.toc
+841 INFO: Target bytecode optimization level: 0
+841 INFO: Initializing module dependency graph...
+842 INFO: Initializing module graph hook caches...
+881 INFO: Analyzing modules for base_library.zip ...
+2502 INFO: Processing standard module hook 'hook-encodings.py' from 'D:\\Programs\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+4179 INFO: Processing standard module hook 'hook-pickle.py' from 'D:\\Programs\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+5322 INFO: Processing standard module hook 'hook-heapq.py' from 'D:\\Programs\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+5710 INFO: Caching module dependency graph...
+5756 INFO: Analyzing E:\软件开发\云集智能网联代理专家\dev\app\launcher.py
+5773 INFO: Processing standard module hook 'hook-_ctypes.py' from 'D:\\Programs\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+6957 INFO: Processing standard module hook 'hook-multiprocessing.util.py' from 'D:\\Programs\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+7034 INFO: Processing standard module hook 'hook-xml.py' from 'D:\\Programs\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+7390 INFO: Processing pre-safe-import-module hook 'hook-typing_extensions.py' from 'D:\\Programs\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+7392 INFO: SetuptoolsInfo: initializing cached setuptools info...
+8927 INFO: Processing standard module hook 'hook-PyQt6.py' from 'D:\\Programs\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+9579 INFO: Processing standard module hook 'hook-PyQt6.QtWidgets.py' from 'D:\\Programs\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+14436 INFO: Processing standard module hook 'hook-PyQt6.QtCore.py' from 'D:\\Programs\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+21225 INFO: Processing standard module hook 'hook-PyQt6.QtGui.py' from 'D:\\Programs\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+50635 INFO: Processing module hooks (post-graph stage)...
+50682 INFO: Performing binary vs. data reclassification (240 entries)
+50790 INFO: Looking for ctypes DLLs
+50900 INFO: Analyzing run-time hooks ...
+50901 INFO: Including run-time hook 'pyi_rth_pkgutil.py' from 'D:\\Programs\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+50903 INFO: Including run-time hook 'pyi_rth_multiprocessing.py' from 'D:\\Programs\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+50906 INFO: Including run-time hook 'pyi_rth_inspect.py' from 'D:\\Programs\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+50908 INFO: Including run-time hook 'pyi_rth_pyqt6.py' from 'D:\\Programs\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+50911 INFO: Processing pre-find-module-path hook 'hook-_pyi_rth_utils.py' from 'D:\\Programs\\Python312\\Lib\\site-packages\\PyInstaller\\hooks\\pre_find_module_path'
+50914 INFO: Processing standard module hook 'hook-_pyi_rth_utils.py' from 'D:\\Programs\\Python312\\Lib\\site-packages\\PyInstaller\\hooks'
+50926 INFO: Creating base_library.zip...
+50948 INFO: Looking for dynamic libraries
+51235 INFO: Extra DLL search directories (AddDllDirectory): ['D:\\Programs\\Python312\\Lib\\site-packages\\PyQt6\\Qt6\\bin']
+51235 INFO: Extra DLL search directories (PATH): ['D:\\Programs\\Python312\\Lib\\site-packages\\PyQt6\\Qt6\\bin']
+52219 INFO: Warnings written to E:\软件开发\云集智能网联代理专家\build\v2026.06.19.0049\build\云集智能网联代理专家-v2026.06.19.0049\warn-云集智能网联代理专家-v2026.06.19.0049.txt
+52243 INFO: Graph cross-reference written to E:\软件开发\云集智能网联代理专家\build\v2026.06.19.0049\build\云集智能网联代理专家-v2026.06.19.0049\xref-云集智能网联代理专家-v2026.06.19.0049.html
+52268 INFO: checking PYZ
+52268 INFO: Building PYZ because PYZ-00.toc is non existent
+52268 INFO: Building PYZ (ZlibArchive) E:\软件开发\云集智能网联代理专家\build\v2026.06.19.0049\build\云集智能网联代理专家-v2026.06.19.0049\PYZ-00.pyz
+52528 INFO: Building PYZ (ZlibArchive) E:\软件开发\云集智能网联代理专家\build\v2026.06.19.0049\build\云集智能网联代理专家-v2026.06.19.0049\PYZ-00.pyz completed successfully.
+52538 INFO: checking PKG
+52540 INFO: Building PKG because PKG-00.toc is non existent
+52540 INFO: Building PKG (CArchive) 云集智能网联代理专家-v2026.06.19.0049.pkg
+80735 INFO: Building PKG (CArchive) 云集智能网联代理专家-v2026.06.19.0049.pkg completed successfully.
+80742 INFO: Bootloader D:\Programs\Python312\Lib\site-packages\PyInstaller\bootloader\Windows-64bit-intel\runw.exe
+80742 INFO: checking EXE
+80742 INFO: Building EXE because EXE-00.toc is non existent
+80742 INFO: Building EXE from EXE-00.toc
+80743 INFO: Copying bootloader EXE to E:\软件开发\云集智能网联代理专家\build\v2026.06.19.0049\dist\云集智能网联代理专家-v2026.06.19.0049.exe
+80750 INFO: Copying icon to EXE
+80754 INFO: Copying version information to EXE
+80758 INFO: Copying 0 resources to EXE
+80758 INFO: Embedding manifest in EXE
+80763 INFO: Appending PKG archive to EXE
+80822 INFO: Fixing EXE headers
+81199 INFO: Building EXE from EXE-00.toc completed successfully.
+81205 INFO: Build complete! The results are available in: E:\软件开发\云集智能网联代理专家\build\v2026.06.19.0049\dist
+=== 构建云集智能网联代理专家 v2026.06.19.0049 ===
+EXE名称: 云集智能网联代理专家-v2026.06.19.0049.exe
+构建目录: E:\软件开发\云集智能网联代理专家\build\v2026.06.19.0049
+内核校验通过: quick.exe → E:\软件开发\云集智能网联代理专家\dev\app\Quick\quick.exe (v1.19.27)
+已生成: icon.ico (16/32/48/256)
+已生成: icon.png (64x64)
+已注入版本号: 2026.06.19.0049
+gitlog.json已生成: E:\软件开发\云集智能网联代理专家\dev\app\gitlog.json (50 条提交)
+已生成版本标记: E:\软件开发\云集智能网联代理专家\dev\app\_build_version.txt
+已包含: .gitee_token
+已包含: .github_token
+已包含: Quick/ (代理核心)
+运行 PyInstaller...
+  命令: D:\Programs\Python312\python.exe -m PyInstaller --noconfirm --clean --name=云集智能网联代理专家-v2026.06.19.0049 --add-data=E:\软件开发\云集智能网联代理专家\project.json;. --add-data=E:\软件开发\云集智能网联代理专家\dev\app\versions.json;. --add-data=E:\软件开发\云集智能网联代理专家\dev\app\gitlog.json;. --add-data=E:\软件开发\云集智能网联代理专家\dev\app\_build_version.txt;. --hidden-import=yaml --hidden-import=maxminddb --add-data=E:\软件开发\云集智能网联代理专家\dev\app\kernel_versions_cache.json;app/ --icon=E:\软件开发\云集智能网联代理专家\dev\app\icon.ico --distpath=E:\软件开发\云集智能网联代理专家\build\v2026.06.19.0049\dist --workpath=E:\软件开发\云集智能网联代理专家\build\v2026.06.19.0049\build --specpath=E:\软件开发\云集智能网联代理专家\build\v2026.06.19.0049\build --windowed --onefile --exclude-module psutil --exclude-module psutil._psutil_windows --exclude-module _tkinter --exclude-module tkinter --add-data E:\软件开发\云集智能网联代理专家\dev\app\icon.ico;. --add-data E:\软件开发\云集智能网联代理专家\dev\app\icon.png;. --add-data E:\软件开发\云集智能网联代理专家\dev\app\ico.png;. --version-file=E:\软件开发\云集智能网联代理专家\dev\app\version_info.txt E:\软件开发\云集智能网联代理专家\dev\app\launcher.py --add-data E:\软件开发\云集智能网联代理专家\dev\app\.gitee_token;. --add-data E:\软件开发\云集智能网联代理专家\dev\app\.github_token;. --add-data E:\软件开发\云集智能网联代理专家\dev\app\Quick;Quick
+EXE已移动到: E:\软件开发\云集智能网联代理专家\dev\dist\云集智能网联代理专家-v2026.06.19.0049.exe
+文件大小: 77.3 MB
+硬链接已创建: E:\软件开发\云集智能网联代理专家\dev\云集智能网联代理专家.exe → E:\软件开发\云集智能网联代理专家\dev\dist\云集智能网联代理专家-v2026.06.19.0049.exe
+提示: 双击入口EXE测试，确认稳定后手动将EXE移入 dev/ver/ 目录
+构建脚本已备份到: E:\软件开发\云集智能网联代理专家\build\v2026.06.19.0049\build.py
+代理内核已复制到整合包
+整合包已生成: E:\软件开发\云集智能网联代理专家\build\v2026.06.19.0049\云集智能网联代理专家-v2026.06.19.0049.zip (193.7 MB)
+
+=== 构建成功! ===
+版本EXE: E:\软件开发\云集智能网联代理专家\dev\dist\云集智能网联代理专家-v2026.06.19.0049.exe
+整合包: E:\软件开发\云集智能网联代理专家\build\v2026.06.19.0049\云集智能网联代理专家-v2026.06.19.0049.zip
+版本号: 2026.06.19.0049
+构建记录: E:\软件开发\云集智能网联代理专家\build\v2026.06.19.0049
+
+提示: 双击 dev/云集智能网联代理专家.exe 测试
+提示: 确认稳定后，手动将EXE从 dev/dist/ 移入 dev/ver/ 目录
+提示: 运行 release.py 可全自动发布到 GitHub + Gitee
+已恢复源代码版本号

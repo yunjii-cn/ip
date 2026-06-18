@@ -879,6 +879,67 @@ COLOR_ORANGE = "#FF9800"
 # Batch 4: 多上游支持 (备选仓库管理)
 # =====================================================================
 BACKUP_SOURCES_FILE = os.path.join(USER_DATA_DIR, "backup_sources.json")
+BUILTIN_BACKUP_SOURCES_VERSION = 1  # Bump 时会重新写入默认备选源
+
+
+# 内置默认备选上游仓库（首次启动时自动写入 backup_sources.json）
+# 每条: (备注名, 主URL, 备用URL列表, 默认启用?)
+# 备用 URL 会在主 URL 失败时按顺序尝试。多个备用 URL 能大幅提升可达率。
+BUILTIN_BACKUP_SOURCES = [
+    (
+        "Alvin9999/PAC (gitlabip)",
+        "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/1/config.yaml",
+        [
+            "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/2/config.yaml",
+            "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/3/config.yaml",
+            "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/4/config.yaml",
+        ],
+        True,
+    ),
+    (
+        "Alvin9999-newpac/fanqiang (GitHub)",
+        "https://raw.githubusercontent.com/Alvin9999-newpac/fanqiang/master/Clash.yaml",
+        [
+            "https://raw.githubusercontent.com/Alvin9999-newpac/fanqiang/main/Clash.yaml",
+            "https://raw.githubusercontent.com/Alvin9999-newpac/fanqiang/master/free-subscribe/Clash.yaml",
+        ],
+        True,
+    ),
+    (
+        "Alvin9999/PAC (GitHub 原始)",
+        "https://raw.githubusercontent.com/Alvin9999/PAC/master/backup/img/1/2/ipp/quick/1/config.yaml",
+        [
+            "https://raw.githubusercontent.com/Alvin9999/PAC/master/backup/img/1/2/ipp/quick/2/config.yaml",
+            "https://raw.githubusercontent.com/Alvin9999/PAC/master/backup/img/1/2/ipp/quick/3/config.yaml",
+            "https://raw.githubusercontent.com/Alvin9999/PAC/master/backup/img/1/2/ipp/quick/4/config.yaml",
+        ],
+        True,
+    ),
+    (
+        "v2ray-free (GitHub)",
+        "https://raw.githubusercontent.com/ripaojiedian/freenode/main/v2ray.yaml",
+        [
+            "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash.yaml",
+        ],
+        True,
+    ),
+    (
+        "free-nodes (GitHub)",
+        "https://raw.githubusercontent.com/mahdibland/SS-Rule-Snippet/master/LAZY_RULES/Clash.yaml",
+        [
+            "https://raw.githubusercontent.com/mahdibland/Shadowsocks-Config-Filter/main/clash.yaml",
+        ],
+        True,
+    ),
+    (
+        "Jsnzkpg/Jsnzkpg (GitHub)",
+        "https://raw.githubusercontent.com/Jsnzkpg/Jsnzkpg/main/clash.yaml",
+        [
+            "https://raw.githubusercontent.com/Jsnzkpg/Jsnzkpg/master/clash.yaml",
+        ],
+        True,
+    ),
+]
 
 
 @dataclass
@@ -890,6 +951,7 @@ class BackupSource:
     last_status: str = "未下载"
     last_error: str = ""
     last_update: str = ""
+    urls: List[str] = field(default_factory=list)  # 备用 URL 列表（按顺序尝试）
 
 
 def load_backup_sources() -> List[BackupSource]:
@@ -905,6 +967,10 @@ def load_backup_sources() -> List[BackupSource]:
         for item in raw:
             if not isinstance(item, dict):
                 continue
+            urls_field = item.get("urls", [])
+            if not isinstance(urls_field, list):
+                urls_field = []
+            urls_field = [u for u in urls_field if isinstance(u, str) and u.strip()]
             result.append(BackupSource(
                 name=item.get("name", ""),
                 url=item.get("url", ""),
@@ -912,6 +978,7 @@ def load_backup_sources() -> List[BackupSource]:
                 last_status=item.get("last_status", "未下载"),
                 last_error=item.get("last_error", ""),
                 last_update=item.get("last_update", ""),
+                urls=urls_field,
             ))
         return result
     except Exception as e:
@@ -932,6 +999,7 @@ def save_backup_sources(sources: List[BackupSource]):
                 "last_status": s.last_status,
                 "last_error": s.last_error,
                 "last_update": s.last_update,
+                "urls": list(s.urls or []),
             })
         with open(BACKUP_SOURCES_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -939,9 +1007,10 @@ def save_backup_sources(sources: List[BackupSource]):
         log.warning(f"保存备选上游仓库失败: {e}")
 
 
-def add_backup_source(name: str, url: str) -> BackupSource:
+def add_backup_source(name: str, url: str, urls: Optional[List[str]] = None) -> BackupSource:
     """添加一个备选上游仓库，返回新创建的对象。
     name 不能为空且不能与已有的重复。
+    urls 是可选的备用 URL 列表（按顺序追加在主 URL 之后尝试）。
     """
     name = (name or "").strip()
     url = (url or "").strip()
@@ -951,11 +1020,21 @@ def add_backup_source(name: str, url: str) -> BackupSource:
         raise ValueError("URL 不能为空")
     if not (url.startswith("http://") or url.startswith("https://")):
         raise ValueError("URL 必须以 http:// 或 https:// 开头")
+    urls_clean = []
+    for u in (urls or []):
+        u = (u or "").strip()
+        if not u:
+            continue
+        if not (u.startswith("http://") or u.startswith("https://")):
+            raise ValueError(f"备用 URL 必须以 http:// 或 https:// 开头: {u}")
+        if u == url:
+            continue
+        urls_clean.append(u)
     sources = load_backup_sources()
     for s in sources:
         if s.name == name:
             raise ValueError(f"已存在同名备选仓库「{name}」")
-    new_src = BackupSource(name=name, url=url, enabled=True)
+    new_src = BackupSource(name=name, url=url, enabled=True, urls=urls_clean)
     sources.append(new_src)
     save_backup_sources(sources)
     return new_src
@@ -990,6 +1069,68 @@ def update_backup_source_status(name: str, status: str, error: str = ""):
             s.last_error = error
             s.last_update = datetime.now().strftime("%Y-%m-%d %H:%M")
     save_backup_sources(sources)
+
+
+def ensure_builtin_backup_sources():
+    """首次启动时自动写入内置默认备选上游仓库到 backup_sources.json。
+
+    行为：
+    - 如果文件不存在：写入全部内置默认源（保留默认启用状态）
+    - 如果文件已存在：检查文件内记录的版本号，低于 BUILTIN_BACKUP_SOURCES_VERSION
+      时，追加新出现的内置源（已存在的同名条目不动，避免覆盖用户自定义设置）
+    """
+    ensure_user_data_dir()
+    try:
+        version_file = BACKUP_SOURCES_FILE + ".ver"
+        current_version = 0
+        if os.path.isfile(version_file):
+            try:
+                with open(version_file, "r", encoding="utf-8") as f:
+                    current_version = int((f.read() or "0").strip() or "0")
+            except Exception:
+                current_version = 0
+
+        existing = load_backup_sources()
+        existing_names = {s.name for s in existing}
+        new_entries: List[BackupSource] = []
+
+        if current_version < BUILTIN_BACKUP_SOURCES_VERSION:
+            for name, primary_url, fallback_urls, default_enabled in BUILTIN_BACKUP_SOURCES:
+                if name in existing_names:
+                    continue
+                new_entries.append(BackupSource(
+                    name=name,
+                    url=primary_url,
+                    enabled=default_enabled,
+                    last_status="未下载",
+                    last_error="",
+                    last_update="",
+                    urls=list(fallback_urls or []),
+                ))
+
+        if new_entries:
+            existing.extend(new_entries)
+            save_backup_sources(existing)
+            log.info(f"已自动写入 {len(new_entries)} 个内置备选上游仓库到 {BACKUP_SOURCES_FILE}")
+
+        # 无论是否新增，都更新版本号（防止下次重复检查逻辑执行时漏掉）
+        with open(version_file, "w", encoding="utf-8") as f:
+            f.write(str(BUILTIN_BACKUP_SOURCES_VERSION))
+    except Exception as e:
+        log.warning(f"自动写入内置备选上游仓库失败: {e}")
+
+
+def get_all_backup_urls(src: BackupSource) -> List[str]:
+    """获取一个备选上游仓库的所有下载 URL（主 URL + 备用 URL，去重保序）"""
+    seen = set()
+    out: List[str] = []
+    for u in [src.url] + list(src.urls or []):
+        u = (u or "").strip()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
 
 
 STYLESHEET = f"""
@@ -1909,19 +2050,24 @@ def download_all_configs():
             results.append((sub.name, config_data, "自定义订阅"))
 
     def try_download_backup(src):
-        """Batch 4: 下载备选上游仓库"""
+        """Batch 4: 下载备选上游仓库（按主 URL + 备用 URL 列表顺序尝试）"""
         config_data = None
         err = ""
-        try:
-            data = download_config(src.url, timeout=15)
-            text = data.decode("utf-8", errors="ignore")
-            # 验证可解析
-            _ = extract_proxies_count(text)
-            config_data = data
-            log.info(f"备选仓库「{src.name}」下载成功 ({src.url})")
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-            log.warning(f"备选仓库「{src.name}」下载失败: {err}")
+        tried_urls = 0
+        for url in get_all_backup_urls(src):
+            tried_urls += 1
+            try:
+                data = download_config(url, timeout=15)
+                text = data.decode("utf-8", errors="ignore")
+                # 验证可解析
+                _ = extract_proxies_count(text)
+                config_data = data
+                log.info(f"备选仓库「{src.name}」下载成功 ({url})")
+                break
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                log.warning(f"备选仓库「{src.name}」URL {tried_urls} 失败 ({url}): {err}")
+                continue
         try:
             update_backup_source_status(
                 src.name,
@@ -1950,28 +2096,37 @@ def download_all_configs():
     failed_names = [n for n, d, s in results if d is None]
     log.info(f"下载汇总（第一轮）: 成功 {len(succeeded)} 条, 失败 {len(failed_names)} 条 {failed_names if failed_names else ''}")
 
-    # === Batch 4: 第二轮 —— 主仓库全失败时降级到备选上游 ===
-    # 判断：内置 4 条全部失败（不含自定义订阅）
+    # === Batch 4 follow-up: 第二轮 —— 主仓库成功率不足时降级到备选上游 ===
+    # 触发条件（更激进，避免主仓库里大部分线路节点都死掉时无备选）：
+    # 1. 内置主仓库全部失败  →  必降级
+    # 2. 内置主仓库成功数 < 2 条（用户视野里基本没法用）  →  必降级
     builtin_results = [(n, d, s) for n, d, s in results if s == "主仓库"]
-    builtin_all_failed = all(d is None for _, d, _ in builtin_results) and len(builtin_results) > 0
-    if builtin_all_failed:
+    builtin_succeeded = [n for n, d, s in builtin_results if d is not None]
+    builtin_total = len(builtin_results)
+    builtin_succeeded_count = len(builtin_succeeded)
+    builtin_all_failed = builtin_total > 0 and builtin_succeeded_count == 0
+    builtin_too_few = builtin_total >= 2 and builtin_succeeded_count < 2
+    if builtin_all_failed or builtin_too_few:
         backup_sources = [s for s in load_backup_sources() if s.enabled]
         if backup_sources:
-            log.warning(f"主仓库 {len(builtin_results)} 条线路全部下载失败，降级到 {len(backup_sources)} 个备选上游仓库")
+            reason = "全部失败" if builtin_all_failed else f"成功 {builtin_succeeded_count}/{builtin_total} 不足"
+            log.warning(
+                f"主仓库{reason}（{builtin_succeeded}），降级到 {len(backup_sources)} 个备选上游仓库"
+            )
             backup_threads = []
             for src in backup_sources:
                 t = threading.Thread(target=try_download_backup, args=(src,))
                 t.start()
                 backup_threads.append(t)
             for t in backup_threads:
-                t.join(timeout=60)
+                t.join(timeout=90)  # 备选可能要走代理通道，时间放宽
             backup_succeeded = [(n, d, s) for n, d, s in results if s == "备选仓库" and d is not None]
             if backup_succeeded:
                 log.info(f"备选仓库降级成功: {len(backup_succeeded)} 条")
             else:
                 log.error("备选仓库也全部失败，无可用线路")
         else:
-            log.warning("主仓库全部失败，且没有配置备选上游仓库。可在「上游管理」添加备选源。")
+            log.warning("主仓库成功率不足，且没有启用的备选上游仓库。可在「上游管理」添加备选源。")
 
     # 返回成功的（含来源标记）
     final = [(n, d, s) for n, d, s in results if d is not None]
@@ -4744,18 +4899,21 @@ class MainWindow(QMainWindow):
             "备选上游仓库",
             "上游管理说明",
             "【上游管理】\n"
-            "当主仓库（内置 4 条线路）全部下载失败时，自动降级到备选上游仓库。\n\n"
-            "【工作原理】\n"
-            "1. 检测线路时，先下载主仓库的 4 条线路\n"
-            "2. 如果 4 条全部失败，自动下载所有启用的备选仓库\n"
-            "3. 备选仓库的线路会出现在检测结果中，可正常使用\n\n"
+            "当主仓库（内置 4 条线路）满足以下条件之一时，自动降级到备选上游仓库：\n"
+            "  ① 全部下载失败 ② 成功条数 < 2（基本没法用）\n\n"
+            "【内置默认源】\n"
+            "首次启动会自动写入 6 个公开备选源（含 Alvin9999/PAC 等常用仓库），\n"
+            "用户可自由启用/禁用/删除/添加新的。\n\n"
+            "【多 URL 兜底】\n"
+            "每个备选源可配 1 个主 URL + 多个备用 URL。\n"
+            "下载时按顺序尝试，主 URL 失败会自动试下一个，\n"
+            "大幅提升不同网络环境下的可达率。\n\n"
             "【适用场景】\n"
             "• 主仓库被墙或服务器宕机\n"
-            "• 主仓库节点全部失效\n"
+            "• 主仓库节点大部分失效（< 2 条成功）\n"
             "• 需要更多线路来源\n\n"
             "【注意】\n"
-            "备选仓库 URL 必须是 Clash YAML 格式的订阅地址。\n"
-            "备选仓库仅在主仓库全部失败时才会启用（不会同时下载）。"
+            "备选仓库 URL 必须是 Clash YAML 格式的订阅地址。"
         ))
         title_row.addStretch()
         outer.addLayout(title_row)
@@ -4824,6 +4982,14 @@ class MainWindow(QMainWindow):
             empty.setWordWrap(True)
             self._backup_list_layout.addWidget(empty)
             return
+        # 顶部统计
+        enabled_count = sum(1 for s in sources if s.enabled)
+        summary = QLabel(
+            f"共 {len(sources)} 个备选源，启用 {enabled_count} 个"
+            f"（主仓库失败或 < 2 条成功时自动降级）"
+        )
+        summary.setStyleSheet("color: #888; font-size: 7pt; padding: 2px 0;")
+        self._backup_list_layout.addWidget(summary)
         for src in sources:
             self._backup_list_layout.addWidget(self._make_backup_source_row(src))
 
@@ -4864,10 +5030,16 @@ class MainWindow(QMainWindow):
 
         # URL（截断显示）
         url_short = src.url if len(src.url) <= 50 else src.url[:47] + "..."
+        extra = len(src.urls or [])
+        if extra > 0:
+            url_short = f"{url_short}  +{extra}备用"
         url_lbl = QLabel(url_short)
         url_lbl.setStyleSheet("color: #666; font-size: 7pt;")
         url_lbl.setWordWrap(False)
-        url_lbl.setToolTip(src.url)
+        tooltip = src.url
+        if extra > 0:
+            tooltip += "\n\n备用 URL：\n" + "\n".join(f"• {u}" for u in (src.urls or []))
+        url_lbl.setToolTip(tooltip)
         rh.addWidget(url_lbl, stretch=2)
 
         # 删除按钮
@@ -10872,6 +11044,9 @@ def main():
     _ensure_single_instance()
 
     sys.excepthook = _global_exception_handler
+
+    # 启动时确保内置默认备选上游仓库存在（首次启动自动写入 backup_sources.json）
+    ensure_builtin_backup_sources()
 
     # 高精度DPI缩放：PassThrough不取整缩放因子，保证各分辨率下界面比例一致
     QApplication.setHighDpiScaleFactorRoundingPolicy(
