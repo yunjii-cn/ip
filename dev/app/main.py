@@ -12,6 +12,7 @@ import shutil
 import time
 import threading
 import urllib.request
+import urllib.error
 import subprocess
 import re
 import ctypes
@@ -19,7 +20,13 @@ import ctypes.wintypes
 import queue
 import tempfile
 import zipfile
+import base64
 from datetime import datetime, date
+from dataclasses import dataclass, asdict, field
+from typing import List, Optional, Dict, Tuple
+
+import yaml
+HAS_YAML = True
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -27,7 +34,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QListWidget,
     QListWidgetItem, QTextEdit, QComboBox, QSpinBox, QSizePolicy,
     QSplashScreen, QScrollArea, QLineEdit, QStyle, QProgressBar,
-    QSystemTrayIcon, QMenu
+    QSystemTrayIcon, QMenu, QCheckBox,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QPoint, QPropertyAnimation, QEasingCurve, pyqtProperty, QRectF, QMetaObject, Q_ARG
 from PyQt6.QtGui import QPixmap, QIcon, QFont, QColor, QPainter, QPen, QFontMetrics, QPalette, QLinearGradient, QTextOption, QAction
@@ -176,6 +183,246 @@ CONFIG_URLS = [
     ("线路4", "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/4/config.yaml",
      "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/4/config.yaml"),
 ]
+
+# ========== 自定义订阅（Batch 1） ==========
+
+USER_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_data")
+SUBSCRIPTIONS_FILE = os.path.join(USER_DATA_DIR, "subscriptions.json")
+
+
+@dataclass
+class Subscription:
+    """用户自定义订阅（Clash YAML 格式）"""
+    name: str            # 备注名（用户必填，在线路列表里显示这个名字）
+    url: str             # 订阅 URL
+    enabled: bool = True
+    last_update: str = ""   # YYYY-MM-DD HH:MM
+    node_count: int = 0
+    last_status: str = "未下载"  # 未下载 / 下载成功 / 下载失败
+    last_error: str = ""
+
+
+def ensure_user_data_dir():
+    os.makedirs(USER_DATA_DIR, exist_ok=True)
+
+
+class SubscriptionManager:
+    """用户自定义订阅的本地持久化管理"""
+
+    def __init__(self):
+        self.subscriptions: List[Subscription] = []
+        self._load()
+
+    def _load(self):
+        ensure_user_data_dir()
+        if not os.path.isfile(SUBSCRIPTIONS_FILE):
+            self.subscriptions = []
+            return
+        try:
+            with open(SUBSCRIPTIONS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                data = []
+            self.subscriptions = [Subscription(**item) for item in data if isinstance(item, dict)]
+        except Exception as e:
+            log.error(f"加载订阅文件失败: {e}")
+            self.subscriptions = []
+
+    def _save(self):
+        ensure_user_data_dir()
+        try:
+            with open(SUBSCRIPTIONS_FILE, "w", encoding="utf-8") as f:
+                json.dump([asdict(s) for s in self.subscriptions], f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.error(f"保存订阅文件失败: {e}")
+
+    def add(self, name: str, url: str) -> Subscription:
+        """添加订阅，名称重复抛 ValueError"""
+        name = (name or "").strip()
+        url = (url or "").strip()
+        if not name:
+            raise ValueError("订阅备注名不能为空")
+        if not url:
+            raise ValueError("订阅 URL 不能为空")
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise ValueError("订阅 URL 必须以 http:// 或 https:// 开头")
+        if any(s.name == name for s in self.subscriptions):
+            raise ValueError(f"订阅备注名「{name}」已存在")
+        sub = Subscription(name=name, url=url)
+        self.subscriptions.append(sub)
+        self._save()
+        return sub
+
+    def remove(self, name: str) -> bool:
+        before = len(self.subscriptions)
+        self.subscriptions = [s for s in self.subscriptions if s.name != name]
+        if len(self.subscriptions) < before:
+            self._save()
+            return True
+        return False
+
+    def toggle(self, name: str, enabled: bool):
+        for s in self.subscriptions:
+            if s.name == name:
+                s.enabled = enabled
+                self._save()
+                return
+
+    def get_enabled(self) -> List[Subscription]:
+        return [s for s in self.subscriptions if s.enabled]
+
+    def get_all(self) -> List[Subscription]:
+        return list(self.subscriptions)
+
+    def find(self, name: str) -> Optional[Subscription]:
+        for s in self.subscriptions:
+            if s.name == name:
+                return s
+        return None
+
+    def update_status(self, name: str, status: str, error: str = "",
+                      node_count: Optional[int] = None):
+        sub = self.find(name)
+        if not sub:
+            return
+        sub.last_status = status
+        sub.last_error = error
+        sub.last_update = time.strftime("%Y-%m-%d %H:%M")
+        if node_count is not None:
+            sub.node_count = node_count
+        self._save()
+
+
+# 全局单例（延迟初始化）
+_subscription_manager: Optional[SubscriptionManager] = None
+
+
+def get_subscription_manager() -> SubscriptionManager:
+    global _subscription_manager
+    if _subscription_manager is None:
+        _subscription_manager = SubscriptionManager()
+    return _subscription_manager
+
+
+def parse_clash_yaml(text: str) -> Dict:
+    """解析 Clash YAML 订阅内容，返回 dict（部分机场用 base64 编码，自动尝试解码）
+
+    抛出 ValueError 表示解析失败
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("订阅内容为空")
+
+    # 尝试直接当 YAML 解析
+    if HAS_YAML:
+        try:
+            cfg = yaml.safe_load(text)
+            if isinstance(cfg, dict):
+                return cfg
+        except Exception:
+            pass
+    else:
+        # 退化：用极简文本解析，识别 proxies/proxy-groups/rules 顶层 key
+        cfg = _parse_yaml_minimal(text)
+        if cfg and (cfg.get("proxies") or cfg.get("proxy-groups")):
+            return cfg
+
+    # 尝试 base64 解码（部分机场用 V2RayN 格式返回 base64）
+    try:
+        # Clash YAML 的 base64 编码格式：每行一个 base64 节点
+        # 简单判断：如果原内容不像 yaml 格式（无 'proxies:' 等关键字），尝试 base64
+        if "proxies:" not in text and "proxy-groups:" not in text:
+            decoded = base64.b64decode(text).decode("utf-8", errors="ignore")
+            if HAS_YAML:
+                cfg = yaml.safe_load(decoded)
+                if isinstance(cfg, dict):
+                    return cfg
+    except Exception:
+        pass
+
+    raise ValueError("订阅内容不是有效的 Clash YAML 格式")
+
+
+def _parse_yaml_minimal(text: str) -> Dict:
+    """不依赖 PyYAML 的极简 YAML 解析（仅用于订阅内容只有 proxies 的情况）
+
+    返回 dict 形如 {"proxies": [{"name": ..., "type": ..., "server": ...}]}
+    """
+    result = {}
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = re.match(r"^(\w[\w-]*):\s*$", line)
+        if m:
+            key = m.group(1)
+            if key not in ("proxies", "proxy-groups", "rules"):
+                i += 1
+                continue
+            items = []
+            i += 1
+            # 收集 - 开头的列表项
+            while i < len(lines):
+                ln = lines[i]
+                if ln.startswith("  - ") or ln.startswith("    - "):
+                    item = {"_raw": []}
+                    # 去掉前导 "  - " 或 "    - "
+                    stripped = re.sub(r"^\s*-\s*", "", ln)
+                    if ":" in stripped:
+                        k, v = stripped.split(":", 1)
+                        item[k.strip()] = v.strip()
+                    item["_raw"].append(ln)
+                    i += 1
+                    # 收集缩进的子项
+                    while i < len(lines) and lines[i].startswith("    ") and not re.match(r"^\s+- ", lines[i]):
+                        sub = lines[i].strip()
+                        if ":" in sub:
+                            k, v = sub.split(":", 1)
+                            item[k.strip()] = v.strip()
+                        item["_raw"].append(lines[i])
+                        i += 1
+                    items.append(item)
+                elif ln.strip() == "" or ln.startswith("#"):
+                    i += 1
+                else:
+                    break
+            result[key] = items
+        else:
+            i += 1
+    return result
+
+
+def extract_proxies_count(text: str) -> int:
+    """统计订阅里的代理节点数（仅 proxies 段，不含 proxy-groups/rules）
+
+    通过解析 YAML 后取 len(cfg.get("proxies", [])) 准确计数。
+    解析失败则用宽松正则（仅 2 空格缩进的 - name:）作兜底
+    """
+    if not text:
+        return 0
+    try:
+        cfg = parse_clash_yaml(text.replace("\r\n", "\n").replace("\r", "\n"))
+        if isinstance(cfg, dict) and isinstance(cfg.get("proxies"), list):
+            return len(cfg["proxies"])
+    except Exception:
+        pass
+    # 兜底：只数 2 空格缩进的 - name:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return len(re.findall(r"\n  - name:", text))
+
+
+def download_subscription(sub: Subscription, timeout: int = 15) -> bytes:
+    """下载并验证单个订阅内容，失败抛异常"""
+    data = download_config(sub.url, timeout=timeout)
+    # 统一 CRLF → LF（部分机场/Windows 环境下订阅是 CRLF 编码）
+    text = data.decode("utf-8", errors="ignore").replace("\r\n", "\n").replace("\r", "\n")
+    # 验证一下能解析
+    cfg = parse_clash_yaml(text)
+    if not isinstance(cfg, dict):
+        raise ValueError("订阅解析结果不是字典")
+    if not cfg.get("proxies") and not cfg.get("proxy-groups"):
+        log.warning(f"订阅 {sub.name} 解析后没有 proxies/proxy-groups 段")
+    return text.encode("utf-8")
 
 COLOR_RED = "#C62828"
 COLOR_RED_LIGHT = "#EF5350"
@@ -1054,8 +1301,14 @@ def download_config(url, timeout=10):
 
 
 def download_all_configs():
+    """下载所有可用线路配置：
+    - 内置 4 条（CONFIG_URLS）
+    - 用户自定义订阅（SubscriptionManager 中 enabled 的）
+    返回 [(name, data_bytes), ...] 仅包含成功的
+    """
     results = []
     lock = threading.Lock()
+    sub_mgr = get_subscription_manager()
 
     def try_download(name, primary_url, fallback_url):
         config_data = None
@@ -1072,13 +1325,46 @@ def download_all_configs():
         with lock:
             results.append((name, config_data))
 
+    def try_download_subscription(sub):
+        """下载并验证一个自定义订阅，下载成功后解析出节点数并更新订阅状态"""
+        config_data = None
+        err = ""
+        node_count = 0
+        try:
+            data = download_subscription(sub, timeout=15)
+            text = data.decode("utf-8", errors="ignore")
+            node_count = extract_proxies_count(text)
+            config_data = data
+            log.info(f"订阅「{sub.name}」下载成功 ({sub.url}), {node_count} 个节点")
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            log.warning(f"订阅「{sub.name}」下载失败: {err}")
+        # 无论成功失败都更新订阅状态（让 UI 能显示"上次失败原因"）
+        try:
+            sub_mgr.update_status(
+                sub.name,
+                "下载成功" if config_data else "下载失败",
+                err,
+                node_count=node_count if config_data else None,
+            )
+        except Exception:
+            pass
+        with lock:
+            results.append((sub.name, config_data))
+
     threads = []
+    # 内置 4 条
     for name, primary_url, fallback_url in CONFIG_URLS:
         t = threading.Thread(target=try_download, args=(name, primary_url, fallback_url))
         t.start()
         threads.append(t)
+    # 自定义订阅
+    for sub in sub_mgr.get_enabled():
+        t = threading.Thread(target=try_download_subscription, args=(sub,))
+        t.start()
+        threads.append(t)
     for t in threads:
-        t.join(timeout=60)  # 增加超时：每条线路最坏 10+10+8+8=36s，留 60s 余量
+        t.join(timeout=60)
     succeeded = [(n, d) for n, d in results if d is not None]
     failed = [n for n, d in results if d is None]
     log.info(f"下载汇总: 成功 {len(succeeded)} 条, 失败 {len(failed)} 条 {failed if failed else ''}")
@@ -2089,12 +2375,13 @@ class ServiceWorker(QThread):
 
             start_quick(quick_dir)
             if not wait_for_proxy(timeout=8):
+                log.warning(f"{name} 代理未就绪，跳过延迟测试")
                 results.append((name, -1.0, -1.0, 0, data))
                 self.line_tested.emit(name, -1.0, False)
                 continue
 
             latencies = []
-            for _, test_url in NODE_TEST_URLS:
+            for label, test_url in NODE_TEST_URLS:
                 try:
                     proxy_handler = urllib.request.ProxyHandler({
                         'http': f'http://{PROXY_URL}',
@@ -2107,8 +2394,11 @@ class ServiceWorker(QThread):
                     elapsed = time.time() - start
                     if resp.status in (200, 204):
                         latencies.append(elapsed)
-                except Exception:
-                    pass
+                        log.info(f"{name} 通过 {label} 测试成功, 延迟 {elapsed:.2f}s")
+                    else:
+                        log.warning(f"{name} {label} 测试返回非 200/204: {resp.status}")
+                except Exception as e:
+                    log.warning(f"{name} {label} 测试失败: {type(e).__name__}: {e}")
 
             if latencies:
                 avg = sum(latencies) / len(latencies)
@@ -2173,6 +2463,7 @@ class ServiceWorker(QThread):
 
             start_quick(quick_dir)
             if not wait_for_proxy(timeout=8):
+                log.warning(f"{name} 代理未就绪，跳过自动选择")
                 continue
 
             try:
@@ -2189,8 +2480,11 @@ class ServiceWorker(QThread):
                     fastest_time = elapsed
                     fastest_name = name
                     fastest_data = data
-            except Exception:
-                pass
+                    log.info(f"{name} 自动选择测试成功, 延迟 {elapsed:.2f}s")
+                elif resp.status not in (200, 204):
+                    log.warning(f"{name} 自动选择测试返回非 200/204: {resp.status}")
+            except Exception as e:
+                log.warning(f"{name} 自动选择测试失败: {type(e).__name__}: {e}")
 
         proxy_enabled = self.kwargs.get("proxy_enabled", False)
         if proxy_enabled:
@@ -3006,10 +3300,11 @@ class MainWindow(QMainWindow):
         ], help_btn=proxy_service_help_btn)
 
     def _build_line_service_panel(self):
-        """线路服务大面板：标题「线路服务」+ 3 个子卡片（线路状态 / 线路列表 / 智能线路）"""
+        """线路服务大面板：标题「线路服务」+ 4 个子卡片（线路状态 / 线路列表 / 智能线路 / 我的订阅）"""
         return self._build_panel_card("线路服务", [
             self._build_line_test_card(),
             self._build_line_list_card(),
+            self._build_subscription_card(),
             self._build_smart_line_card(),
         ])
 
@@ -3176,13 +3471,16 @@ class MainWindow(QMainWindow):
         return card
 
     def _build_line_list_card(self):
-        """线路列表子卡片"""
+        """线路列表子卡片（内置 4 条 + 所有启用的自定义订阅）
+
+        使用 _rebuild_line_rows() 在订阅变更后重绘
+        """
         card = QFrame()
         card.setObjectName("switch-row")
         card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
-        lc = QVBoxLayout(card)
-        lc.setContentsMargins(14, 8, 14, 8)
-        lc.setSpacing(6)
+        self._line_list_layout = QVBoxLayout(card)
+        self._line_list_layout.setContentsMargins(14, 8, 14, 8)
+        self._line_list_layout.setSpacing(6)
 
         line_header = QHBoxLayout()
         line_title = QLabel("线路列表")
@@ -3192,7 +3490,7 @@ class MainWindow(QMainWindow):
             "可用代理线路列表",
             "线路列表说明",
             "【线路列表】\n"
-            "显示所有可用的代理线路，每条线路可独立检测和使用。\n\n"
+            "显示所有可用的代理线路（4 条内置 + 你添加的订阅），每条线路可独立检测和使用。\n\n"
             "【检测线路】\n"
             "点击「检测线路」按钮，程序会自动先更新线路配置，\n"
             "然后测试所有线路的连通性和延迟，结果显示在每条线路旁边。\n"
@@ -3204,37 +3502,263 @@ class MainWindow(QMainWindow):
             "点击「更新线路配置」按钮。"
         ))
         line_header.addStretch()
-        lc.addLayout(line_header)
+        self._line_list_layout.addLayout(line_header)
 
+        # 存储所有线路行（内置 + 自定义）
         self.line_rows = {}
-        for name, _, _ in CONFIG_URLS:
-            row = QFrame()
-            row.setObjectName("line-row")
-            row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            rh = QHBoxLayout(row)
-            rh.setContentsMargins(14, 8, 14, 8)
-            rh.setSpacing(12)
-            name_lbl = QLabel(name)
-            name_lbl.setObjectName("suggestion")
-            name_lbl.setFixedWidth(50)
-            name_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
-            rh.addWidget(name_lbl)
-            status_lbl = QLabel("未检测")
-            status_lbl.setObjectName("dim")
-            status_lbl.setWordWrap(True)
-            status_lbl.setStyleSheet("font-size: 9pt;")
-            rh.addWidget(status_lbl, stretch=1)
-            use_btn = QPushButton("使用")
-            use_btn.setObjectName("small-blue")
-            use_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            use_btn.setFixedWidth(70)
-            use_btn.setFixedHeight(24)
-            use_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-            use_btn.clicked.connect(lambda checked, n=name: self._on_use_line(n))
-            rh.addWidget(use_btn)
-            lc.addWidget(row)
-            self.line_rows[name] = {"status": status_lbl, "use_btn": use_btn, "data": None, "row": row}
+        self._line_rows_container = QFrame()
+        self._line_rows_layout = QVBoxLayout(self._line_rows_container)
+        self._line_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._line_rows_layout.setSpacing(2)
+        self._line_list_layout.addWidget(self._line_rows_container)
+
+        # 首次构建
+        self._rebuild_line_rows()
         return card
+
+    def _make_line_row(self, name, is_custom=False):
+        """创建一个线路行 widget（不加入 layout，调用方负责 addWidget）"""
+        row = QFrame()
+        row.setObjectName("line-row")
+        row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        rh = QHBoxLayout(row)
+        rh.setContentsMargins(14, 8, 14, 8)
+        rh.setSpacing(12)
+        # 名称（自定义订阅前加图标区分）
+        display_name = ("📋 " + name) if is_custom else name
+        name_lbl = QLabel(display_name)
+        name_lbl.setObjectName("suggestion")
+        name_lbl.setFixedWidth(90 if is_custom else 50)
+        name_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
+        rh.addWidget(name_lbl)
+        # 状态
+        status_lbl = QLabel("未检测")
+        status_lbl.setObjectName("dim")
+        status_lbl.setWordWrap(True)
+        status_lbl.setStyleSheet("font-size: 9pt;")
+        rh.addWidget(status_lbl, stretch=1)
+        # 使用按钮
+        use_btn = QPushButton("使用")
+        use_btn.setObjectName("small-blue")
+        use_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        use_btn.setFixedWidth(70)
+        use_btn.setFixedHeight(24)
+        use_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        use_btn.clicked.connect(lambda checked, n=name: self._on_use_line(n))
+        rh.addWidget(use_btn)
+        # 存储
+        self.line_rows[name] = {
+            "status": status_lbl, "use_btn": use_btn, "data": None, "row": row,
+            "is_custom": is_custom,
+        }
+        return row
+
+    def _rebuild_line_rows(self):
+        """重建所有线路行（清空 → 内置 4 条 + 启用的自定义订阅）"""
+        if not hasattr(self, "_line_rows_layout"):
+            return
+        # 清空旧行
+        while self._line_rows_layout.count():
+            item = self._line_rows_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self.line_rows = {}
+        # 内置 4 条
+        for name, _, _ in CONFIG_URLS:
+            self._line_rows_layout.addWidget(self._make_line_row(name, is_custom=False))
+        # 启用的自定义订阅
+        try:
+            mgr = get_subscription_manager()
+            for sub in mgr.get_enabled():
+                self._line_rows_layout.addWidget(self._make_line_row(sub.name, is_custom=True))
+        except Exception as e:
+            log.warning(f"重建线路行失败: {e}")
+        # 拉伸项
+        self._line_rows_layout.addStretch(1)
+
+    def _build_subscription_card(self):
+        """我的订阅子卡片：添加订阅表单 + 已有订阅列表"""
+        card = QFrame()
+        card.setObjectName("switch-row")
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        sc = QVBoxLayout(card)
+        sc.setContentsMargins(14, 8, 14, 14)
+        sc.setSpacing(8)
+
+        # 标题行
+        head = QHBoxLayout()
+        title = QLabel("📋 我的订阅")
+        title.setStyleSheet(f"font-size: 9pt; font-weight: bold; color: {COLOR_TEXT};")
+        head.addWidget(title)
+        head.addWidget(_make_help_btn(
+            "自定义代理订阅",
+            "我的订阅说明",
+            "【自定义订阅】\n"
+            "把你自己的机场订阅链接贴进来，软件会下载并解析，\n"
+            "这些订阅会和内置的 4 条线路一起出现在「线路列表」中，\n"
+            "可以点「检测线路」一起测速、点「使用」切到这条线。\n\n"
+            "【支持的格式】\n"
+            "Clash YAML 格式订阅（绝大多数机场都支持）。\n"
+            "订阅 URL 一般在你的机场「复制订阅链接」页面里找。\n\n"
+            "【备注名】\n"
+            "必填，例：「机场A」、「我的订阅」，会显示在线路列表里。"
+        ))
+        head.addStretch()
+        sc.addLayout(head)
+
+        # 添加表单
+        form = QHBoxLayout()
+        form.setSpacing(6)
+        self.sub_name_edit = QLineEdit()
+        self.sub_name_edit.setPlaceholderText("备注名 (必填)")
+        self.sub_name_edit.setMaximumWidth(120)
+        self.sub_name_edit.setStyleSheet("font-size: 8pt; padding: 3px;")
+        form.addWidget(self.sub_name_edit)
+        self.sub_url_edit = QLineEdit()
+        self.sub_url_edit.setPlaceholderText("订阅 URL (https://...)")
+        self.sub_url_edit.setStyleSheet("font-size: 8pt; padding: 3px;")
+        form.addWidget(self.sub_url_edit, stretch=1)
+        add_btn = QPushButton("➕ 添加")
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_btn.setFixedHeight(26)
+        add_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {COLOR_GREEN}; color: #fff; "
+            f"font-size: 8pt; font-weight: bold; border-radius: 4px; border: none; padding: 0 10px; }}"
+            f"QPushButton:hover {{ background-color: #2E7D32; }}"
+            f"QPushButton:disabled {{ background-color: #333; color: #666; }}"
+        )
+        add_btn.clicked.connect(self._on_add_subscription)
+        form.addWidget(add_btn)
+        sc.addLayout(form)
+
+        # 已有订阅列表
+        self._sub_list_container = QFrame()
+        self._sub_list_layout = QVBoxLayout(self._sub_list_container)
+        self._sub_list_layout.setContentsMargins(0, 4, 0, 0)
+        self._sub_list_layout.setSpacing(3)
+        sc.addWidget(self._sub_list_container)
+
+        self._rebuild_subscription_list()
+        return card
+
+    def _rebuild_subscription_list(self):
+        """重建订阅管理列表"""
+        if not hasattr(self, "_sub_list_layout"):
+            return
+        while self._sub_list_layout.count():
+            item = self._sub_list_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        mgr = get_subscription_manager()
+        subs = mgr.get_all()
+        if not subs:
+            empty = QLabel("（暂无订阅，粘贴 Clash 订阅 URL 即可添加）")
+            empty.setStyleSheet("color: #666; font-size: 8pt; font-style: italic; padding: 4px;")
+            self._sub_list_layout.addWidget(empty)
+        else:
+            for sub in subs:
+                self._sub_list_layout.addWidget(self._make_sub_row(sub))
+        self._sub_list_layout.addStretch(1)
+
+    def _make_sub_row(self, sub: Subscription):
+        """单条订阅管理行：[启用] 名称 节点数 上次状态 [删除]"""
+        row = QFrame()
+        row.setObjectName("sub-row")
+        row.setStyleSheet("#sub-row { background-color: #131820; border: 1px solid #1f2a38; border-radius: 3px; }")
+        row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        rh = QHBoxLayout(row)
+        rh.setContentsMargins(10, 5, 10, 5)
+        rh.setSpacing(8)
+
+        # 启用 checkbox
+        chk = QCheckBox()
+        chk.setChecked(sub.enabled)
+        chk.setCursor(Qt.CursorShape.PointingHandCursor)
+        chk.toggled.connect(lambda checked, n=sub.name: self._on_toggle_subscription(n, checked))
+        rh.addWidget(chk)
+
+        # 名称
+        name_lbl = QLabel(sub.name)
+        name_lbl.setStyleSheet("font-size: 9pt; font-weight: bold;")
+        name_lbl.setFixedWidth(120)
+        rh.addWidget(name_lbl)
+
+        # 节点数 + 上次状态
+        info = f"📡 {sub.node_count} 节点" if sub.node_count else "📡 ? 节点"
+        if sub.last_update:
+            info += f"  ·  {sub.last_update}"
+        if sub.last_status == "下载成功":
+            color = COLOR_GREEN
+        elif sub.last_status == "下载失败":
+            color = "#FF6B80"
+        else:
+            color = "#888"
+        status_lbl = QLabel(info)
+        status_lbl.setStyleSheet(f"color: {color}; font-size: 8pt;")
+        status_lbl.setWordWrap(True)
+        rh.addWidget(status_lbl, stretch=1)
+
+        # 删除按钮
+        del_btn = QPushButton("🗑")
+        del_btn.setToolTip("删除此订阅")
+        del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        del_btn.setFixedSize(26, 22)
+        del_btn.setStyleSheet(
+            "QPushButton { background-color: #2a1a1a; color: #FF6B80; "
+            "border: 1px solid #5a2a2a; border-radius: 3px; font-size: 11pt; }"
+            "QPushButton:hover { background-color: #5a2020; }"
+        )
+        del_btn.clicked.connect(lambda checked, n=sub.name: self._on_remove_subscription(n))
+        rh.addWidget(del_btn)
+        return row
+
+    def _on_add_subscription(self):
+        """添加订阅按钮回调"""
+        name = self.sub_name_edit.text().strip()
+        url = self.sub_url_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "提示", "请填写备注名")
+            return
+        if not url:
+            QMessageBox.warning(self, "提示", "请填写订阅 URL")
+            return
+        try:
+            get_subscription_manager().add(name, url)
+        except ValueError as e:
+            QMessageBox.warning(self, "添加失败", str(e))
+            return
+        except Exception as e:
+            QMessageBox.critical(self, "添加失败", f"未知错误: {e}")
+            return
+        self.sub_name_edit.clear()
+        self.sub_url_edit.clear()
+        self._rebuild_subscription_list()
+        self._rebuild_line_rows()
+        QMessageBox.information(self, "已添加", f"订阅「{name}」已添加。下次点「检测线路」时一并下载测试。")
+
+    def _on_remove_subscription(self, name: str):
+        """删除订阅按钮回调"""
+        ret = QMessageBox.question(
+            self, "确认删除",
+            f"确定要删除订阅「{name}」吗？\n该订阅会从线路列表中移除。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        mgr = get_subscription_manager()
+        mgr.remove(name)
+        self._rebuild_subscription_list()
+        self._rebuild_line_rows()
+
+    def _on_toggle_subscription(self, name: str, enabled: bool):
+        """启用/禁用订阅"""
+        get_subscription_manager().toggle(name, enabled)
+        self._rebuild_line_rows()
 
     def _build_line_test_card(self):
         """线路状态子卡片：延迟 | 线路 | 进度 | 检测按钮（内核信息已迁移到代理状态卡）"""
