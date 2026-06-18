@@ -874,6 +874,124 @@ COLOR_DIM = "#888888"
 COLOR_GREEN = "#4EBA65"
 COLOR_ORANGE = "#FF9800"
 
+
+# =====================================================================
+# Batch 4: 多上游支持 (备选仓库管理)
+# =====================================================================
+BACKUP_SOURCES_FILE = os.path.join(USER_DATA_DIR, "backup_sources.json")
+
+
+@dataclass
+class BackupSource:
+    """备选上游仓库（当主仓库 CONFIG_URLS 全部下载失败时降级使用）"""
+    name: str            # 备注名（如 "备用仓库A"）
+    url: str             # 订阅 URL（Clash YAML 格式）
+    enabled: bool = True
+    last_status: str = "未下载"
+    last_error: str = ""
+    last_update: str = ""
+
+
+def load_backup_sources() -> List[BackupSource]:
+    """从 user_data/backup_sources.json 加载备选上游仓库列表"""
+    try:
+        if not os.path.isfile(BACKUP_SOURCES_FILE):
+            return []
+        with open(BACKUP_SOURCES_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, list):
+            return []
+        result = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            result.append(BackupSource(
+                name=item.get("name", ""),
+                url=item.get("url", ""),
+                enabled=item.get("enabled", True),
+                last_status=item.get("last_status", "未下载"),
+                last_error=item.get("last_error", ""),
+                last_update=item.get("last_update", ""),
+            ))
+        return result
+    except Exception as e:
+        log.warning(f"加载备选上游仓库失败: {e}")
+        return []
+
+
+def save_backup_sources(sources: List[BackupSource]):
+    """保存备选上游仓库列表到 user_data/backup_sources.json"""
+    try:
+        os.makedirs(os.path.dirname(BACKUP_SOURCES_FILE), exist_ok=True)
+        data = []
+        for s in sources:
+            data.append({
+                "name": s.name,
+                "url": s.url,
+                "enabled": s.enabled,
+                "last_status": s.last_status,
+                "last_error": s.last_error,
+                "last_update": s.last_update,
+            })
+        with open(BACKUP_SOURCES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"保存备选上游仓库失败: {e}")
+
+
+def add_backup_source(name: str, url: str) -> BackupSource:
+    """添加一个备选上游仓库，返回新创建的对象。
+    name 不能为空且不能与已有的重复。
+    """
+    name = (name or "").strip()
+    url = (url or "").strip()
+    if not name:
+        raise ValueError("备注名不能为空")
+    if not url:
+        raise ValueError("URL 不能为空")
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise ValueError("URL 必须以 http:// 或 https:// 开头")
+    sources = load_backup_sources()
+    for s in sources:
+        if s.name == name:
+            raise ValueError(f"已存在同名备选仓库「{name}」")
+    new_src = BackupSource(name=name, url=url, enabled=True)
+    sources.append(new_src)
+    save_backup_sources(sources)
+    return new_src
+
+
+def remove_backup_source(name: str) -> bool:
+    """删除指定名称的备选上游仓库"""
+    sources = load_backup_sources()
+    before = len(sources)
+    sources = [s for s in sources if s.name != name]
+    if len(sources) < before:
+        save_backup_sources(sources)
+        return True
+    return False
+
+
+def toggle_backup_source(name: str, enabled: bool):
+    """启用/禁用备选上游仓库"""
+    sources = load_backup_sources()
+    for s in sources:
+        if s.name == name:
+            s.enabled = enabled
+    save_backup_sources(sources)
+
+
+def update_backup_source_status(name: str, status: str, error: str = ""):
+    """更新备选上游仓库的下载状态"""
+    sources = load_backup_sources()
+    for s in sources:
+        if s.name == name:
+            s.last_status = status
+            s.last_error = error
+            s.last_update = datetime.now().strftime("%Y-%m-%d %H:%M")
+    save_backup_sources(sources)
+
+
 STYLESHEET = f"""
 QMainWindow {{ background-color: {COLOR_BG}; }}
 QWidget {{ color: {COLOR_TEXT}; font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif; }}
@@ -1741,9 +1859,11 @@ def download_all_configs():
     """下载所有可用线路配置：
     - 内置 4 条（CONFIG_URLS）
     - 用户自定义订阅（SubscriptionManager 中 enabled 的）
-    返回 [(name, data_bytes), ...] 仅包含成功的
+    - Batch 4: 内置全失败时降级到备选上游仓库
+    返回 [(name, data_bytes, source_tag), ...] 仅包含成功的
+    source_tag: "主仓库" / "备选仓库" / "自定义订阅"
     """
-    results = []
+    results = []  # [(name, data, source_tag)]
     lock = threading.Lock()
     sub_mgr = get_subscription_manager()
 
@@ -1760,7 +1880,7 @@ def download_all_configs():
         if config_data is None:
             log.error(f"{name} 配置所有下载方式均失败")
         with lock:
-            results.append((name, config_data))
+            results.append((name, config_data, "主仓库"))
 
     def try_download_subscription(sub):
         """下载并验证一个自定义订阅，下载成功后解析出节点数并更新订阅状态"""
@@ -1776,7 +1896,6 @@ def download_all_configs():
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             log.warning(f"订阅「{sub.name}」下载失败: {err}")
-        # 无论成功失败都更新订阅状态（让 UI 能显示"上次失败原因"）
         try:
             sub_mgr.update_status(
                 sub.name,
@@ -1787,25 +1906,76 @@ def download_all_configs():
         except Exception:
             pass
         with lock:
-            results.append((sub.name, config_data))
+            results.append((sub.name, config_data, "自定义订阅"))
 
+    def try_download_backup(src):
+        """Batch 4: 下载备选上游仓库"""
+        config_data = None
+        err = ""
+        try:
+            data = download_config(src.url, timeout=15)
+            text = data.decode("utf-8", errors="ignore")
+            # 验证可解析
+            _ = extract_proxies_count(text)
+            config_data = data
+            log.info(f"备选仓库「{src.name}」下载成功 ({src.url})")
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            log.warning(f"备选仓库「{src.name}」下载失败: {err}")
+        try:
+            update_backup_source_status(
+                src.name,
+                "下载成功" if config_data else "下载失败",
+                err,
+            )
+        except Exception:
+            pass
+        with lock:
+            results.append((src.name, config_data, "备选仓库"))
+
+    # === 第一轮：主仓库 + 自定义订阅 ===
     threads = []
-    # 内置 4 条
     for name, primary_url, fallback_url in CONFIG_URLS:
         t = threading.Thread(target=try_download, args=(name, primary_url, fallback_url))
         t.start()
         threads.append(t)
-    # 自定义订阅
     for sub in sub_mgr.get_enabled():
         t = threading.Thread(target=try_download_subscription, args=(sub,))
         t.start()
         threads.append(t)
     for t in threads:
         t.join(timeout=60)
-    succeeded = [(n, d) for n, d in results if d is not None]
-    failed = [n for n, d in results if d is None]
-    log.info(f"下载汇总: 成功 {len(succeeded)} 条, 失败 {len(failed)} 条 {failed if failed else ''}")
-    return succeeded
+
+    succeeded = [(n, d, s) for n, d, s in results if d is not None]
+    failed_names = [n for n, d, s in results if d is None]
+    log.info(f"下载汇总（第一轮）: 成功 {len(succeeded)} 条, 失败 {len(failed_names)} 条 {failed_names if failed_names else ''}")
+
+    # === Batch 4: 第二轮 —— 主仓库全失败时降级到备选上游 ===
+    # 判断：内置 4 条全部失败（不含自定义订阅）
+    builtin_results = [(n, d, s) for n, d, s in results if s == "主仓库"]
+    builtin_all_failed = all(d is None for _, d, _ in builtin_results) and len(builtin_results) > 0
+    if builtin_all_failed:
+        backup_sources = [s for s in load_backup_sources() if s.enabled]
+        if backup_sources:
+            log.warning(f"主仓库 {len(builtin_results)} 条线路全部下载失败，降级到 {len(backup_sources)} 个备选上游仓库")
+            backup_threads = []
+            for src in backup_sources:
+                t = threading.Thread(target=try_download_backup, args=(src,))
+                t.start()
+                backup_threads.append(t)
+            for t in backup_threads:
+                t.join(timeout=60)
+            backup_succeeded = [(n, d, s) for n, d, s in results if s == "备选仓库" and d is not None]
+            if backup_succeeded:
+                log.info(f"备选仓库降级成功: {len(backup_succeeded)} 条")
+            else:
+                log.error("备选仓库也全部失败，无可用线路")
+        else:
+            log.warning("主仓库全部失败，且没有配置备选上游仓库。可在「上游管理」添加备选源。")
+
+    # 返回成功的（含来源标记）
+    final = [(n, d, s) for n, d, s in results if d is not None]
+    return final
 
 
 def save_config(quick_dir, config_data):
@@ -2764,12 +2934,12 @@ class ServiceWorker(QThread):
             saved_line = self.kwargs.get("current_line")
             selected = None
             if saved_line:
-                for name, data in downloaded:
+                for name, data, _src in downloaded:
                     if name == saved_line:
                         selected = (name, data)
                         break
             if not selected:
-                selected = downloaded[0]
+                selected = (downloaded[0][0], downloaded[0][1])
             save_config(quick_dir, selected[1])
             self.line_selected.emit(selected[0])
             self.progress.emit(f"已选择: {selected[0]}")
@@ -2824,7 +2994,7 @@ class ServiceWorker(QThread):
         results = []
         total = len(downloaded)
 
-        for i, (name, data) in enumerate(downloaded):
+        for i, (name, data, _src) in enumerate(downloaded):
             self.progress.emit(f"正在检测线路 {i+1}/{total}: {name}...")
             save_config(quick_dir, data)
 
@@ -2900,7 +3070,7 @@ class ServiceWorker(QThread):
         if proxy_enabled:
             restore_data = original_config
             if current_line:
-                for n, d in downloaded:
+                for n, d, _src in downloaded:
                     if n == current_line:
                         restore_data = d
                         break
@@ -2943,7 +3113,7 @@ class ServiceWorker(QThread):
         # 新逻辑：综合 7d 成功率 (60%) + 当前延迟 (40%)
         test_results = []  # [(name, elapsed, data, success)]
         health_db = get_health_db()
-        for name, data in downloaded:
+        for name, data, _src in downloaded:
             self.progress.emit(f"正在测试 {name}...")
             save_config(quick_dir, data)
 
@@ -3093,12 +3263,12 @@ class ServiceWorker(QThread):
                 saved_line = self.kwargs.get("current_line")
                 selected = None
                 if saved_line:
-                    for name, data in downloaded:
+                    for name, data, _src in downloaded:
                         if name == saved_line:
                             selected = (name, data)
                             break
                 if not selected:
-                    selected = downloaded[0]
+                    selected = (downloaded[0][0], downloaded[0][1])
                 save_config(quick_dir, selected[1])
                 if is_proxy_running():
                     stop_quick()
@@ -3844,12 +4014,13 @@ class MainWindow(QMainWindow):
         ], help_btn=proxy_service_help_btn)
 
     def _build_line_service_panel(self):
-        """线路服务大面板：标题「线路服务」+ 5 个子卡片（线路状态 / 线路列表 / 国家筛选 / 我的订阅 / 智能线路）"""
+        """线路服务大面板：标题「线路服务」+ 6 个子卡片（线路状态 / 线路列表 / 国家筛选 / 我的订阅 / 上游管理 / 智能线路）"""
         return self._build_panel_card("线路服务", [
             self._build_line_test_card(),
             self._build_line_list_card(),
             self._build_country_filter_card(),
             self._build_subscription_card(),
+            self._build_backup_source_card(),
             self._build_smart_line_card(),
         ])
 
@@ -4552,6 +4723,219 @@ class MainWindow(QMainWindow):
                 if avg is not None:
                     tip += f"，平均延迟 {avg:.2f}s"
                 badge.setToolTip(tip)
+
+    def _build_backup_source_card(self):
+        """上游管理子卡片：管理备选上游仓库（Batch 4）
+        当主仓库 4 条线路全部下载失败时，自动降级到备选上游仓库。
+        """
+        card = QFrame()
+        card.setObjectName("switch-row")
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(14, 8, 14, 8)
+        outer.setSpacing(6)
+
+        # 标题行
+        title_row = QHBoxLayout()
+        title = QLabel("🔄 上游管理")
+        title.setStyleSheet(f"font-size: 9pt; font-weight: bold; color: {COLOR_TEXT};")
+        title_row.addWidget(title)
+        title_row.addWidget(_make_help_btn(
+            "备选上游仓库",
+            "上游管理说明",
+            "【上游管理】\n"
+            "当主仓库（内置 4 条线路）全部下载失败时，自动降级到备选上游仓库。\n\n"
+            "【工作原理】\n"
+            "1. 检测线路时，先下载主仓库的 4 条线路\n"
+            "2. 如果 4 条全部失败，自动下载所有启用的备选仓库\n"
+            "3. 备选仓库的线路会出现在检测结果中，可正常使用\n\n"
+            "【适用场景】\n"
+            "• 主仓库被墙或服务器宕机\n"
+            "• 主仓库节点全部失效\n"
+            "• 需要更多线路来源\n\n"
+            "【注意】\n"
+            "备选仓库 URL 必须是 Clash YAML 格式的订阅地址。\n"
+            "备选仓库仅在主仓库全部失败时才会启用（不会同时下载）。"
+        ))
+        title_row.addStretch()
+        outer.addLayout(title_row)
+
+        # 添加行：备注名 + URL + 添加按钮
+        add_row = QHBoxLayout()
+        add_row.setSpacing(6)
+        self._backup_name_input = QLineEdit()
+        self._backup_name_input.setPlaceholderText("备注名")
+        self._backup_name_input.setFixedHeight(26)
+        self._backup_name_input.setMaxLength(30)
+        self._backup_name_input.setStyleSheet(
+            f"QLineEdit {{ background-color: #111; color: {COLOR_TEXT}; "
+            f"border: 1px solid {COLOR_BORDER}; border-radius: 4px; padding: 0 8px; font-size: 8pt; }}"
+            f"QLineEdit:focus {{ border-color: {COLOR_GREEN}; }}"
+        )
+        add_row.addWidget(self._backup_name_input, 1)
+
+        self._backup_url_input = QLineEdit()
+        self._backup_url_input.setPlaceholderText("https:// 备选仓库订阅 URL (Clash YAML)")
+        self._backup_url_input.setFixedHeight(26)
+        self._backup_url_input.setStyleSheet(
+            f"QLineEdit {{ background-color: #111; color: {COLOR_TEXT}; "
+            f"border: 1px solid {COLOR_BORDER}; border-radius: 4px; padding: 0 8px; font-size: 8pt; }}"
+            f"QLineEdit:focus {{ border-color: {COLOR_GREEN}; }}"
+        )
+        add_row.addWidget(self._backup_url_input, 3)
+
+        add_btn = QPushButton("➕ 添加")
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_btn.setFixedHeight(26)
+        add_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {COLOR_GREEN}; color: #fff; "
+            f"font-size: 8pt; font-weight: bold; border-radius: 4px; border: none; padding: 0 12px; }}"
+            f"QPushButton:hover {{ background-color: #2E7D32; }}"
+        )
+        add_btn.clicked.connect(self._on_add_backup_source)
+        add_row.addWidget(add_btn)
+        outer.addLayout(add_row)
+
+        # 备选仓库列表
+        self._backup_list_layout = QVBoxLayout()
+        self._backup_list_layout.setSpacing(2)
+        outer.addLayout(self._backup_list_layout)
+
+        # 初始化列表
+        self._rebuild_backup_source_list()
+        return card
+
+    def _rebuild_backup_source_list(self):
+        """重建备选仓库列表"""
+        if not hasattr(self, "_backup_list_layout"):
+            return
+        # 清空
+        while self._backup_list_layout.count():
+            item = self._backup_list_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        # 重新构建
+        sources = load_backup_sources()
+        if not sources:
+            empty = QLabel("（暂无备选上游仓库。主仓库全部失败时将无线路可用。）")
+            empty.setStyleSheet("color: #555; font-size: 8pt; padding: 4px 0;")
+            empty.setWordWrap(True)
+            self._backup_list_layout.addWidget(empty)
+            return
+        for src in sources:
+            self._backup_list_layout.addWidget(self._make_backup_source_row(src))
+
+    def _make_backup_source_row(self, src: BackupSource) -> QFrame:
+        """创建单个备选仓库行"""
+        row = QFrame()
+        row.setObjectName("line-row")
+        row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        rh = QHBoxLayout(row)
+        rh.setContentsMargins(8, 4, 8, 4)
+        rh.setSpacing(8)
+
+        # 启用/禁用 checkbox
+        chk = QCheckBox()
+        chk.setChecked(src.enabled)
+        chk.setCursor(Qt.CursorShape.PointingHandCursor)
+        chk.setFixedSize(18, 18)
+        chk.setStyleSheet(
+            f"QCheckBox {{ spacing: 0; }}"
+            f"QCheckBox::indicator {{ width: 14px; height: 14px; }}"
+        )
+        chk.toggled.connect(lambda checked, n=src.name: self._on_toggle_backup_source(n, checked))
+        rh.addWidget(chk)
+
+        # 名称 + 状态
+        info_text = f"📦 {src.name}"
+        if src.last_status == "下载成功":
+            info_text += f"  ✅ {src.last_update}"
+        elif src.last_status == "下载失败":
+            err_short = src.last_error[:30] if src.last_error else ""
+            info_text += f"  ❌ {err_short}"
+        else:
+            info_text += f"  ⬜ {src.last_status}"
+        name_lbl = QLabel(info_text)
+        name_lbl.setStyleSheet("font-size: 8pt; font-weight: bold;")
+        name_lbl.setWordWrap(True)
+        rh.addWidget(name_lbl, stretch=1)
+
+        # URL（截断显示）
+        url_short = src.url if len(src.url) <= 50 else src.url[:47] + "..."
+        url_lbl = QLabel(url_short)
+        url_lbl.setStyleSheet("color: #666; font-size: 7pt;")
+        url_lbl.setWordWrap(False)
+        url_lbl.setToolTip(src.url)
+        rh.addWidget(url_lbl, stretch=2)
+
+        # 删除按钮
+        del_btn = QPushButton("✕")
+        del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        del_btn.setFixedSize(22, 22)
+        del_btn.setStyleSheet(
+            f"QPushButton {{ background-color: #2a1a1a; color: #FF6B80; "
+            f"font-size: 9pt; border-radius: 3px; border: 1px solid #3a1a1a; }}"
+            f"QPushButton:hover {{ background-color: #5a2020; }}"
+        )
+        del_btn.clicked.connect(lambda checked, n=src.name: self._on_remove_backup_source(n))
+        rh.addWidget(del_btn)
+        return row
+
+    def _on_add_backup_source(self):
+        """添加备选上游仓库"""
+        name = self._backup_name_input.text().strip()
+        url = self._backup_url_input.text().strip()
+        if not name:
+            QMessageBox.warning(self, "提示", "请输入备注名")
+            return
+        if not url:
+            QMessageBox.warning(self, "提示", "请输入订阅 URL")
+            return
+        try:
+            add_backup_source(name, url)
+        except ValueError as e:
+            QMessageBox.warning(self, "添加失败", str(e))
+            return
+        except Exception as e:
+            QMessageBox.critical(self, "添加失败", f"{type(e).__name__}: {e}")
+            return
+        # 清空输入框
+        self._backup_name_input.clear()
+        self._backup_url_input.clear()
+        # 刷新列表
+        self._rebuild_backup_source_list()
+        # 刷新线路行（备选仓库不会出现在线路列表里，只在降级时使用）
+        QMessageBox.information(
+            self, "已添加",
+            f"备选仓库「{name}」已添加。\n"
+            f"当主仓库 4 条线路全部下载失败时，会自动降级到该仓库。"
+        )
+
+    def _on_remove_backup_source(self, name: str):
+        """删除备选上游仓库"""
+        ret = QMessageBox.question(
+            self, "确认删除",
+            f"确定要删除备选仓库「{name}」吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            remove_backup_source(name)
+        except Exception as e:
+            QMessageBox.critical(self, "删除失败", f"{e}")
+            return
+        self._rebuild_backup_source_list()
+
+    def _on_toggle_backup_source(self, name: str, enabled: bool):
+        """启用/禁用备选上游仓库"""
+        try:
+            toggle_backup_source(name, enabled)
+        except Exception as e:
+            log.warning(f"切换备选仓库状态失败: {e}")
 
     def _build_smart_line_card(self):
         """智能线路子卡片：分组小标题 + 3 个开关行（断线自动切换 / 定时切换最快线路 / 检测线路前更新配置）"""
@@ -7701,12 +8085,12 @@ class MainWindow(QMainWindow):
                 if downloaded:
                     selected = None
                     if current_line:
-                        for n, d in downloaded:
+                        for n, d, _src in downloaded:
                             if n == current_line:
                                 selected = (n, d)
                                 break
                     if not selected:
-                        selected = downloaded[0]
+                        selected = (downloaded[0][0], downloaded[0][1])
                     save_config(quick_dir, selected[1])
                     log.info(f"启动时已下载最新配置: {selected[0]}")
             except Exception as e:
