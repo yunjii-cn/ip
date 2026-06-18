@@ -1,3 +1,4 @@
 PyQt6>=6.4.0
 pyinstaller>=5.13.0
 PyYAML>=6.0
+maxminddb>=2.2.0

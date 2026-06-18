@@ -28,13 +28,16 @@ from typing import List, Optional, Dict, Tuple
 import yaml
 HAS_YAML = True
 
+import maxminddb
+HAS_MAXMINDDB = True
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QStackedWidget, QFrame, QDialog,
     QMessageBox, QListWidget,
     QListWidgetItem, QTextEdit, QComboBox, QSpinBox, QSizePolicy,
     QSplashScreen, QScrollArea, QLineEdit, QStyle, QProgressBar,
-    QSystemTrayIcon, QMenu, QCheckBox,
+    QSystemTrayIcon, QMenu, QCheckBox, QGridLayout, QDialogButtonBox,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QPoint, QPropertyAnimation, QEasingCurve, pyqtProperty, QRectF, QMetaObject, Q_ARG
 from PyQt6.QtGui import QPixmap, QIcon, QFont, QColor, QPainter, QPen, QFontMetrics, QPalette, QLinearGradient, QTextOption, QAction
@@ -423,6 +426,263 @@ def download_subscription(sub: Subscription, timeout: int = 15) -> bytes:
     if not cfg.get("proxies") and not cfg.get("proxy-groups"):
         log.warning(f"订阅 {sub.name} 解析后没有 proxies/proxy-groups 段")
     return text.encode("utf-8")
+
+
+# ========== GeoIP 国家查询（Batch 2） ==========
+
+# 找 mmdb 路径的优先级
+GEOIP_MMDB_CANDIDATES = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "Quick", "Country.mmdb"),
+    os.path.join(USER_DATA_DIR, "Country.mmdb"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "Country.mmdb"),
+]
+# 备用下载源（GitHub CDN 上的 GeoLite2-Country 镜像）
+GEOIP_MMDB_DOWNLOAD_URLS = [
+    "https://cdn.jsdelivr.net/gh/Hackl0us/GeoIP2-CN@release/Country.mmdb",
+    "https://raw.githubusercontent.com/Hackl0us/GeoIP2-CN/release/Country.mmdb",
+]
+
+_geoip_reader = None  # 全局缓存
+_geoip_path = None
+
+
+def get_geoip_db_path() -> Optional[str]:
+    """返回第一个存在的 mmdb 路径，不存在返回 None"""
+    for p in GEOIP_MMDB_CANDIDATES:
+        if os.path.isfile(p) and os.path.getsize(p) > 1000:
+            return p
+    return None
+
+
+def get_geoip_reader():
+    """懒加载 maxminddb Reader（单例）"""
+    global _geoip_reader, _geoip_path
+    if _geoip_reader is not None:
+        return _geoip_reader
+    path = get_geoip_db_path()
+    if not path:
+        return None
+    try:
+        _geoip_reader = maxminddb.open_database(path)
+        _geoip_path = path
+        log.info(f"GeoIP 数据库已加载: {path}")
+        return _geoip_reader
+    except Exception as e:
+        log.error(f"加载 GeoIP 数据库失败 ({path}): {e}")
+        return None
+
+
+def download_geoip_db(force: bool = False) -> Optional[str]:
+    """下载 GeoIP 数据库到 user_data 目录，返回下载后的路径，失败返回 None"""
+    target = os.path.join(USER_DATA_DIR, "Country.mmdb")
+    if not force and os.path.isfile(target) and os.path.getsize(target) > 1000:
+        return target
+    ensure_user_data_dir()
+    for url in GEOIP_MMDB_DOWNLOAD_URLS:
+        try:
+            log.info(f"下载 GeoIP 数据库: {url}")
+            data = download_config(url, timeout=60)
+            if len(data) < 1000:
+                raise ValueError(f"下载文件太小: {len(data)} bytes")
+            with open(target, "wb") as f:
+                f.write(data)
+            log.info(f"GeoIP 数据库已下载: {target} ({len(data)} bytes)")
+            return target
+        except Exception as e:
+            log.warning(f"下载 GeoIP 失败 ({url}): {e}")
+            continue
+    return None
+
+
+# 国家代码 → 中文名 / 国旗 emoji
+COUNTRY_NAMES = {
+    "CN": "中国", "HK": "香港", "TW": "台湾", "MO": "澳门",
+    "JP": "日本", "KR": "韩国", "SG": "新加坡", "MY": "马来西亚",
+    "TH": "泰国", "VN": "越南", "ID": "印度尼西亚", "PH": "菲律宾",
+    "IN": "印度", "PK": "巴基斯坦",
+    "US": "美国", "CA": "加拿大", "MX": "墨西哥",
+    "GB": "英国", "DE": "德国", "FR": "法国", "IT": "意大利", "ES": "西班牙",
+    "NL": "荷兰", "RU": "俄罗斯", "TR": "土耳其", "UA": "乌克兰",
+    "AU": "澳大利亚", "NZ": "新西兰",
+    "BR": "巴西", "AR": "阿根廷",
+    "ZA": "南非", "EG": "埃及",
+    "AE": "阿联酋", "SA": "沙特阿拉伯", "IL": "以色列",
+    "SE": "瑞典", "NO": "挪威", "FI": "芬兰", "CH": "瑞士", "AT": "奥地利",
+    "PL": "波兰", "IE": "爱尔兰", "BE": "比利时", "PT": "葡萄牙", "GR": "希腊",
+    "CZ": "捷克", "HU": "匈牙利", "RO": "罗马尼亚",
+}
+
+# 常用国旗 emoji
+def country_flag(code: str) -> str:
+    """国家代码 → 国旗 emoji（如 'US' → '🇺🇸'）"""
+    if not code or len(code) != 2:
+        return "🌐"
+    try:
+        return "".join(chr(0x1F1E6 + ord(c) - ord('A')) for c in code.upper())
+    except Exception:
+        return "🌐"
+
+
+def lookup_country(ip: str) -> Optional[str]:
+    """查 IP 的国家代码（2 字母 ISO），未找到返回 None"""
+    reader = get_geoip_reader()
+    if not reader or not ip:
+        return None
+    try:
+        r = reader.get(ip)
+        if r and "country" in r:
+            return r["country"].get("iso_code")
+    except Exception:
+        return None
+    return None
+
+
+def resolve_server_country(server: str) -> Optional[str]:
+    """节点 server → 国家代码。server 可能是 IP 或域名（先 DNS 解析）"""
+    if not server:
+        return None
+    # 已经是 IP
+    try:
+        socket.inet_aton(server)  # IPv4
+        return lookup_country(server)
+    except OSError:
+        pass
+    # 是域名，做 DNS 解析
+    try:
+        ip = socket.gethostbyname(server)
+        return lookup_country(ip)
+    except Exception:
+        return None
+
+
+def get_node_countries_for_config(config_text: str) -> Dict[str, str]:
+    """从 config 文本中提取每个 proxy 节点对应的国家代码
+
+    返回 {"proxy_name": "US", ...}
+    """
+    result = {}
+    try:
+        cfg = parse_clash_yaml(config_text)
+    except Exception:
+        return result
+    if not isinstance(cfg, dict):
+        return result
+    for proxy in cfg.get("proxies", []):
+        if not isinstance(proxy, dict):
+            continue
+        name = proxy.get("name")
+        server = proxy.get("server")
+        if name and server:
+            country = resolve_server_country(server)
+            if country:
+                result[name] = country
+    return result
+
+
+# ========== 国家筛选设置（Batch 2） ==========
+
+def load_country_whitelist() -> List[str]:
+    """读取用户设置的国家白名单（空列表表示不筛选）"""
+    settings_path = os.path.join(USER_DATA_DIR, "settings.json")
+    if not os.path.isfile(settings_path):
+        return []
+    try:
+        with open(settings_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        wl = data.get("country_whitelist", [])
+        if isinstance(wl, list):
+            return [c for c in wl if isinstance(c, str) and len(c) == 2]
+    except Exception as e:
+        log.warning(f"读取国家白名单失败: {e}")
+    return []
+
+
+def save_country_whitelist(countries: List[str]):
+    """保存国家白名单到 user_data/settings.json"""
+    settings_path = os.path.join(USER_DATA_DIR, "settings.json")
+    ensure_user_data_dir()
+    data = {}
+    if os.path.isfile(settings_path):
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    data["country_whitelist"] = [c for c in countries if isinstance(c, str) and len(c) == 2]
+    try:
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.error(f"保存国家白名单失败: {e}")
+
+
+def filter_proxies_by_country(config_text: str, countries: List[str]) -> str:
+    """根据国家白名单过滤 config 中的 proxies 和 proxy-groups 引用
+
+    countries: 空列表表示不过滤
+    返回过滤后的 config 文本
+    """
+    if not countries:
+        return config_text
+    try:
+        cfg = parse_clash_yaml(config_text)
+    except Exception:
+        return config_text
+    if not isinstance(cfg, dict):
+        return config_text
+
+    proxies = cfg.get("proxies", [])
+    if not isinstance(proxies, list):
+        return config_text
+
+    # 1. 标记保留的 proxy 名字
+    keep_names = set()
+    removed_names = set()
+    for p in proxies:
+        if not isinstance(p, dict):
+            continue
+        name = p.get("name")
+        server = p.get("server")
+        if not name:
+            continue
+        country = resolve_server_country(server) if server else None
+        if country and country in countries:
+            keep_names.add(name)
+        else:
+            removed_names.add(name)
+
+    log.info(f"国家筛选: 保留 {len(keep_names)} 个, 移除 {len(removed_names)} 个 (白名单: {countries})")
+
+    if not keep_names:
+        log.warning("国家筛选后没有保留任何节点，跳过筛选")
+        return config_text
+
+    # 2. 过滤 proxies 段
+    cfg["proxies"] = [p for p in proxies if isinstance(p, dict) and p.get("name") in keep_names]
+
+    # 3. 清理 proxy-groups 里的引用
+    for group in cfg.get("proxy-groups", []):
+        if not isinstance(group, dict):
+            continue
+        # proxies 列表
+        if "proxies" in group and isinstance(group["proxies"], list):
+            group["proxies"] = [
+                x for x in group["proxies"]
+                if (isinstance(x, str) and x in keep_names) or x not in removed_names
+            ]
+            # 如果组里全空了，至少保留 DIRECT/REJECT
+            if not group["proxies"]:
+                group["proxies"] = ["DIRECT"]
+
+    # 4. 序列化回 yaml
+    try:
+        import io
+        buf = io.StringIO()
+        yaml.safe_dump(cfg, buf, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        return buf.getvalue()
+    except Exception as e:
+        log.error(f"序列化筛选后 config 失败: {e}")
+        return config_text
 
 COLOR_RED = "#C62828"
 COLOR_RED_LIGHT = "#EF5350"
@@ -1421,6 +1681,28 @@ def save_config(quick_dir, config_data):
                 advanced_text += fp_match.group(0)
         except Exception:
             pass
+    # Batch 2: 国家白名单过滤（在写入前生效）
+    try:
+        wl = load_country_whitelist()
+    except Exception:
+        wl = []
+    if wl:
+        try:
+            text = config_data.decode("utf-8", errors="ignore") if isinstance(config_data, (bytes, bytearray)) else config_data
+            filtered_text = filter_proxies_by_country(text, wl)
+            if filtered_text != text:
+                removed_n = text.count("- name:") - filtered_text.count("- name:")
+                # yaml 序列化后用 # 开头注释会破坏结构，所以重新计数
+                try:
+                    before = parse_clash_yaml(text).get("proxies", [])
+                    after = parse_clash_yaml(filtered_text).get("proxies", [])
+                    removed_n = max(0, len(before) - len(after))
+                except Exception:
+                    pass
+                log.info(f"国家筛选生效: 保留 {sorted(set(c.upper() for c in wl))}, 过滤 {removed_n} 个节点")
+                config_data = filtered_text.encode("utf-8")
+        except Exception as e:
+            log.warning(f"国家筛选失败（已跳过）: {e}")
     # 写入新配置
     with open(config_path, 'wb') as f:
         f.write(config_data)
@@ -3300,10 +3582,11 @@ class MainWindow(QMainWindow):
         ], help_btn=proxy_service_help_btn)
 
     def _build_line_service_panel(self):
-        """线路服务大面板：标题「线路服务」+ 4 个子卡片（线路状态 / 线路列表 / 智能线路 / 我的订阅）"""
+        """线路服务大面板：标题「线路服务」+ 5 个子卡片（线路状态 / 线路列表 / 国家筛选 / 我的订阅 / 智能线路）"""
         return self._build_panel_card("线路服务", [
             self._build_line_test_card(),
             self._build_line_list_card(),
+            self._build_country_filter_card(),
             self._build_subscription_card(),
             self._build_smart_line_card(),
         ])
@@ -3577,6 +3860,136 @@ class MainWindow(QMainWindow):
             log.warning(f"重建线路行失败: {e}")
         # 拉伸项
         self._line_rows_layout.addStretch(1)
+
+    def _build_country_filter_card(self):
+        """国家筛选子卡片：选择需要代理的 IP 区域/国家，保存 config 时自动过滤节点
+        （Batch 2）
+        """
+        card = QFrame()
+        card.setObjectName("switch-row")
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(14, 8, 14, 8)
+        outer.setSpacing(6)
+
+        # 标题行
+        title_row = QHBoxLayout()
+        title = QLabel("🌍 国家筛选")
+        title.setStyleSheet(f"font-size: 9pt; font-weight: bold; color: {COLOR_TEXT};")
+        title_row.addWidget(title)
+        title_row.addWidget(_make_help_btn(
+            "国家/地区筛选",
+            "国家筛选说明",
+            "【国家筛选】\n"
+            "选择你需要的代理出口国家/地区，保存 config 时会过滤掉不在白名单中的节点。\n"
+            "适用于：\n"
+            "• 只想用某些地区的节点（如只用日本/美国）\n"
+            "• 机场节点太多，加载慢，按地区精简\n"
+            "• 测试某地区连通性\n\n"
+            "【原理】\n"
+            "本软件内置 GeoIP 库（Country.mmdb），节点下载完成后会按节点 server 域名/IP 解析国家，\n"
+            "不在白名单的节点会被剔除，proxy-groups 里对这些节点的引用也会一并清理。\n"
+            "未选任何国家 = 不筛选 = 保留所有节点。\n\n"
+            "【生效时机】\n"
+            "下一次点击「使用」某条线路时，自动按当前白名单过滤。\n"
+            "也可以点「重新下载」强制重下并应用。"
+        ))
+        title_row.addStretch()
+        outer.addLayout(title_row)
+
+        # 摘要 + 按钮行
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        self._country_filter_summary = QLabel("当前: 全部 (未筛选)")
+        self._country_filter_summary.setStyleSheet("color: #aaa; font-size: 8pt;")
+        self._country_filter_summary.setWordWrap(True)
+        action_row.addWidget(self._country_filter_summary, stretch=1)
+        # 选择按钮
+        select_btn = QPushButton("🌍 选择国家")
+        select_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        select_btn.setFixedHeight(26)
+        select_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; "
+            f"font-size: 8pt; font-weight: bold; border-radius: 4px; border: none; padding: 0 12px; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
+        )
+        select_btn.clicked.connect(self._on_select_countries)
+        action_row.addWidget(select_btn)
+        # 清空按钮
+        clear_btn = QPushButton("清空")
+        clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear_btn.setFixedHeight(26)
+        clear_btn.setStyleSheet(
+            f"QPushButton {{ background-color: #2a2a2a; color: {COLOR_TEXT}; "
+            f"font-size: 8pt; border-radius: 4px; border: 1px solid {COLOR_BORDER}; padding: 0 12px; }}"
+            f"QPushButton:hover {{ background-color: #3a3a3a; }}"
+        )
+        clear_btn.clicked.connect(self._on_clear_country_filter)
+        action_row.addWidget(clear_btn)
+        outer.addLayout(action_row)
+
+        # 初始化摘要
+        self._refresh_country_filter_summary()
+        return card
+
+    def _refresh_country_filter_summary(self):
+        """刷新国家筛选摘要文字"""
+        if not hasattr(self, "_country_filter_summary"):
+            return
+        try:
+            wl = load_country_whitelist()
+        except Exception:
+            wl = []
+        if not wl:
+            self._country_filter_summary.setText("当前: 全部 (未筛选)")
+            self._country_filter_summary.setStyleSheet("color: #aaa; font-size: 8pt;")
+        else:
+            codes = sorted(set(c.upper() for c in wl if c))
+            chips = " ".join(f"{country_flag(c)} {COUNTRY_NAMES.get(c, c)}" for c in codes[:8])
+            if len(codes) > 8:
+                chips += f" …(+{len(codes) - 8})"
+            self._country_filter_summary.setText(f"已选 {len(codes)} 个: {chips}")
+            self._country_filter_summary.setStyleSheet(f"color: {COLOR_GREEN}; font-size: 8pt;")
+
+    def _on_select_countries(self):
+        """打开国家多选对话框"""
+        try:
+            current = load_country_whitelist()
+        except Exception:
+            current = []
+        dlg = CountryFilterDialog(current, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_sel = dlg.get_selected()
+            try:
+                save_country_whitelist(new_sel)
+            except Exception as e:
+                QMessageBox.critical(self, "保存失败", f"保存国家白名单失败: {e}")
+                return
+            self._refresh_country_filter_summary()
+            n = len(new_sel)
+            if n == 0:
+                QMessageBox.information(self, "已保存", "已清空国家筛选，下次保存 config 将保留所有节点。")
+            else:
+                QMessageBox.information(
+                    self, "已保存",
+                    f"已保存 {n} 个国家到白名单。\n下次点击「使用」线路时会自动按白名单过滤。\n"
+                    f"如要立即生效，请重新点「使用」目标线路。"
+                )
+
+    def _on_clear_country_filter(self):
+        """清空国家筛选"""
+        try:
+            current = load_country_whitelist()
+        except Exception:
+            current = []
+        if not current:
+            return
+        try:
+            save_country_whitelist([])
+        except Exception as e:
+            QMessageBox.critical(self, "清空失败", f"{e}")
+            return
+        self._refresh_country_filter_summary()
 
     def _build_subscription_card(self):
         """我的订阅子卡片：添加订阅表单 + 已有订阅列表"""
@@ -9125,6 +9538,230 @@ class MainWindow(QMainWindow):
         except Exception:
             self.raise_()
             self.activateWindow()
+
+
+class CountryFilterDialog(QDialog):
+    """国家多选对话框：搜索 + 全选/清空 + 5 列网格 + 确认/取消
+
+    Batch 2
+    """
+
+    # 热门国家放前面（按用户使用频率排序）
+    HOT_COUNTRIES = [
+        "CN", "HK", "TW", "JP", "KR", "SG", "US", "GB", "DE", "FR",
+        "CA", "AU", "MY", "TH", "PH", "VN", "ID", "IN", "RU", "BR",
+        "NL", "IT", "ES", "SE", "NO", "FI", "CH", "AT", "BE", "IE",
+        "PL", "TR", "AE", "SA", "IL", "EG", "ZA", "MX", "AR", "CL",
+        "NZ", "UA", "CZ", "PT", "GR", "HU", "DK", "RO", "BG", "NG",
+    ]
+
+    def __init__(self, current: List[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("选择国家/地区")
+        self.setMinimumSize(720, 560)
+        self.resize(780, 620)
+        # 暗黑风格
+        self.setStyleSheet(
+            f"QDialog {{ background-color: {COLOR_BG}; color: {COLOR_TEXT}; }}"
+            f"QLineEdit {{ background-color: #111; color: {COLOR_TEXT}; border: 1px solid {COLOR_BORDER}; "
+            f"border-radius: 4px; padding: 5px 8px; font-size: 9pt; }}"
+            f"QLabel {{ color: {COLOR_TEXT}; }}"
+        )
+        self._checkboxes: Dict[str, QCheckBox] = {}
+        self._selected: set = set(c.upper() for c in current if c)
+        self._build_ui()
+        self._sync_checkboxes()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        # 顶部说明
+        tip = QLabel("勾选你需要的代理出口国家/地区，保存后下次使用线路时自动按白名单过滤节点。")
+        tip.setStyleSheet("color: #aaa; font-size: 8pt;")
+        tip.setWordWrap(True)
+        root.addWidget(tip)
+
+        # 搜索 + 计数 + 全选/清空
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(6)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("🔍 搜索国家 / 地区 (中文/英文/代码)")
+        self.search_edit.textChanged.connect(self._on_search_changed)
+        toolbar.addWidget(self.search_edit, stretch=1)
+        # 计数
+        self.count_lbl = QLabel("已选 0")
+        self.count_lbl.setStyleSheet(f"color: {COLOR_GREEN}; font-size: 8pt; font-weight: bold; padding: 0 4px;")
+        toolbar.addWidget(self.count_lbl)
+        # 全选
+        all_btn = QPushButton("全选")
+        all_btn.setFixedHeight(26)
+        all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        all_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {COLOR_BLUE}; color: #fff; font-size: 8pt; "
+            f"border-radius: 4px; border: none; padding: 0 10px; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_BLUE_LIGHT}; }}"
+        )
+        all_btn.clicked.connect(self._on_select_all_visible)
+        toolbar.addWidget(all_btn)
+        # 清空
+        none_btn = QPushButton("清空")
+        none_btn.setFixedHeight(26)
+        none_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        none_btn.setStyleSheet(
+            f"QPushButton {{ background-color: #2a2a2a; color: {COLOR_TEXT}; font-size: 8pt; "
+            f"border-radius: 4px; border: 1px solid {COLOR_BORDER}; padding: 0 10px; }}"
+            f"QPushButton:hover {{ background-color: #3a3a3a; }}"
+        )
+        none_btn.clicked.connect(self._on_clear_all)
+        toolbar.addWidget(none_btn)
+        root.addLayout(toolbar)
+
+        # 滚动区 + 5 列网格
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(
+            f"QScrollArea {{ background-color: {COLOR_BG}; border: 1px solid {COLOR_BORDER}; border-radius: 4px; }}"
+            f"QScrollArea > QWidget > QWidget {{ background-color: {COLOR_BG}; }}"
+        )
+        grid_widget = QWidget()
+        grid_widget.setStyleSheet(f"background-color: {COLOR_BG};")
+        self.grid_layout = QGridLayout(grid_widget)
+        self.grid_layout.setContentsMargins(10, 10, 10, 10)
+        self.grid_layout.setHorizontalSpacing(8)
+        self.grid_layout.setVerticalSpacing(4)
+        scroll.setWidget(grid_widget)
+        root.addWidget(scroll, stretch=1)
+
+        # 顺序：热门国家 → 全部国家
+        all_codes = self.HOT_COUNTRIES + sorted(
+            c for c in COUNTRY_NAMES.keys() if c not in self.HOT_COUNTRIES
+        )
+        # 去重
+        seen = set()
+        self._ordered_codes = []
+        for c in all_codes:
+            if c and c not in seen:
+                seen.add(c)
+                self._ordered_codes.append(c)
+        for code in self._ordered_codes:
+            name = COUNTRY_NAMES.get(code, code)
+            flag = country_flag(code)
+            chk = QCheckBox(f"{flag}  {name}  ({code})")
+            chk.setCursor(Qt.CursorShape.PointingHandCursor)
+            chk.setStyleSheet(
+                f"QCheckBox {{ color: {COLOR_TEXT}; spacing: 6px; font-size: 9pt; padding: 2px 4px; }}"
+                f"QCheckBox:hover {{ color: {COLOR_GREEN}; }}"
+                f"QCheckBox::indicator {{ width: 14px; height: 14px; }}"
+            )
+            chk.toggled.connect(lambda checked, c=code: self._on_item_toggled(c, checked))
+            self._checkboxes[code] = chk
+
+        # 5 列布局
+        self._relayout_grid("")
+
+        # 确认/取消
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setFixedHeight(28)
+        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel_btn.setStyleSheet(
+            f"QPushButton {{ background-color: #2a2a2a; color: {COLOR_TEXT}; font-size: 9pt; "
+            f"border-radius: 4px; border: 1px solid {COLOR_BORDER}; padding: 0 20px; }}"
+            f"QPushButton:hover {{ background-color: #3a3a3a; }}"
+        )
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        ok_btn = QPushButton("确认选择")
+        ok_btn.setFixedHeight(28)
+        ok_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        ok_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {COLOR_GREEN}; color: #fff; font-size: 9pt; "
+            f"font-weight: bold; border-radius: 4px; border: none; padding: 0 20px; }}"
+            f"QPushButton:hover {{ background-color: #2E7D32; }}"
+        )
+        ok_btn.clicked.connect(self.accept)
+        btn_row.addWidget(ok_btn)
+        root.addLayout(btn_row)
+
+    def _relayout_grid(self, keyword: str):
+        """按 keyword 过滤后重新摆放到 5 列网格里"""
+        # 清空旧位置
+        while self.grid_layout.count():
+            item = self.grid_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                # 立即重新加入下方（不能 deleteLater，会失去引用）
+        kw = (keyword or "").strip().lower()
+        cols = 5
+        row = 0
+        col = 0
+        for code in self._ordered_codes:
+            chk = self._checkboxes.get(code)
+            if not chk:
+                continue
+            name = COUNTRY_NAMES.get(code, code)
+            label_text = f"{country_flag(code)}  {name}  ({code})".lower()
+            if kw and kw not in label_text and kw not in code.lower():
+                chk.hide()
+                continue
+            chk.show()
+            self.grid_layout.addWidget(chk, row, col)
+            col += 1
+            if col >= cols:
+                col = 0
+                row += 1
+        # 如果全部被过滤，添加一个占位提示
+        if self.grid_layout.count() == 0:
+            placeholder = QLabel("（无匹配的国家）")
+            placeholder.setStyleSheet("color: #666; font-size: 9pt; padding: 20px;")
+            placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.grid_layout.addWidget(placeholder, 0, 0, 1, cols)
+        # 占位
+        self.grid_layout.setRowStretch(self.grid_layout.rowCount(), 1)
+
+    def _on_search_changed(self, text: str):
+        self._relayout_grid(text)
+
+    def _on_item_toggled(self, code: str, checked: bool):
+        if checked:
+            self._selected.add(code)
+        else:
+            self._selected.discard(code)
+        self._update_count()
+
+    def _on_select_all_visible(self):
+        # 仅勾选当前可见项
+        for code, chk in self._checkboxes.items():
+            if chk.isVisible():
+                chk.setChecked(True)
+        self._update_count()
+
+    def _on_clear_all(self):
+        for chk in self._checkboxes.values():
+            chk.setChecked(False)
+        self._update_count()
+
+    def _sync_checkboxes(self):
+        """根据已选集合同步勾选状态"""
+        for code, chk in self._checkboxes.items():
+            chk.setChecked(code in self._selected)
+        self._update_count()
+
+    def _update_count(self):
+        n = len(self._selected)
+        self.count_lbl.setText(f"已选 {n}")
+        if n == 0:
+            self.count_lbl.setStyleSheet("color: #888; font-size: 8pt; font-weight: bold; padding: 0 4px;")
+        else:
+            self.count_lbl.setStyleSheet(f"color: {COLOR_GREEN}; font-size: 8pt; font-weight: bold; padding: 0 4px;")
+
+    def get_selected(self) -> List[str]:
+        return sorted(self._selected)
+
 
 def _global_exception_handler(exc_type, exc_value, exc_tb):
     import traceback
