@@ -972,11 +972,38 @@ def test_direct_latency(timeout=NODE_TEST_TIMEOUT):
         return float('inf')
 
 
-def download_config(url, timeout=8):
+def download_config(url, timeout=10):
+    """下载配置文件，使用多级回退策略保证成功率
+
+    策略（按优先级）：
+    1. 强制直连（ProxyHandler({})），绕过 Windows 系统代理/HTTPS_PROXY 环境变量
+       —— 解决 mihomo 代理"端口在但上游坏掉"导致的 SSL EOF 死循环
+    2. 走 PROXY_URL（应用代理，is_proxy_running() 时）—— 给无法直连的用户留通道
+    3. 走 urllib.request.urlopen()，尊重环境代理 —— 兜底
+    4. 显式走 127.0.0.1:7890 —— 最后兜底
+    """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+
+    # 层级 1：强制直连（关键修复）
+    # 用空的 ProxyHandler 显式覆盖 Windows 系统代理/HTTPS_PROXY 环境变量，
+    # 避免下载请求被转发到"端口在但上游坏掉"的本地 mihomo 代理
+    try:
+        proxy_handler = urllib.request.ProxyHandler({})
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ctx),
+            proxy_handler,
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with opener.open(req, timeout=timeout) as resp:
+            data = resp.read()
+            log.debug(f"直连下载成功 ({url})")
+            return data
+    except Exception as e:
+        log.debug(f"强制直连失败 ({url}): {type(e).__name__}: {e}")
+
+    # 层级 2：走 PROXY_URL（应用代理，代理进程确实在跑时使用）
     if is_proxy_running():
         try:
             proxy_handler = urllib.request.ProxyHandler({
@@ -987,15 +1014,25 @@ def download_config(url, timeout=8):
                 urllib.request.HTTPSHandler(context=ctx),
                 proxy_handler,
             )
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with opener.open(req, timeout=timeout) as resp:
-                return resp.read()
-        except Exception:
-            pass
+                data = resp.read()
+                log.info(f"代理下载成功 ({url})")
+                return data
+        except Exception as e:
+            log.debug(f"走 PROXY_URL 失败 ({url}): {type(e).__name__}: {e}")
+
+    # 层级 3：走 urlopen()，尊重环境代理设置（兜底）
     try:
-        with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
-            return resp.read()
-    except Exception:
-        pass
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
+            data = resp.read()
+            log.info(f"urlopen 下载成功 ({url})")
+            return data
+    except Exception as e:
+        log.debug(f"urlopen 失败 ({url}): {type(e).__name__}: {e}")
+
+    # 层级 4：显式走 127.0.0.1:7890（最后兜底）
     try:
         proxy_handler = urllib.request.ProxyHandler({
             'http': f'http://127.0.0.1:7890',
@@ -1006,10 +1043,13 @@ def download_config(url, timeout=8):
             proxy_handler,
         )
         req2 = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with opener.open(req2, timeout=5) as resp:
-            return resp.read()
-    except Exception:
-        pass
+        with opener.open(req2, timeout=8) as resp:
+            data = resp.read()
+            log.info(f"127.0.0.1:7890 下载成功 ({url})")
+            return data
+    except Exception as e:
+        log.debug(f"127.0.0.1:7890 失败 ({url}): {type(e).__name__}: {e}")
+
     raise urllib.error.URLError("所有下载方式均失败")
 
 
@@ -1025,8 +1065,10 @@ def download_all_configs():
                 log.info(f"{name} 配置下载成功 ({url})")
                 break
             except Exception as e:
-                log.warning(f"{name} 配置下载失败 ({url}): {e}")
+                log.warning(f"{name} 配置下载失败 ({url}): {type(e).__name__}: {e}")
                 continue
+        if config_data is None:
+            log.error(f"{name} 配置所有下载方式均失败")
         with lock:
             results.append((name, config_data))
 
@@ -1036,8 +1078,11 @@ def download_all_configs():
         t.start()
         threads.append(t)
     for t in threads:
-        t.join(timeout=30)
-    return [(n, d) for n, d in results if d is not None]
+        t.join(timeout=60)  # 增加超时：每条线路最坏 10+10+8+8=36s，留 60s 余量
+    succeeded = [(n, d) for n, d in results if d is not None]
+    failed = [n for n, d in results if d is None]
+    log.info(f"下载汇总: 成功 {len(succeeded)} 条, 失败 {len(failed)} 条 {failed if failed else ''}")
+    return succeeded
 
 
 def save_config(quick_dir, config_data):
