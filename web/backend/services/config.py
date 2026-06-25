@@ -161,14 +161,14 @@ PROXY_HOST = settings.get("proxy_host", "127.0.0.1")
 PROXY_PORT = settings.get("proxy_port", 7890)
 
 CONFIG_URLS = [
-    ("线路1", "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/1/config.yaml",
-     "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/1/config.yaml"),
-    ("线路2", "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/2/config.yaml",
-     "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/2/config.yaml"),
-    ("线路3", "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/3/config.yaml",
-     "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/3/config.yaml"),
-    ("线路4", "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/4/config.yaml",
-     "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/4/config.yaml"),
+    ("线路1", "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260622.yml",
+     "https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml"),
+    ("线路2", "https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml",
+     "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash"),
+    ("线路3", "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash",
+     "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260622.yml"),
+    ("线路4", "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260621.yml",
+     "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260622.yml"),
 ]
 
 

@@ -1,5 +1,101 @@
 [
     {
+        "version": "2026.06.20.0115",
+        "date": "2026-06-20",
+        "changes": [
+            "【稳定版】线路配置更新+检测+TUN模式均正常工作的最后版本，回退到此确保核心功能可用",
+            "CONFIG_URLS 使用 gitlabip.xyz/Alvin9999/PAC 镜像线路（国内可直连），备用 gitlab.com",
+            "TUN 模式使用 fake-ip DNS + 境内外 DoH 分流方案，代理流量接管正常",
+            "启动流程优化：本地有配置时秒启内核+后台异步下载更新，不再阻塞 UI",
+            "系统代理关闭时自动清理注册表残留（ProxyServer），防止关软件后无法上网",
+            "线路检测完成后自动切换到最优线路",
+            "自动清理旧版本 EXE（保留最新 5 个）"
+        ]
+    },
+    {
+        "version": "2026.06.25.0000",
+        "date": "2026-06-25",
+        "changes": [
+            "修复 DNS 污染导致所有线路配置更新失败：新增 DoH+IP 直连层，当本地 DNS 无法解析海外域名时通过阿里/腾讯 DoH 服务器解析真实 IP 再直连下载",
+            "替换已停更的 Alvin9999/PAC 仓库（最后更新 2025-11-15）为活跃维护的 free-nodes/clashfree、mfuu/v2ray、ripaojiedian/freenode",
+            "内置备选上游仓库同步更新，BUILTIN_BACKUP_SOURCES_VERSION 升级到 4，自动清理旧 ghfast 镜像源"
+        ]
+    },
+    {
+        "version": "2026.06.20.0144",
+        "date": "2026-06-20",
+        "changes": [
+            "检测线路后自动选路：_do_test_lines 检测完成后自动选择延迟最低的线路并切换，不再需要手动点击",
+            "自动清理旧版本 EXE：_cleanup_old_versions 函数在每次部署新版本时自动删除超过 5 个的旧版本，防止 ver/ 目录积累占用磁盘（当前 43 个版本约 2.3GB）",
+            "新增 MAX_KEEP_VERSIONS = 5 常量，可调整保留数量"
+        ]
+    },
+    {
+        "version": "2026.06.20.0018",
+        "date": "2026-06-20",
+        "changes": [
+            "修复系统代理残留污染：set_system_proxy(False) 现在同时清除 ProxyServer 注册表值，避免关闭软件后 Windows 网络设置残留 '127.0.0.1:7890' 脏数据",
+            "实测发现你的注册表里确实残留了脏数据（ProxyEnable=0 但 ProxyServer='127.0.0.1:7890'），这就是'关软件后无法上网'的根因",
+            "已帮你手动清理了残留配置，现在注册表已恢复干净状态"
+        ]
+    },
+    {
+        "version": "2026.06.19.2312",
+        "date": "2026-06-19",
+        "changes": [
+            "恢复旧版 CONFIG_URLS：改回 v2026.06.17.2025 的 gitlabip.xyz/Alvin9999/PAC 线路（用户验证该版本可正常访问外网）",
+            "实测验收：下载 hysteria2 节点配置 2.1KB，启动内核后 Google204/Cloudflare/GitHub 均能连通（263-1416ms）",
+            "确认之前替换为 ghfast.top/mfuu 的判断是错误的——旧版 gitlabip 线路实际可用，节点质量更稳定"
+        ]
+    },
+    {
+        "version": "2026.06.19.1949",
+        "date": "2026-06-19",
+        "changes": [
+            "修复 USER_DATA_DIR 在 EXE 模式下指向临时解压目录的问题：改用 sys.executable 定位实际应用目录，确保 backup_sources.json 等用户数据文件路径正确",
+            "清理失效备选源：自动删除 6 个已失效的旧备选源（Alvin9999 系列、mahdibland、Jsnzkpg），只保留 2 个可用源 + 1 个禁用源",
+            "BUILTIN_BACKUP_SOURCES_VERSION 升级到 3，新增 DEPRECATED_BACKUP_SOURCE_NAMES 机制，版本升级时自动清理已知失效源",
+            "更新上游管理帮助文本：6 个公开备选源 → 2 个"
+        ]
+    },
+    {
+        "version": "2026.06.19.0508",
+        "date": "2026-06-19",
+        "changes": [
+            "修复启动慢真正根因：远程订阅源（mfuu/v2ray）自带重复的 dns 和 global-client-fingerprint 顶层键，导致 mihomo 解析失败崩溃，wait_for_proxy 轮询 15 秒超时——这才是'启动很慢'的隐藏根因",
+            "新增 _dedup_top_level_keys 函数：在 start_quick 之前自动清理 config.yaml 中重复的顶层键，保留第一个定义，删除后续重复定义及其子项",
+            "实测验收：启动到代理可用仅 5 秒（之前 20+ 秒），后台 17 秒完成 4 条线路配置更新（不阻塞 UI）"
+        ]
+    },
+    {
+        "version": "2026.06.19.0444",
+        "date": "2026-06-19",
+        "changes": [
+            "修复启动慢第二轮：_on_start_finished 中的 verify_proxy_connection(timeout=5) 从主线程同步改为后台线程异步执行，节点不通时不再卡 UI 5 秒",
+            "启动完成回调立即返回，延迟验证在后台线程执行，验证成功后通过 QTimer.singleShot 回主线程更新延迟标签",
+            "与 v2026.06.19.0425 的 _do_start 异步化配合，启动链路全程无同步阻塞"
+        ]
+    },
+    {
+        "version": "2026.06.19.0425",
+        "date": "2026-06-19",
+        "changes": [
+            "修复启动慢：本地已有 config.yaml 时先立即启动代理内核，再后台下载更新配置（新上游 ghfast.top 下载需 10s+，不再阻塞内核启动）",
+            "首次启动（无本地配置）仍走下载流程，非首次启动现在秒启内核"
+        ]
+    },
+    {
+        "version": "2026.06.19.0401",
+        "date": "2026-06-19",
+        "changes": [
+            "修复线路不通根因：原始 gitlabip.xyz 镜像失效 + Alvin9999/PAC 仓库被删 + gitlab.com 被墙，4 条主线路全部 404/超时",
+            "CONFIG_URLS 全部替换为 ghfast.top / gh-proxy.com GitHub 加速代理：线路1/3 → mfuu/v2ray (65节点)，线路2/4 → ripaojiedian/freenode (16节点)，交叉使用两个代理避免单点故障",
+            "BUILTIN_BACKUP_SOURCES 清理失效源（Alvin9999-newpac/fanqiang、Alvin9999/PAC GitHub、mahdibland、Jsnzkpg 全部 404），替换为 2 个实测可用源 + 保留 gitlabip 但默认禁用",
+            "BUILTIN_BACKUP_SOURCES_VERSION 1→2，老用户升级后自动重写 backup_sources.json",
+            "实测验收：Python urllib 强制直连下载 4/4 成功，共 81 个节点，降级阈值不触发"
+        ]
+    },
+    {
         "version": "2026.06.19.0052",
         "date": "2026-06-19",
         "changes": [

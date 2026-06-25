@@ -1,0 +1,9 @@
+admin.html 已重构，新文件大小: 13542
+含 shell.js: True
+含 page-content: True
+含 data-page=admin: True
+残留 <header>: 1
+account.html 已创建: 9536 bytes
+警告：未找到 /admin 路由模板，请检查 server.js
+未找到 /admin 路由
+--- 完成 ---

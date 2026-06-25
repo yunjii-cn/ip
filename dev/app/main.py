@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import json
 import socket
 import ssl
+import http.client
 import shutil
 import time
 import threading
@@ -169,27 +170,46 @@ PROXY_URL = f"{PROXY_HOST}:{PROXY_PORT}"
 def _update_proxy_url():
     global PROXY_HOST, PROXY_PORT, PROXY_URL
     PROXY_URL = f"{PROXY_HOST}:{PROXY_PORT}"
-NODE_TEST_TIMEOUT = 3
+NODE_TEST_TIMEOUT = 6
 NODE_TEST_URL = "https://www.gstatic.com/generate_204"
+# 线路检测 URL：境内+境外混合
+# - 境外：验证代理能翻墙访问外网（核心目标）
+# - 境内：兜底，当境外域名首包慢/被重置时，至少能确认「代理内核本身是通的」
+# 任一 URL 成功即判定该线路可用，避免误判整条线路超时
 NODE_TEST_URLS = [
     ("Google", "https://www.gstatic.com/generate_204"),
+    ("Baidu", "https://www.baidu.com/"),
     ("Cloudflare", "https://cp.cloudflare.com/"),
 ]
 
 CONFIG_URLS = [
-    ("线路1", "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/1/config.yaml",
-     "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/1/config.yaml"),
-    ("线路2", "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/2/config.yaml",
-     "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/2/config.yaml"),
-    ("线路3", "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/3/config.yaml",
-     "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/3/config.yaml"),
-    ("线路4", "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/4/config.yaml",
-     "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/4/config.yaml"),
+    # 活跃维护的免费节点仓库（GitHub raw），通过 DoH+IP 层绕过 DNS 污染
+    # 备选 GitLab 源作为直连回退
+    ("线路1", "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260622.yml",
+     "https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml"),
+    ("线路2", "https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml",
+     "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash"),
+    ("线路3", "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash",
+     "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260622.yml"),
+    ("线路4", "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260621.yml",
+     "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260622.yml"),
 ]
 
 # ========== 自定义订阅（Batch 1） ==========
 
-USER_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_data")
+# EXE 模式下 __file__ 指向 _MEIPASS 临时解压目录，需要用 sys.executable 定位实际应用目录
+if getattr(sys, 'frozen', False):
+    _ud_base = os.path.dirname(os.path.abspath(sys.executable))
+    for _ in range(5):
+        if os.path.isfile(os.path.join(_ud_base, '.yunji.lock')) or os.path.isdir(os.path.join(_ud_base, 'app')):
+            break
+        _p = os.path.dirname(_ud_base)
+        if _p == _ud_base:
+            break
+        _ud_base = _p
+    USER_DATA_DIR = os.path.join(_ud_base, 'app', 'user_data')
+else:
+    USER_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_data")
 SUBSCRIPTIONS_FILE = os.path.join(USER_DATA_DIR, "subscriptions.json")
 
 
@@ -879,64 +899,46 @@ COLOR_ORANGE = "#FF9800"
 # Batch 4: 多上游支持 (备选仓库管理)
 # =====================================================================
 BACKUP_SOURCES_FILE = os.path.join(USER_DATA_DIR, "backup_sources.json")
-BUILTIN_BACKUP_SOURCES_VERSION = 1  # Bump 时会重新写入默认备选源
+BUILTIN_BACKUP_SOURCES_VERSION = 4  # 2026-06-25: 替换失效源为活跃维护的 free-nodes/mfuu/ripaojiedian
+
+# 已知失效的备选源名称（版本升级时自动删除，避免用户看到一堆"未下载"的死源）
+DEPRECATED_BACKUP_SOURCE_NAMES = {
+    "Alvin9999/PAC (gitlabip)",
+    "Alvin9999-newpac/fanqiang (GitHub)",
+    "Alvin9999/PAC (GitHub 原始)",
+    "v2ray-free (GitHub)",
+    "free-nodes (GitHub)",
+    "Jsnzkpg/Jsnzkpg (GitHub)",
+    "mfuu/v2ray (GitHub→ghfast)",         # ghfast.top DNS 污染后失效
+    "ripaojiedian/freenode (GitHub→ghfast)",  # ghfast.top DNS 污染后失效
+}
 
 
 # 内置默认备选上游仓库（首次启动时自动写入 backup_sources.json）
 # 每条: (备注名, 主URL, 备用URL列表, 默认启用?)
 # 备用 URL 会在主 URL 失败时按顺序尝试。多个备用 URL 能大幅提升可达率。
+# 2026-06-25: 替换为活跃维护的免费仓库（free-nodes 每日更新, mfuu/ripaojiedian 持续维护）
+# 使用原始 raw.githubusercontent.com 地址，download_config 内置 DoH+IP 回退
 BUILTIN_BACKUP_SOURCES = [
     (
-        "Alvin9999/PAC (gitlabip)",
-        "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/1/config.yaml",
+        "free-nodes/clashfree (GitHub)",
+        "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260622.yml",
         [
-            "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/2/config.yaml",
-            "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/3/config.yaml",
-            "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/4/config.yaml",
+            "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260621.yml",
+            "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260620.yml",
         ],
         True,
     ),
     (
-        "Alvin9999-newpac/fanqiang (GitHub)",
-        "https://raw.githubusercontent.com/Alvin9999-newpac/fanqiang/master/Clash.yaml",
-        [
-            "https://raw.githubusercontent.com/Alvin9999-newpac/fanqiang/main/Clash.yaml",
-            "https://raw.githubusercontent.com/Alvin9999-newpac/fanqiang/master/free-subscribe/Clash.yaml",
-        ],
+        "mfuu/v2ray (GitHub)",
+        "https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml",
+        [],
         True,
     ),
     (
-        "Alvin9999/PAC (GitHub 原始)",
-        "https://raw.githubusercontent.com/Alvin9999/PAC/master/backup/img/1/2/ipp/quick/1/config.yaml",
-        [
-            "https://raw.githubusercontent.com/Alvin9999/PAC/master/backup/img/1/2/ipp/quick/2/config.yaml",
-            "https://raw.githubusercontent.com/Alvin9999/PAC/master/backup/img/1/2/ipp/quick/3/config.yaml",
-            "https://raw.githubusercontent.com/Alvin9999/PAC/master/backup/img/1/2/ipp/quick/4/config.yaml",
-        ],
-        True,
-    ),
-    (
-        "v2ray-free (GitHub)",
-        "https://raw.githubusercontent.com/ripaojiedian/freenode/main/v2ray.yaml",
-        [
-            "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash.yaml",
-        ],
-        True,
-    ),
-    (
-        "free-nodes (GitHub)",
-        "https://raw.githubusercontent.com/mahdibland/SS-Rule-Snippet/master/LAZY_RULES/Clash.yaml",
-        [
-            "https://raw.githubusercontent.com/mahdibland/Shadowsocks-Config-Filter/main/clash.yaml",
-        ],
-        True,
-    ),
-    (
-        "Jsnzkpg/Jsnzkpg (GitHub)",
-        "https://raw.githubusercontent.com/Jsnzkpg/Jsnzkpg/main/clash.yaml",
-        [
-            "https://raw.githubusercontent.com/Jsnzkpg/Jsnzkpg/master/clash.yaml",
-        ],
+        "ripaojiedian/freenode (GitHub)",
+        "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash",
+        [],
         True,
     ),
 ]
@@ -1076,8 +1078,9 @@ def ensure_builtin_backup_sources():
 
     行为：
     - 如果文件不存在：写入全部内置默认源（保留默认启用状态）
-    - 如果文件已存在：检查文件内记录的版本号，低于 BUILTIN_BACKUP_SOURCES_VERSION
-      时，追加新出现的内置源（已存在的同名条目不动，避免覆盖用户自定义设置）
+    - 如果文件已存在：检查文件内记录的版本号，低于 BUILTIN_BACKUP_SOURCES_VERSION 时：
+      ① 删除已知失效的旧源（DEPRECATED_BACKUP_SOURCE_NAMES）
+      ② 追加新出现的内置源（已存在的同名条目不动，避免覆盖用户自定义设置）
     """
     ensure_user_data_dir()
     try:
@@ -1095,6 +1098,15 @@ def ensure_builtin_backup_sources():
         new_entries: List[BackupSource] = []
 
         if current_version < BUILTIN_BACKUP_SOURCES_VERSION:
+            # ① 清理已知失效的旧源
+            before_count = len(existing)
+            existing = [s for s in existing if s.name not in DEPRECATED_BACKUP_SOURCE_NAMES]
+            removed_count = before_count - len(existing)
+            if removed_count > 0:
+                log.info(f"已清理 {removed_count} 个失效备选上游仓库")
+            existing_names = {s.name for s in existing}
+
+            # ② 追加新出现的内置源
             for name, primary_url, fallback_urls, default_enabled in BUILTIN_BACKUP_SOURCES:
                 if name in existing_names:
                     continue
@@ -1108,10 +1120,11 @@ def ensure_builtin_backup_sources():
                     urls=list(fallback_urls or []),
                 ))
 
-        if new_entries:
+        if new_entries or current_version < BUILTIN_BACKUP_SOURCES_VERSION:
             existing.extend(new_entries)
             save_backup_sources(existing)
-            log.info(f"已自动写入 {len(new_entries)} 个内置备选上游仓库到 {BACKUP_SOURCES_FILE}")
+            if new_entries:
+                log.info(f"已自动写入 {len(new_entries)} 个内置备选上游仓库到 {BACKUP_SOURCES_FILE}")
 
         # 无论是否新增，都更新版本号（防止下次重复检查逻辑执行时漏掉）
         with open(version_file, "w", encoding="utf-8") as f:
@@ -1524,6 +1537,7 @@ if not getattr(sys, 'frozen', False):
     log.addHandler(_console_handler)
 
 
+
 def _self_deploy(exe_dir):
     base_name = BRAND_NAME
     src_exe = os.path.abspath(sys.executable)
@@ -1915,10 +1929,76 @@ def test_direct_latency(timeout=NODE_TEST_TIMEOUT):
         return float('inf')
 
 
+# DNS-over-HTTPS 服务器（国内可达，用于绕过 DNS 污染解析真实 IP）
+_DOH_SERVERS = [
+    "https://dns.alidns.com/resolve",
+    "https://doh.pub/dns-query",
+]
+
+
+def _resolve_via_doh(host):
+    """通过 DNS-over-HTTPS 解析域名真实 IP（绕过本地 DNS 污染）。
+    返回 IPv4 地址列表，全部失败返回空列表。
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    for doh_url in _DOH_SERVERS:
+        try:
+            query_url = f"{doh_url}?name={host}&type=A"
+            req = urllib.request.Request(query_url, headers={
+                "Accept": "application/dns-json",
+                "User-Agent": "Mozilla/5.0",
+            })
+            with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
+                result = json.loads(resp.read())
+                answers = result.get("Answer", [])
+                ips = [a["data"] for a in answers if a.get("type") == 1]
+                if ips:
+                    log.info(f"DoH {doh_url}: {host} -> {ips}")
+                    return ips
+        except Exception as e:
+            log.debug(f"DoH {doh_url} 失败 ({host}): {type(e).__name__}: {e}")
+    return []
+
+
+def _try_doh_ip_download(url, host, ips, timeout):
+    """尝试通过 DoH 解析出的 IP 直连下载（SNI=host, Host header=host）。
+    逐个尝试 IP，第一个成功即返回数据。
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path + ("?" + parsed.query if parsed.query else "")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    for ip in ips:
+        try:
+            sock = socket.create_connection((ip, port), timeout=timeout)
+            ssock = ctx.wrap_socket(sock, server_hostname=host)
+            conn = http.client.HTTPSConnection(ip, port, context=ctx, timeout=timeout)
+            conn.sock = ssock
+            conn.request("GET", path, headers={
+                "Host": host,
+                "User-Agent": "Mozilla/5.0",
+            })
+            resp = conn.getresponse()
+            data = resp.read()
+            conn.close()
+            log.info(f"DoH+IP 直连成功: {host} via {ip} ({len(data)} bytes)")
+            return data
+        except Exception as e:
+            log.debug(f"DoH+IP {ip} 失败 ({host}): {type(e).__name__}: {e}")
+    raise urllib.error.URLError(
+        f"DoH+IP: 所有 IP 均失败 ({host}: {ips})"
+    )
+
+
 def download_config(url, timeout=10):
     """下载配置文件，使用多级回退策略保证成功率
 
     策略（按优先级）：
+    0. DNS-over-HTTPS + IP 直连 —— 绕过本地 DNS 污染，用国内 DoH 解析真实 IP
     1. 强制直连（ProxyHandler({})），绕过 Windows 系统代理/HTTPS_PROXY 环境变量
        —— 解决 mihomo 代理"端口在但上游坏掉"导致的 SSL EOF 死循环
     2. 走 PROXY_URL（应用代理，is_proxy_running() 时）—— 给无法直连的用户留通道
@@ -1929,24 +2009,32 @@ def download_config(url, timeout=10):
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
-    # 层级 1：强制直连（关键修复）
-    # 用空的 ProxyHandler 显式覆盖 Windows 系统代理/HTTPS_PROXY 环境变量，
-    # 避免下载请求被转发到"端口在但上游坏掉"的本地 mihomo 代理
-    try:
-        proxy_handler = urllib.request.ProxyHandler({})
-        opener = urllib.request.build_opener(
-            urllib.request.HTTPSHandler(context=ctx),
-            proxy_handler,
-        )
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with opener.open(req, timeout=timeout) as resp:
-            data = resp.read()
-            log.debug(f"直连下载成功 ({url})")
-            return data
-    except Exception as e:
-        log.debug(f"强制直连失败 ({url}): {type(e).__name__}: {e}")
+    # 解析 URL 获取 hostname
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or ""
 
-    # 层级 2：走 PROXY_URL（应用代理，代理进程确实在跑时使用）
+    # 层级 0：DNS-over-HTTPS + IP 直连（绕过本地 DNS 污染）
+    _FAKE_IP_PREFIXES = ("198.18.", "198.19.")
+    if host and not host.replace(".", "").isdigit():
+        need_doh = False
+        try:
+            addr_info = socket.getaddrinfo(host, 443, socket.AF_INET)
+            resolved_ips = [info[4][0] for info in addr_info]
+            if all(ip.startswith(_FAKE_IP_PREFIXES) for ip in resolved_ips):
+                log.debug(f"DNS 被污染：{host} -> {resolved_ips}（fake-ip），尝试 DoH...")
+                need_doh = True
+        except socket.gaierror:
+            log.debug(f"DNS 解析失败 ({host})，尝试 DoH...")
+            need_doh = True
+        if need_doh:
+            try:
+                ips = _resolve_via_doh(host)
+                if ips:
+                    return _try_doh_ip_download(url, host, ips, timeout)
+            except Exception as e:
+                log.debug(f"DoH+IP 层失败 ({host}): {type(e).__name__}: {e}")
+
+    # 层级 1：走 PROXY_URL（代理进程在跑时优先走代理——国内直连常被封锁）
     if is_proxy_running():
         try:
             proxy_handler = urllib.request.ProxyHandler({
@@ -1964,6 +2052,21 @@ def download_config(url, timeout=10):
                 return data
         except Exception as e:
             log.debug(f"走 PROXY_URL 失败 ({url}): {type(e).__name__}: {e}")
+
+    # 层级 2：强制直连（代理未运行时的回退）
+    try:
+        proxy_handler = urllib.request.ProxyHandler({})
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ctx),
+            proxy_handler,
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with opener.open(req, timeout=timeout) as resp:
+            data = resp.read()
+            log.debug(f"直连下载成功 ({url})")
+            return data
+    except Exception as e:
+        log.debug(f"强制直连失败 ({url}): {type(e).__name__}: {e}")
 
     # 层级 3：走 urlopen()，尊重环境代理设置（兜底）
     try:
@@ -2244,6 +2347,53 @@ def save_config(quick_dir, config_data):
     log.info(f"配置已保存到 {config_path}")
 
 
+def _dedup_top_level_keys(config_path):
+    """去除 config.yaml 中重复的顶层键，避免 mihomo 解析失败崩溃
+
+    远程订阅源（如 mfuu/v2ray）可能自带重复的 dns / global-client-fingerprint 等顶层键，
+    mihomo 解析时会报 "mapping key already defined" 错误并立即退出，
+    导致 wait_for_proxy 轮询 15 秒超时——这是"启动很慢"的隐藏根因。
+    本函数保留每个顶层键的第一次出现，删除后续重复定义及其子项。
+    """
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        # 找出所有顶层键及其行号（行首非空格，匹配 key: 或 key: value）
+        top_level_keys = {}  # key -> list of line indices
+        for i, line in enumerate(lines):
+            m = re.match(r'^([a-zA-Z][a-zA-Z0-9_-]*)\s*:', line)
+            if m:
+                key = m.group(1)
+                top_level_keys.setdefault(key, []).append(i)
+
+        # 找出重复的键
+        dupes = {k: v for k, v in top_level_keys.items() if len(v) > 1}
+        if not dupes:
+            return True  # 无重复
+
+        # 标记需要删除的行（保留第一个，删除后续重复定义及其子项）
+        lines_to_delete = set()
+        for key, line_indices in dupes.items():
+            for start_idx in line_indices[1:]:
+                lines_to_delete.add(start_idx)
+                for j in range(start_idx + 1, len(lines)):
+                    # 子项是缩进行的行（以空格/tab 开头且非空）
+                    if lines[j].startswith((' ', '\t')) and lines[j].strip():
+                        lines_to_delete.add(j)
+                    else:
+                        break
+
+        new_lines = [line for i, line in enumerate(lines) if i not in lines_to_delete]
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+        log.info(f"已去除重复的顶层键: {list(dupes.keys())}")
+        return True
+    except Exception as e:
+        log.warning(f"清理重复顶层键失败: {e}")
+        return False
+
+
 def start_quick(quick_dir):
     quick_exe = os.path.join(quick_dir, "quick.exe")
     if not os.path.isfile(quick_exe):
@@ -2253,6 +2403,8 @@ def start_quick(quick_dir):
     if not os.path.isfile(config_path):
         log.error(f"config.yaml 不存在: {config_path}")
         return False
+    # 启动前清理重复的顶层键，避免 mihomo 解析失败崩溃
+    _dedup_top_level_keys(config_path)
     log.info(f"配置文件大小: {os.path.getsize(config_path)} bytes")
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -2387,8 +2539,12 @@ def set_system_proxy(enable):
                               "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*")
             log.info(f"已开启系统代理: {PROXY_URL}")
         else:
+            # 停止时不仅要关闭开关，还要清除 ProxyServer 残留值，避免污染系统代理配置。
+            # 如果不清除，Windows 网络设置会残留 "127.0.0.1:7890" 这个无效地址，
+            # 导致用户即使关闭软件也无法上网——因为系统仍指向一个不存在的代理。
             winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
-            log.info("已关闭系统代理")
+            winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, "")
+            log.info("已关闭系统代理（清除残留配置）")
         winreg.CloseKey(key)
         INTERNET_OPTION_SETTINGS_CHANGED = 39
         INTERNET_OPTION_REFRESH = 37
@@ -3082,8 +3238,53 @@ class ServiceWorker(QThread):
         if is_proxy_running():
             self.finished.emit(True, "代理已在运行")
             return
-        self.progress.emit("正在获取线路配置...")
         log.info("开始启动代理服务")
+
+        config_path = os.path.join(quick_dir, "config.yaml")
+        has_local_config = os.path.isfile(config_path)
+
+        # 优化启动速度：本地已有 config.yaml 时先立即启动内核，再后台下载更新配置
+        # （新上游 ghfast.top 下载需 10s+，不应阻塞内核启动）
+        if has_local_config:
+            self.progress.emit("正在启动代理内核...")
+            quick_exe = os.path.join(quick_dir, "quick.exe")
+            if not os.path.isfile(quick_exe):
+                self.finished.emit(False, "代理内核不存在，请先更新代理内核")
+                return
+            if not start_quick(quick_dir):
+                self.finished.emit(False, "代理内核启动失败")
+                return
+            if not wait_for_proxy(timeout=15):
+                self.finished.emit(False, "代理内核启动失败")
+                return
+            log.info("代理内核已启动（使用本地配置），后台下载最新配置...")
+            self.finished.emit(True, "代理已启动 (后台更新配置中)")
+
+            # 后台下载最新配置，下载成功后静默覆盖（下次重启生效）
+            saved_line = self.kwargs.get("current_line")
+            def _bg_download():
+                try:
+                    downloaded = download_all_configs()
+                    if downloaded:
+                        selected = None
+                        if saved_line:
+                            for name, data, _src in downloaded:
+                                if name == saved_line:
+                                    selected = (name, data)
+                                    break
+                        if not selected:
+                            selected = (downloaded[0][0], downloaded[0][1])
+                        save_config(quick_dir, selected[1])
+                        self.line_selected.emit(selected[0])
+                        log.info(f"后台配置更新完成: {selected[0]}")
+                except Exception as e:
+                    log.warning(f"后台下载配置失败: {e}")
+            import threading
+            threading.Thread(target=_bg_download, daemon=True).start()
+            return
+
+        # 本地无 config.yaml：必须下载才能启动（首次启动场景）
+        self.progress.emit("正在获取线路配置...")
         downloaded = download_all_configs()
         if downloaded:
             saved_line = self.kwargs.get("current_line")
@@ -3100,7 +3301,7 @@ class ServiceWorker(QThread):
             self.progress.emit(f"已选择: {selected[0]}")
             log.info(f"启动线路: {selected[0]}, 配置大小: {len(selected[1])} bytes")
         else:
-            if not os.path.isfile(os.path.join(quick_dir, "config.yaml")):
+            if not has_local_config:
                 self.finished.emit(False, "无可用配置")
                 return
             log.warning("未下载到新配置，使用本地已有配置")
@@ -3158,7 +3359,7 @@ class ServiceWorker(QThread):
                 time.sleep(1)
 
             start_quick(quick_dir)
-            if not wait_for_proxy(timeout=8):
+            if not wait_for_proxy(timeout=15):
                 log.warning(f"{name} 代理未就绪，跳过延迟测试")
                 results.append((name, -1.0, -1.0, 0, data))
                 self.line_tested.emit(name, -1.0, False)
@@ -3175,23 +3376,28 @@ class ServiceWorker(QThread):
 
             latencies = []
             for label, test_url in NODE_TEST_URLS:
-                try:
-                    proxy_handler = urllib.request.ProxyHandler({
-                        'http': f'http://{PROXY_URL}',
-                        'https': f'http://{PROXY_URL}',
-                    })
-                    opener = urllib.request.build_opener(proxy_handler)
-                    req = urllib.request.Request(test_url, headers={"User-Agent": "Mozilla/5.0"})
-                    start = time.time()
-                    resp = opener.open(req, timeout=NODE_TEST_TIMEOUT)
-                    elapsed = time.time() - start
-                    if resp.status in (200, 204):
-                        latencies.append(elapsed)
-                        log.info(f"{name} 通过 {label} 测试成功, 延迟 {elapsed:.2f}s")
-                    else:
-                        log.warning(f"{name} {label} 测试返回非 200/204: {resp.status}")
-                except Exception as e:
-                    log.warning(f"{name} {label} 测试失败: {type(e).__name__}: {e}")
+                # 单 URL 失败后重试 1 次：quick.exe 刚启动可能尚未完成首次握手/DNS 解析，
+                # 首包超时并不代表线路本身不可用，重试可显著降低误判
+                for attempt in range(2):
+                    try:
+                        proxy_handler = urllib.request.ProxyHandler({
+                            'http': f'http://{PROXY_URL}',
+                            'https': f'http://{PROXY_URL}',
+                        })
+                        opener = urllib.request.build_opener(proxy_handler)
+                        req = urllib.request.Request(test_url, headers={"User-Agent": "Mozilla/5.0"})
+                        start = time.time()
+                        resp = opener.open(req, timeout=NODE_TEST_TIMEOUT)
+                        elapsed = time.time() - start
+                        if resp.status in (200, 204):
+                            latencies.append(elapsed)
+                            log.info(f"{name} 通过 {label} 测试成功, 延迟 {elapsed:.2f}s" +
+                                     (f" (重试第{attempt}次)" if attempt else ""))
+                            break
+                        else:
+                            log.warning(f"{name} {label} 测试返回非 200/204: {resp.status}")
+                    except Exception as e:
+                        log.warning(f"{name} {label} 测试失败 (第{attempt+1}次): {type(e).__name__}: {e}")
 
             if latencies:
                 avg = sum(latencies) / len(latencies)
@@ -3220,11 +3426,25 @@ class ServiceWorker(QThread):
                 except Exception as e:
                     log.warning(f"写健康度记录失败 {name}: {e}")
 
+        # 检测完成后自动选路：选择延迟最低且成功的线路
+        fastest_name, fastest_data = None, None
+        if results:
+            # 过滤出成功的线路（avg >= 0）
+            successful = [(n, avg, d) for n, avg, best, count, d in results if avg >= 0]
+            if successful:
+                # 按平均延迟排序，取最快的
+                fastest_name, _, fastest_data = min(successful, key=lambda x: x[1])
+                log.info(f"自动选路: 选择最快线路 {fastest_name} (延迟 {successful[0][1]:.2f}s)")
+
         proxy_enabled = self.kwargs.get("proxy_enabled", False)
         current_line = self.kwargs.get("current_line", "")
         if proxy_enabled:
             restore_data = original_config
-            if current_line:
+            if fastest_data:
+                # 优先使用检测后自动选出的最快线路
+                restore_data = fastest_data
+                log.info(f"检测后自动选路: {fastest_name}")
+            elif current_line:
                 for n, d, _src in downloaded:
                     if n == current_line:
                         restore_data = d
@@ -3239,12 +3459,22 @@ class ServiceWorker(QThread):
             wait_for_proxy(timeout=8)
         else:
             stop_quick()
-            if original_config:
+            if fastest_data:
+                # 即使 proxy_enabled=False，也保存最快线路配置到 config.yaml
+                with open(config_path, 'wb') as f:
+                    f.write(fastest_data)
+                log.info(f"检测后自动选路（未启动代理）: {fastest_name}")
+            elif original_config:
                 with open(config_path, 'wb') as f:
                     f.write(original_config)
 
         self.kwargs["results"] = results
-        self.finished.emit(True, "检测完成")
+        # 检测完成后自动切换线路
+        if fastest_name:
+            self.line_selected.emit(fastest_name)
+            self.finished.emit(True, f"检测完成 (已自动切换至最快线路: {fastest_name})")
+        else:
+            self.finished.emit(True, "检测完成")
 
     def _do_auto_select(self):
         self.progress.emit("正在下载配置文件...")
@@ -4902,7 +5132,7 @@ class MainWindow(QMainWindow):
             "当主仓库（内置 4 条线路）满足以下条件之一时，自动降级到备选上游仓库：\n"
             "  ① 全部下载失败 ② 成功条数 < 2（基本没法用）\n\n"
             "【内置默认源】\n"
-            "首次启动会自动写入 6 个公开备选源（含 Alvin9999/PAC 等常用仓库），\n"
+            "首次启动会自动写入 2 个公开备选源（mfuu/v2ray + ripaojiedian/freenode），\n"
             "用户可自由启用/禁用/删除/添加新的。\n\n"
             "【多 URL 兜底】\n"
             "每个备选源可配 1 个主 URL + 多个备用 URL。\n"
@@ -6753,12 +6983,7 @@ class MainWindow(QMainWindow):
         self.switch_proxy.setEnabled(True)
         if ok:
             self.line_progress.setText(msg)
-            try:
-                connected, latency = verify_proxy_connection(timeout=5)
-                if connected and latency:
-                    self.svc_latency_label.setText(f"延迟: {latency:.2f}s")
-            except Exception as e:
-                log.warning(f"验证代理连接异常: {e}")
+            # 系统代理、监控等立即执行（不阻塞 UI）
             if self._needs_system_proxy():
                 set_system_proxy(True)
                 self._update_sys_proxy_label()
@@ -6769,6 +6994,16 @@ class MainWindow(QMainWindow):
             if self.settings.get("auto_line_switch", False):
                 self._start_auto_line_timer()
             self._update_active_line()
+            # 延迟验证异步执行，避免卡 UI（节点不通时会等 5 秒）
+            import threading
+            def _verify():
+                try:
+                    connected, latency = verify_proxy_connection(timeout=5)
+                    if connected and latency:
+                        QTimer.singleShot(0, lambda: self.svc_latency_label.setText(f"延迟: {latency:.2f}s"))
+                except Exception as e:
+                    log.warning(f"验证代理连接异常: {e}")
+            threading.Thread(target=_verify, daemon=True).start()
         else:
             self.line_progress.setText(msg)
             self._update_active_line()
@@ -6944,6 +7179,18 @@ class MainWindow(QMainWindow):
                 self.switch_sniffing.setStyleSheet("opacity: 1.0;")
         self.tun_admin_hint.setVisible(checked)
         if is_proxy_running():
+            # 关键：TUN 模式切换时必须管理系统代理
+            # - 开启 TUN：关闭系统代理（TUN 通过虚拟网卡接管全部流量，系统代理多余且冲突）
+            # - 关闭 TUN：如果当前代理设置需要系统代理，重新开启
+            if checked:
+                set_system_proxy(False)
+                self._update_sys_proxy_label()
+                log.info("TUN 模式开启，已关闭系统代理（TUN 接管全部流量）")
+            else:
+                if self._needs_system_proxy():
+                    set_system_proxy(True)
+                    self._update_sys_proxy_label()
+                    log.info("TUN 模式关闭，已恢复系统代理")
             self._inject_all_rules()
             self.tun_restart_hint.setText("⚠ TUN 设置已应用，重启服务后完全生效")
             self.tun_restart_hint.setVisible(True)
@@ -6980,7 +7227,12 @@ class MainWindow(QMainWindow):
                 rb._block_signal = False
         self._save_setting("tun_proxy_mode", mode)
         if is_proxy_running():
+            # TUN 模式下始终不需要系统代理（TUN 接管全部流量）
+            # 切换范围时确保系统代理处于关闭状态
+            set_system_proxy(False)
+            self._update_sys_proxy_label()
             self._inject_all_rules()
+            self.tun_restart_hint.setText("⚠ TUN 代理范围已应用，重启服务后完全生效")
             self.tun_restart_hint.setVisible(True)
         log.info(f"TUN 代理范围: {mode}")
 
@@ -7308,7 +7560,9 @@ class MainWindow(QMainWindow):
 
     def _inject_custom_rules(self):
         """在mihomo的config.yaml中注入用户自定义的代理规则
-        若 address_proxy_enabled=False，则只保留空标记块，不注入实际规则
+        若 address_proxy_enabled=False，则只保留空标记块，不注入实际规则。
+        例外：TUN 白名单模式下，无论"地址代理"开关状态如何，都会注入规则
+        （因为白名单本身就是通过规则 + MATCH,DIRECT 实现的）。
         """
         quick_dir = self.quick_dir
         if not quick_dir:
@@ -7335,9 +7589,21 @@ class MainWindow(QMainWindow):
             content = "\n".join(filtered)
             # 构建自定义规则行
             custom_lines = ["  # YUNJI_CUSTOM_RULES_START"]
-            if self.settings.get("address_proxy_enabled", True):
-                scope = self.settings.get("address_proxy_scope", "all")
-                selected_idx = self.settings.get("address_proxy_selected", 0)
+            # TUN 白名单模式下，无论"地址代理"开关状态如何，都需要注入规则
+            # 因为白名单本身就是通过规则（DOMAIN-SUFFIX 等）+ MATCH,DIRECT 实现的
+            is_tun_specified = (
+                self.settings.get("tun_enabled", False)
+                and self.settings.get("tun_proxy_mode", "all") == "specified"
+            )
+            if is_tun_specified or self.settings.get("address_proxy_enabled", True):
+                # TUN 白名单模式：注入所有规则（白名单应包含所有用户添加的规则，
+                # 不受地址代理的"所有/单选"范围设置影响）
+                if is_tun_specified:
+                    scope = "all"
+                    selected_idx = 0
+                else:
+                    scope = self.settings.get("address_proxy_scope", "all")
+                    selected_idx = self.settings.get("address_proxy_selected", 0)
                 for i, rule in enumerate(self._proxy_rules or []):
                     rule_type = rule.get("type", "DOMAIN-SUFFIX")
                     value = rule.get("value", "").strip()
@@ -7380,7 +7646,7 @@ class MainWindow(QMainWindow):
                     if scope == "specified" and i != spec_idx:
                         continue
                     app_count += 1
-            if self.settings.get("address_proxy_enabled", True):
+            if is_tun_specified or self.settings.get("address_proxy_enabled", True):
                 log.info(f"已注入 {rule_count} 条地址代理规则")
             if self.settings.get("custom_apps_enabled", False):
                 log.info(f"已注入 {app_count} 条程序代理规则（PROCESS-NAME）")
@@ -7584,20 +7850,29 @@ class MainWindow(QMainWindow):
             advanced_blocks = []
 
             # TUN 模式配置
+            # 关键修复（v2026.06.25）：补全 mihomo TUN 必需字段，并改用 redir-host + 境内外分流域
+            # 旧配置缺陷：
+            #   1) 缺 device/strict-route，部分内核版本无法创建虚拟网卡
+            #   2) fake-ip 无 filter 白名单，境内服务（米家/苹果推送/内网）解析到 fake-ip 后路由错乱 → 外网打不开
+            #   3) system 栈缺 auto-redirect，无法接管已建立连接
             if tun_enabled:
                 tun_stack = self.settings.get("tun_stack", "gvisor")
+                redirect_line = "  auto-redirect: true\n  auto-redirect-exclude: []\n" if tun_stack == "system" else ""
                 tun_block = (
                     f"tun:\n"
                     f"  enable: true\n"
                     f"  stack: {tun_stack}\n"
+                    f"  device: YunjiTun\n"
                     f"  dns-hijack:\n"
                     f"    - any:53\n"
+                    f"    - tcp://any:53\n"
                     f"  auto-route: true\n"
                     f"  auto-detect-interface: true\n"
+                    f"  strict-route: true\n"
+                    f"{redirect_line}"
                 )
                 advanced_blocks.append(tun_block)
 
-                # TUN 模式必须配置 DNS（fake-ip 模式，防止 DNS 泄漏和污染）
                 dns_block = (
                     "dns:\n"
                     "  enable: true\n"
@@ -11042,6 +11317,14 @@ def main():
     # 单实例控制：杀同名前缀的旧 EXE / 旧 python main.py → mutex 占位
     # 这是整个进程生命周期的第一步，必须在任何 QApplication 资源创建之前完成
     _ensure_single_instance()
+
+    # 清除残留的代理环境变量（上次关闭时未清理会导致所有网络请求指向死代理）
+    _DEFAULT_PROXY_ENVS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy")
+    for _k in _DEFAULT_PROXY_ENVS:
+        try:
+            del os.environ[_k]
+        except KeyError:
+            pass
 
     sys.excepthook = _global_exception_handler
 

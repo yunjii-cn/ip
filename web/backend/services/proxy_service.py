@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import socket
 import subprocess
@@ -57,6 +58,74 @@ def get_quick_dir():
     return None
 
 
+def _dedup_top_level_keys(config_path):
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        top_level_keys = {}
+        for i, line in enumerate(lines):
+            m = re.match(r'^([a-zA-Z][a-zA-Z0-9_-]*)\s*:', line)
+            if m:
+                key = m.group(1)
+                top_level_keys.setdefault(key, []).append(i)
+
+        dupes = {k: v for k, v in top_level_keys.items() if len(v) > 1}
+        if not dupes:
+            return True
+
+        lines_to_delete = set()
+        for key, line_indices in dupes.items():
+            for start_idx in line_indices[1:]:
+                lines_to_delete.add(start_idx)
+                for j in range(start_idx + 1, len(lines)):
+                    if lines[j].startswith((' ', '\t')) and lines[j].strip():
+                        lines_to_delete.add(j)
+                    else:
+                        break
+
+        new_lines = [line for i, line in enumerate(lines) if i not in lines_to_delete]
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+        log.info(f"已去除重复的顶层键: {list(dupes.keys())}")
+        return True
+    except Exception as e:
+        log.warning(f"清理重复顶层键失败: {e}")
+        return False
+
+
+def start_quick_raw(quick_dir):
+    exe_path = os.path.join(quick_dir, "quick.exe")
+    if not os.path.isfile(exe_path):
+        return False
+    config_path = os.path.join(quick_dir, "config.yaml")
+    if not os.path.isfile(config_path):
+        return False
+    _dedup_top_level_keys(config_path)
+    log.info(f"配置文件大小: {os.path.getsize(config_path)} bytes")
+    subprocess.Popen(
+        [exe_path, "-d", quick_dir],
+        cwd=quick_dir,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
+    log.info(f"已启动代理内核: {exe_path}")
+    return True
+
+
+def stop_quick_raw():
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "quick.exe"],
+            capture_output=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        log.info("已停止代理内核")
+    except Exception as e:
+        log.error(f"停止代理内核失败: {e}")
+
+
 def start_proxy():
     global _proxy_process
     quick_dir = get_quick_dir()
@@ -67,22 +136,14 @@ def start_proxy():
     if not os.path.isfile(exe_path):
         return False, "代理内核文件不存在"
 
-    # TUN 模式需要管理员权限（创建虚拟网卡）
     mode = get_proxy_mode()
     if mode == "tun" and not is_admin():
         return False, "TUN 模式需要管理员权限，请以管理员身份运行本程序"
 
     try:
-        _proxy_process = subprocess.Popen(
-            [exe_path, "-d", quick_dir],
-            cwd=quick_dir,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
+        start_quick_raw(quick_dir)
         if wait_for_proxy(timeout=15):
             s = load_settings()
-            # 系统代理模式：设置注册表系统代理；TUN 模式：不需要系统代理
             if mode == "system" and s.get("global_proxy", False):
                 set_system_proxy()
             if s.get("proxy_enabled", False) is False:
@@ -98,18 +159,8 @@ def stop_proxy():
     global _proxy_process
     try:
         clear_system_proxy()
-        if _proxy_process and _proxy_process.poll() is None:
-            _proxy_process.terminate()
-            try:
-                _proxy_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                _proxy_process.kill()
-            _proxy_process = None
-        else:
-            subprocess.run(
-                ["taskkill", "/F", "/IM", "quick.exe"],
-                capture_output=True, timeout=10,
-            )
+        stop_quick_raw()
+        _proxy_process = None
         s = load_settings()
         s["proxy_enabled"] = False
         save_settings(s)
