@@ -1958,6 +1958,12 @@ def _resolve_via_doh(host):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    # 强制直连 DoH 服务器，避免被本机系统代理 / HTTPS_PROXY 环境变量劫持
+    # （下载阶段应用自身代理通常尚未启动，走代理会静默失败）
+    doh_opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=ctx),
+    )
     for doh_url in _DOH_SERVERS:
         try:
             query_url = f"{doh_url}?name={host}&type=A"
@@ -1965,7 +1971,7 @@ def _resolve_via_doh(host):
                 "Accept": "application/dns-json",
                 "User-Agent": "Mozilla/5.0",
             })
-            with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
+            with doh_opener.open(req, timeout=5) as resp:
                 result = json.loads(resp.read())
                 answers = result.get("Answer", [])
                 ips = [a["data"] for a in answers if a.get("type") == 1]
@@ -2020,11 +2026,11 @@ def _try_doh_ip_download(url, host, ips, timeout):
     )
 
 
-def download_config(url, timeout=10):
+def download_config(url, timeout=30):
     """下载配置文件，使用多级回退策略保证成功率
 
     策略（按优先级）：
-    0. DNS-over-HTTPS + IP 直连 —— 绕过本地 DNS 污染，用国内 DoH 解析真实 IP
+    0. DNS-over-HTTPS + IP 直连（最优先）—— 对 raw.githubusercontent.com 等非 IP 域名无条件先走 DoH+IP，绕过 DNS 污染与"假正常 IP 直连封锁"导致的静默超时
     1. 强制直连（ProxyHandler({})），绕过 Windows 系统代理/HTTPS_PROXY 环境变量
        —— 解决 mihomo 代理"端口在但上游坏掉"导致的 SSL EOF 死循环
     2. 走 PROXY_URL（应用代理，is_proxy_running() 时）—— 给无法直连的用户留通道
@@ -2038,27 +2044,21 @@ def download_config(url, timeout=10):
     # 解析 URL 获取 hostname
     parsed = urllib.parse.urlparse(url)
     host = parsed.hostname or ""
+    is_ip = bool(host) and host.replace(".", "").isdigit()
 
-    # 层级 0：DNS-over-HTTPS + IP 直连（绕过本地 DNS 污染）
-    _FAKE_IP_PREFIXES = ("198.18.", "198.19.")
-    if host and not host.replace(".", "").isdigit():
-        need_doh = False
+    # 层级 0（最优先）：DNS-over-HTTPS + IP 直连
+    # 绕过本地 DNS 污染，以及"DNS 返回看似正常、但直连被封锁的 IP"导致静默超时的情况。
+    # 对 raw.githubusercontent.com / api.github.com 等国内直连常失败的域名最可靠。
+    if host and not is_ip:
         try:
-            addr_info = socket.getaddrinfo(host, 443, socket.AF_INET)
-            resolved_ips = [info[4][0] for info in addr_info]
-            if all(ip.startswith(_FAKE_IP_PREFIXES) for ip in resolved_ips):
-                log.debug(f"DNS 被污染：{host} -> {resolved_ips}（fake-ip），尝试 DoH...")
-                need_doh = True
-        except socket.gaierror:
-            log.debug(f"DNS 解析失败 ({host})，尝试 DoH...")
-            need_doh = True
-        if need_doh:
-            try:
-                ips = _resolve_via_doh(host)
-                if ips:
-                    return _try_doh_ip_download(url, host, ips, timeout)
-            except Exception as e:
-                log.debug(f"DoH+IP 层失败 ({host}): {type(e).__name__}: {e}")
+            ips = _resolve_via_doh(host)
+            if ips:
+                data = _try_doh_ip_download(url, host, ips, timeout)
+                if data:
+                    log.info(f"DoH+IP 优先下载成功 ({host})")
+                    return data
+        except Exception as e:
+            log.debug(f"DoH+IP 优先层失败 ({host}): {type(e).__name__}: {e}")
 
     # 层级 1：走 PROXY_URL（代理进程在跑时优先走代理——国内直连常被封锁）
     if is_proxy_running():
@@ -2207,7 +2207,8 @@ def _discover_freenodes_latest_date():
             dates = []
             for it in items:
                 m = re.match(r"^clash(\d{8})\.yml$", it.get("name", ""))
-                if m:
+                # 跳过当天尚未生成的空文件（size=0），否则会选到 0 字节的占位文件
+                if m and it.get("size", 0) > 100:
                     dates.append(m.group(1))
             if dates:
                 latest = max(dates)
@@ -2223,7 +2224,8 @@ def _discover_freenodes_latest_date():
             ds = (today - timedelta(days=back)).strftime("%Y%m%d")
             try:
                 data = download_config(_FREENODES_RAW_TPL.format(date=ds), timeout=10)
-                if data and not data.lstrip().startswith(b"<"):
+                # 要求非空且体积合理（>100B），并排除 HTML 错误页
+                if data and len(data) > 100 and not data.lstrip().startswith(b"<"):
                     log.info(f"自动发现 free-nodes 最新文件: clash{ds}.yml (日期探测)")
                     return ds
             except Exception:
@@ -2366,7 +2368,7 @@ def download_all_configs():
         t.start()
         threads.append(t)
     for t in threads:
-        t.join(timeout=60)
+        t.join(timeout=120)
 
     succeeded = [(n, d, s) for n, d, s in results if d is not None]
     failed_names = [n for n, d, s in results if d is None]
