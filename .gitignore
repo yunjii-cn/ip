@@ -110,3 +110,10 @@ dev/运行PC.bat
 # Build/Publish temp scripts (local only)
 dev/build_now.py
 dev/publish_now.py
+
+# ========== 本地工作记忆（含操作笔记/路径，不上共享远程） ==========
+.workbuddy/
+
+# ========== 运行时自动发现缓存 ==========
+.freenodes_latest.txt
+dev/app/.freenodes_latest.txt

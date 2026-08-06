@@ -182,17 +182,22 @@ NODE_TEST_URLS = [
     ("Cloudflare", "https://cp.cloudflare.com/"),
 ]
 
+_FREENODES_TOKEN = "__FREENODES_LATEST__"  # 占位符：运行时自动替换为最新日期文件
+
 CONFIG_URLS = [
     # 活跃维护的免费节点仓库（GitHub raw），通过 DoH+IP 层绕过 DNS 污染
+    # free-nodes/clashfree 使用日期文件名（clashYYYYMMDD.yml），旧文件会被清理，
+    # 故不再硬编码日期，改用 _FREENODES_TOKEN 占位，运行时自动发现最新文件见：
+    #   https://github.com/free-nodes/clashfree （每日更新）
     # 备选 GitLab 源作为直连回退
-    ("线路1", "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260622.yml",
+    ("线路1", _FREENODES_TOKEN,
      "https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml"),
     ("线路2", "https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml",
      "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash"),
     ("线路3", "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash",
-     "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260622.yml"),
-    ("线路4", "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260621.yml",
-     "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260622.yml"),
+     _FREENODES_TOKEN),
+    ("线路4", _FREENODES_TOKEN,
+     "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash"),
 ]
 
 # ========== 自定义订阅（Batch 1） ==========
@@ -962,7 +967,8 @@ def load_backup_sources() -> List[BackupSource]:
         if not os.path.isfile(BACKUP_SOURCES_FILE):
             return []
         with open(BACKUP_SOURCES_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
+            content = f.read()
+        raw = json.loads(content)
         if not isinstance(raw, list):
             return []
         result = []
@@ -983,6 +989,15 @@ def load_backup_sources() -> List[BackupSource]:
                 urls=urls_field,
             ))
         return result
+    except json.JSONDecodeError as e:
+        log.warning(f"加载备选上游仓库失败（JSON损坏）: {e}")
+        try:
+            bak_path = BACKUP_SOURCES_FILE + ".bak"
+            os.replace(BACKUP_SOURCES_FILE, bak_path)
+            log.warning(f"已备份损坏文件到 {bak_path}，将重新生成默认备选源")
+        except Exception:
+            pass
+        return []
     except Exception as e:
         log.warning(f"加载备选上游仓库失败: {e}")
         return []
@@ -1983,8 +1998,19 @@ def _try_doh_ip_download(url, host, ips, timeout):
                 "User-Agent": "Mozilla/5.0",
             })
             resp = conn.getresponse()
+            status = resp.status
             data = resp.read()
             conn.close()
+            if status != 200:
+                log.debug(f"DoH+IP {ip} 返回 HTTP {status} ({host})，跳过")
+                continue
+            # 防止把错误页面 HTML 当作 Clash YAML 写入配置
+            head = data.lstrip()[:1]
+            if head and head not in (b"#", b"-", b"{", b"[", b"p", b"r"):
+                # Clash YAML 通常以 # / - / { / [ 或 proxy key 开头；HTML 以 < 开头
+                if data.lstrip().startswith(b"<"):
+                    log.debug(f"DoH+IP {ip} 返回非 YAML 内容（疑似 HTML）({host})，跳过")
+                    continue
             log.info(f"DoH+IP 直连成功: {host} via {ip} ({len(data)} bytes)")
             return data
         except Exception as e:
@@ -2099,6 +2125,148 @@ def download_config(url, timeout=10):
     raise urllib.error.URLError("所有下载方式均失败")
 
 
+# ========== free-nodes/clashfree 最新日期文件自动发现 ==========
+# 该仓库每日生成 clashYYYYMMDD.yml，旧文件会被清理，硬编码日期会 404。
+# 改为运行时自动发现最新日期文件，避免每次手动改 URL。
+_FREENODES_RAW_TPL = "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash{date}.yml"
+_FREENODES_CACHE_TTL = 6 * 3600  # 缓存 6 小时，避免频繁打 GitHub API（有速率限制）
+if getattr(sys, 'frozen', False):
+    _FREENODES_APP_BASE = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    _FREENODES_APP_BASE = os.path.dirname(os.path.abspath(__file__))
+_FREENODES_CACHE_FILE = os.path.join(_FREENODES_APP_BASE, ".freenodes_latest.txt")
+_free_nodes_latest = {"date": None, "ts": 0.0}
+
+
+def _github_api_json(api_path):
+    """通过 DoH+IP 直连 GitHub API（api.github.com 同样被 DNS 污染）。
+    返回解析后的 JSON；失败返回 None。
+    """
+    host = "api.github.com"
+    url = f"https://{host}{api_path}"
+    ips = _resolve_via_doh(host)
+    if not ips:
+        return None
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    parsed = urllib.parse.urlparse(url)
+    req_path = parsed.path + (("?" + parsed.query) if parsed.query else "")
+    for ip in ips:
+        try:
+            sock = socket.create_connection((ip, 443), timeout=10)
+            ssock = ctx.wrap_socket(sock, server_hostname=host)
+            conn = http.client.HTTPSConnection(ip, 443, context=ctx, timeout=10)
+            conn.sock = ssock
+            conn.request("GET", req_path, headers={
+                "Host": host,
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/vnd.github+json",
+            })
+            resp = conn.getresponse()
+            if resp.status != 200:
+                conn.close()
+                continue
+            data = resp.read()
+            conn.close()
+            return json.loads(data)
+        except Exception as e:
+            log.debug(f"GitHub API {ip} 失败 ({api_path}): {type(e).__name__}: {e}")
+    return None
+
+
+def _load_freenodes_cache():
+    try:
+        if os.path.isfile(_FREENODES_CACHE_FILE):
+            with open(_FREENODES_CACHE_FILE, "r", encoding="utf-8") as f:
+                return f.read().strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _save_freenodes_cache(date):
+    try:
+        with open(_FREENODES_CACHE_FILE, "w", encoding="utf-8") as f:
+            f.write(date)
+    except Exception:
+        pass
+
+
+def _discover_freenodes_latest_date():
+    """发现 free-nodes/clashfree 最新 clashYYYYMMDD 日期。失败返回 ''。
+
+    策略：
+    1) GitHub API 列目录，取最大日期（最准确）
+    2) API 失败/限流 → 从今天往回探测 7 天，第一个可下载的即最新可用
+    """
+    # 1) GitHub API（api.github.com 同样被 DNS 污染，走 DoH+IP）
+    try:
+        items = _github_api_json("/repos/free-nodes/clashfree/contents/")
+        if items:
+            dates = []
+            for it in items:
+                m = re.match(r"^clash(\d{8})\.yml$", it.get("name", ""))
+                if m:
+                    dates.append(m.group(1))
+            if dates:
+                latest = max(dates)
+                log.info(f"自动发现 free-nodes 最新文件: clash{latest}.yml (GitHub API)")
+                return latest
+    except Exception as e:
+        log.debug(f"GitHub API 发现失败: {e}")
+
+    # 2) 日期探测回退（复用 download_config 的 DoH+IP 链路，不走 API 不计速率）
+    try:
+        today = date.today()
+        for back in range(0, 8):
+            ds = (today - timedelta(days=back)).strftime("%Y%m%d")
+            try:
+                data = download_config(_FREENODES_RAW_TPL.format(date=ds), timeout=10)
+                if data and not data.lstrip().startswith(b"<"):
+                    log.info(f"自动发现 free-nodes 最新文件: clash{ds}.yml (日期探测)")
+                    return ds
+            except Exception:
+                continue
+    except Exception as e:
+        log.debug(f"日期探测失败: {e}")
+    return ""
+
+
+def get_freenodes_latest_url(force=False):
+    """返回 free-nodes 最新 clashYYYYMMDD.yml 的 raw URL（带 6h 缓存）。"""
+    global _free_nodes_latest
+    now = time.time()
+    if not force and _free_nodes_latest.get("date"):
+        if now - _free_nodes_latest.get("ts", 0) < _FREENODES_CACHE_TTL:
+            return _FREENODES_RAW_TPL.format(date=_free_nodes_latest["date"])
+
+    latest_date = _discover_freenodes_latest_date()
+    if latest_date:
+        _free_nodes_latest = {"date": latest_date, "ts": now}
+        _save_freenodes_cache(latest_date)
+        return _FREENODES_RAW_TPL.format(date=latest_date)
+
+    # 发现失败：退回文件缓存（即便旧也尽量可用），再不行用硬编码兜底
+    cached = _load_freenodes_cache()
+    if cached:
+        log.warning("free-nodes 自动发现失败，使用缓存日期 clash%s.yml" % cached)
+        return _FREENODES_RAW_TPL.format(date=cached)
+    log.warning("free-nodes 自动发现失败，使用兜底日期 clash20260805.yml")
+    return _FREENODES_RAW_TPL.format(date="20260805")
+
+
+def get_effective_config_urls():
+    """把 CONFIG_URLS 中的 _FREENODES_TOKEN 替换为运行时发现的最新 URL。"""
+    fn = get_freenodes_latest_url()
+    out = []
+    for name, primary, fallback in CONFIG_URLS:
+        p = fn if primary == _FREENODES_TOKEN else primary
+        fb = fn if fallback == _FREENODES_TOKEN else fallback
+        out.append((name, p, fb))
+    return out
+
+
 def download_all_configs():
     """下载所有可用线路配置：
     - 内置 4 条（CONFIG_URLS）
@@ -2115,11 +2283,16 @@ def download_all_configs():
         config_data = None
         for url in [primary_url, fallback_url]:
             try:
-                config_data = download_config(url)
+                data = download_config(url)
+                # 验证可解析（防止把 HTML 错误页当作 Clash YAML）
+                text = data.decode("utf-8", errors="ignore")
+                _ = extract_proxies_count(text)
+                config_data = data
                 log.info(f"{name} 配置下载成功 ({url})")
                 break
             except Exception as e:
                 log.warning(f"{name} 配置下载失败 ({url}): {type(e).__name__}: {e}")
+                config_data = None
                 continue
         if config_data is None:
             log.error(f"{name} 配置所有下载方式均失败")
@@ -2184,7 +2357,7 @@ def download_all_configs():
 
     # === 第一轮：主仓库 + 自定义订阅 ===
     threads = []
-    for name, primary_url, fallback_url in CONFIG_URLS:
+    for name, primary_url, fallback_url in get_effective_config_urls():
         t = threading.Thread(target=try_download, args=(name, primary_url, fallback_url))
         t.start()
         threads.append(t)
@@ -2234,6 +2407,34 @@ def download_all_configs():
     # 返回成功的（含来源标记）
     final = [(n, d, s) for n, d, s in results if d is not None]
     return final
+
+
+def _ensure_proxy_port(config_path, port=7890, socks_port=7891, controller="127.0.0.1:9090"):
+    """保证配置文件含有监听端口与外部控制端口。
+
+    线路检测时 save_config 会用单条订阅配置覆盖 config.yaml，而部分订阅源
+    （如 free-nodes/clashfree）原始内容不含 port/socks-port/external-controller，
+    导致 mihomo 不在 7890 监听，wait_for_proxy 永远超时（"代理未就绪"）。
+    本函数在写入后兜底补全缺失的端口键。
+    """
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        has_listen = re.search(r'^\s*(port|mixed-port|socks-port)\s*:', content, re.MULTILINE)
+        has_controller = re.search(r'^\s*external-controller\s*:', content, re.MULTILINE)
+        add = []
+        if not has_listen:
+            add.append(f"port: {port}")
+            add.append(f"socks-port: {socks_port}")
+        if not has_controller:
+            add.append(f"external-controller: {controller}")
+        if add:
+            content = "\n".join(add) + "\n" + content
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            log.info(f"已补全监听端口配置: {add}")
+    except Exception as e:
+        log.warning(f"补全端口配置失败: {e}")
 
 
 def save_config(quick_dir, config_data):
@@ -2344,6 +2545,8 @@ def save_config(quick_dir, config_data):
                     log.info(f"已保留 {len(yunji_blocks)} 个 YUNJI 规则块 + 高级配置（无 rules 段）")
         except Exception as e:
             log.warning(f"恢复 YUNJI 规则块和高级配置失败: {e}")
+    # 兜底：确保监听端口存在（线路检测用单条订阅覆盖时尤其容易丢失）
+    _ensure_proxy_port(config_path)
     log.info(f"配置已保存到 {config_path}")
 
 
@@ -2430,6 +2633,12 @@ def stop_quick():
             startupinfo=si,
             creationflags=subprocess.CREATE_NO_WINDOW
         )
+        # 等待端口真正释放，避免新内核因端口被僵尸进程占用而绑定失败
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            if not is_proxy_running():
+                break
+            time.sleep(0.5)
         log.info("已停止代理内核")
     except Exception as e:
         log.error(f"停止代理内核失败: {e}")
@@ -3354,12 +3563,12 @@ class ServiceWorker(QThread):
             self.progress.emit(f"正在检测线路 {i+1}/{total}: {name}...")
             save_config(quick_dir, data)
 
-            if is_proxy_running():
-                stop_quick()
-                time.sleep(1)
+            # 无论端口是否响应，都先停掉旧内核（避免僵尸进程抢占 7890 端口）
+            stop_quick()
+            time.sleep(1)
 
             start_quick(quick_dir)
-            if not wait_for_proxy(timeout=15):
+            if not wait_for_proxy(timeout=25):
                 log.warning(f"{name} 代理未就绪，跳过延迟测试")
                 results.append((name, -1.0, -1.0, 0, data))
                 self.line_tested.emit(name, -1.0, False)
@@ -3441,7 +3650,6 @@ class ServiceWorker(QThread):
         if proxy_enabled:
             restore_data = original_config
             if fastest_data:
-                # 优先使用检测后自动选出的最快线路
                 restore_data = fastest_data
                 log.info(f"检测后自动选路: {fastest_name}")
             elif current_line:
@@ -3450,8 +3658,7 @@ class ServiceWorker(QThread):
                         restore_data = d
                         break
             if restore_data:
-                with open(config_path, 'wb') as f:
-                    f.write(restore_data)
+                save_config(quick_dir, restore_data)
             if is_proxy_running():
                 stop_quick()
                 time.sleep(1)
@@ -3460,13 +3667,10 @@ class ServiceWorker(QThread):
         else:
             stop_quick()
             if fastest_data:
-                # 即使 proxy_enabled=False，也保存最快线路配置到 config.yaml
-                with open(config_path, 'wb') as f:
-                    f.write(fastest_data)
+                save_config(quick_dir, fastest_data)
                 log.info(f"检测后自动选路（未启动代理）: {fastest_name}")
             elif original_config:
-                with open(config_path, 'wb') as f:
-                    f.write(original_config)
+                save_config(quick_dir, original_config)
 
         self.kwargs["results"] = results
         # 检测完成后自动切换线路
@@ -3590,8 +3794,7 @@ class ServiceWorker(QThread):
             if fastest_data:
                 save_config(quick_dir, fastest_data)
             elif original_config:
-                with open(config_path, 'wb') as f:
-                    f.write(original_config)
+                save_config(quick_dir, original_config)
             if is_proxy_running():
                 stop_quick()
                 time.sleep(1)
@@ -3602,8 +3805,7 @@ class ServiceWorker(QThread):
             if fastest_data:
                 save_config(quick_dir, fastest_data)
             elif original_config:
-                with open(config_path, 'wb') as f:
-                    f.write(original_config)
+                save_config(quick_dir, original_config)
 
         if fastest_data:
             self.line_selected.emit(fastest_name)
@@ -7888,6 +8090,15 @@ class MainWindow(QMainWindow):
                     "  fallback-filter:\n"
                     "    geoip: true\n"
                     "    geoip-code: CN\n"
+                    "  fake-ip-filter:\n"
+                    "    - '+.lan'\n"
+                    "    - '+.local'\n"
+                    "    - '+.msftconnecttest.com'\n"
+                    "    - '+.msftncsi.com'\n"
+                    "    - 'localhost.ptlogin2.qq.com'\n"
+                    "    - '+.push.apple.com'\n"
+                    "    - '+.apple.com'\n"
+                    "    - '+.market.xiaomi.com'\n"
                 )
                 advanced_blocks.append(dns_block)
 
@@ -10581,11 +10792,20 @@ class MainWindow(QMainWindow):
             return
 
         # 加载图标：优先用主图标，没有就降级用内置 style icon
-        app_dir = os.path.dirname(os.path.abspath(__file__))
-        icon_path = os.path.join(app_dir, "icon.png")
-        if os.path.isfile(icon_path):
-            tray_icon = QIcon(icon_path)
+        # 搜索顺序与 _set_icon / _SplashScreen 保持一致：ico.png → icon.png → icon.ico
+        if hasattr(sys, '_MEIPASS'):
+            base = sys._MEIPASS
         else:
+            base = os.path.dirname(os.path.abspath(__file__))
+        tray_icon = None
+        for name in ('ico.png', 'icon.png', 'icon.ico'):
+            p = os.path.join(base, name)
+            if os.path.isfile(p):
+                tray_icon = QIcon(p)
+                if not tray_icon.isNull():
+                    break
+                tray_icon = None
+        if tray_icon is None:
             tray_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
         self.setWindowIcon(tray_icon)
 
@@ -11188,6 +11408,9 @@ def _kill_same_name_processes():
     #   云集智能网联代理专家 v2026.06.17.2025.exe  （理论上不会出现）
     # APP_NAME 形如 "云集智能网联代理专家 v2026.06.17.2025" 永远 startswith 不上。
     base_prefix = BRAND_NAME.lower()
+    # 本项目 app 目录（dev 模式判定基准）：只有工作目录/命令行指向此目录的
+    # python 进程才视为本项目旧实例，避免误杀 ComfyUI、视频创意站等 python 应用
+    app_dir = os.path.dirname(os.path.abspath(__file__)).lower()
 
     # 1. 收集当前进程的祖先链（防止杀到自己的父进程把自己也带走）
     my_ancestor_pids = set()
@@ -11225,12 +11448,16 @@ def _kill_same_name_processes():
                         and exe_name.endswith('.exe')
                     )
                 else:
-                    # 开发模式：python.exe / pythonw.exe + cmdline 含 main.py
+                    # 开发模式：python.exe / pythonw.exe + 命令行/工作目录指向本项目 dev/app
+                    # 关键：不能只匹配 'main.py'（ComfyUI、视频创意站等都是 python main.py 启动），
+                    # 必须限定到本项目目录，否则会误杀其它 python 应用。
                     if exe_name in ('python.exe', 'pythonw.exe'):
                         try:
                             import psutil
-                            cmdline = ' '.join(psutil.Process(pid).cmdline()).lower()
-                            if 'main.py' in cmdline:
+                            p = psutil.Process(pid)
+                            cl = ' '.join(p.cmdline()).lower()
+                            cwd = (p.cwd() or '').lower()
+                            if 'main.py' in cl and (app_dir in cl or app_dir == cwd or app_dir in cwd):
                                 should_kill = True
                         except Exception:
                             pass

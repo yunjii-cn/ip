@@ -70,6 +70,8 @@ function onIconError() {
   justify-content: space-between;
   background: #111;
   padding: 0 14px;
+  /* 为系统状态栏预留安全区，避免内容（图标/标题）与系统状态栏（时间/电量）重叠 */
+  padding-top: env(safe-area-inset-top, 0px);
   height: 44px;
   border-bottom: 1px solid #333;
   flex-shrink: 0;

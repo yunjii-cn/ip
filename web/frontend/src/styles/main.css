@@ -35,6 +35,11 @@ html, body {
   min-width: 360px;
 }
 
+/* 底部 TabBar 为系统导航栏/手势条预留安全区 */
+.van-tabbar {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
 .main-content {
   overflow-y: auto;
   padding: 12px;
