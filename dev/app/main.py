@@ -2758,7 +2758,7 @@ def _filter_advanced_sections(advanced_text, present_keys):
     return "\n".join(kept).strip("\n")
 
 
-def save_config(quick_dir, config_data):
+def save_config(quick_dir, config_data, mixed_port=None, socks_port=None, controller=None):
     config_path = os.path.join(quick_dir, "config.yaml")
     backup_path = os.path.join(quick_dir, "config.yaml_backup")
     # 先读取已有的 YUNJI 注入规则和高级配置段
@@ -2870,7 +2870,13 @@ def save_config(quick_dir, config_data):
         except Exception as e:
             log.warning(f"恢复 YUNJI 规则块和高级配置失败: {e}")
     # 兜底：确保监听端口存在（线路检测用单条订阅覆盖时尤其容易丢失）
-    _ensure_proxy_port(config_path)
+    # mixed_port 等可选参数用于并发检测：让每条线路监听独立端口，互不冲突。
+    _ensure_proxy_port(
+        config_path,
+        port=(mixed_port if mixed_port is not None else 7890),
+        socks_port=(socks_port if socks_port is not None else 7891),
+        controller=(controller if controller is not None else "127.0.0.1:9090"),
+    )
     log.info(f"配置已保存到 {config_path}")
 
 
@@ -2921,27 +2927,26 @@ def _dedup_top_level_keys(config_path):
         return False
 
 
-def start_quick(quick_dir):
-    """启动 mihomo(quick.exe)。
+def _launch_quick(quick_dir):
+    """拉起一个 mihomo(quick.exe) 实例（不等待端口就绪，仅做 6s 启动期 fatal 探测）。
 
-    返回 (ok, reason)：
-      - ok=True  已成功拉起且未立即致命退出（端口是否就绪由调用方 wait_for_proxy 判定）
-      - ok=False 启动文件缺失，或进程在 6s 内 fatal 退出（配置解析/MMDB 等错误），
-        reason 含可读错误，便于线路检测区分“配置坏”与“代理未就绪”。
+    返回 subprocess.Popen 对象；若 exe/config 缺失或启动 6s 内 fatal 退出，返回 None
+    （调用方据此判定该实例不可用）。并发线路检测会为每个线路启动独立实例并保留 proc
+    句柄，以便结束时精确终止，避免误杀其它实例（如用户正在使用的主代理 7890）。
     """
     quick_exe = os.path.join(quick_dir, "quick.exe")
     if not os.path.isfile(quick_exe):
         log.error(f"quick.exe 不存在: {quick_exe}")
-        return False, "quick.exe 不存在"
+        return None
     config_path = os.path.join(quick_dir, "config.yaml")
     if not os.path.isfile(config_path):
         log.error(f"config.yaml 不存在: {config_path}")
-        return False, "config.yaml 不存在"
+        return None
     # 启动前清理重复的顶层键，避免 mihomo 解析失败崩溃
     _dedup_top_level_keys(config_path)
     # 启动前对配置做一次【纯文本安全修复】（修正过时 cipher / 废弃键 / geoip 拼写），
     # 保证即使遗留了旧版/损坏的 config.yaml（如 chacha20-poly1305、datgeip 拼写），
-    # 内核也能正常解析启动，而不必依赖用户先手动“更新配置”。文本级改动零风险、幂等。
+    # 内核也能正常解析启动。文本级改动零风险、幂等。
     try:
         with open(config_path, "rb") as _f:
             _raw = _f.read()
@@ -2967,7 +2972,7 @@ def start_quick(quick_dir):
         )
     except Exception as e:
         log.error(f"启动 quick.exe 异常: {e}")
-        return False, f"启动异常: {e}"
+        return None
     # 轮询 6s：若进程已退出且非 0，则为 fatal（配置解析失败/MMDB 缺失等）
     for _ in range(12):
         time.sleep(0.5)
@@ -2981,10 +2986,112 @@ def start_quick(quick_dir):
             tail = out.decode("utf-8", errors="ignore")[-400:]
             if rc != 0 or "level=fatal" in tail:
                 log.error(f"quick.exe 启动即致命退出(rc={rc}): {tail}")
-                return False, f"内核解析/启动失败: {tail[-200:]}"
+                return None
             break
-    log.info(f"已启动代理内核: {quick_exe}")
+    return proc
+
+
+def start_quick(quick_dir):
+    """启动 mihomo(quick.exe)（单实例便捷封装）。
+
+    返回 (ok, reason)：
+      - ok=True  已成功拉起且未立即致命退出（端口是否就绪由调用方 wait_for_proxy 判定）
+      - ok=False 启动文件缺失，或进程在 6s 内 fatal 退出（配置解析/MMDB 等错误），
+        reason 含可读错误，便于线路检测区分“配置坏”与“代理未就绪”。
+    """
+    proc = _launch_quick(quick_dir)
+    if proc is None:
+        return False, "内核解析/启动失败或文件缺失"
+    log.info(f"已启动代理内核: {os.path.join(quick_dir, 'quick.exe')}")
     return True, ""
+
+
+def start_quick_proc(quick_dir):
+    """并发检测专用：拉起一个内核实例并返回其 Popen 句柄（或 None）。
+
+    与 start_quick 的区别：返回进程对象而非 (ok,reason)，便于调用方在检测结束后
+    精确终止该实例（stop_quick_proc），而不会像 stop_quick() 那样 taskkill 掉全部
+    quick.exe（会误杀用户正在使用的主代理）。
+    """
+    return _launch_quick(quick_dir)
+
+
+def stop_quick_proc(proc):
+    """精确终止一个内核实例（仅该进程），不影响其它 quick.exe 实例（如主代理）。"""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # 兜底：若 proc.kill 未生效（子进程已脱离），按 pid 强杀
+    try:
+        if proc.poll() is None:
+            subprocess.run(["taskkill", "/f", "/pid", str(proc.pid)],
+                           capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    except Exception:
+        pass
+
+
+def is_port_listening(port, host="127.0.0.1"):
+    """检测指定本地端口是否处于监听状态（并发检测用，不再只认 7890）。"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(0.3)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        return result == 0
+    except Exception:
+        return False
+
+
+def wait_for_proxy_port(port, timeout=8):
+    """等待指定端口就绪（并发检测每条线路用各自端口，避免受全局 7890 限制）。"""
+    start = time.time()
+    while time.time() - start < timeout:
+        if is_port_listening(port):
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def _pick_free_port(base, host="127.0.0.1", span=50):
+    """从 base 起找一个未被占用的本地端口（避免并发实例端口撞车）。"""
+    p = base
+    while p < base + span:
+        if not is_port_listening(p, host):
+            return p
+        p += 1
+    return base
+
+
+def _prepare_test_dir(base_quick_dir, line_dir):
+    """为并发检测的某条线路准备独立工作子目录。
+
+    mihomo 用 -d 指定 home 目录，所有相对路径（config.yaml / geoip.metadb /
+    Country.mmdb / cache.db / logs）都相对该目录。为避免多实例抢同一 cache.db、
+    又能共享只读的 MMDB，这里：
+      - makedirs(line_dir)
+      - 对只读的 geoip.metadb / Country.mmdb 做硬链接（同卷零成本），失败则拷贝
+      - cache.db / logs 由 mihomo 在子目录内自行创建（天然隔离）
+    """
+    os.makedirs(line_dir, exist_ok=True)
+    for name in ("geoip.metadb", "Country.mmdb"):
+        src = os.path.join(base_quick_dir, name)
+        dst = os.path.join(line_dir, name)
+        if os.path.isfile(src) and not os.path.exists(dst):
+            try:
+                os.link(src, dst)  # NTFS 同卷硬链接，零额外空间
+            except Exception:
+                try:
+                    shutil.copy2(src, dst)
+                except Exception as e:
+                    log.warning(f"准备测试目录拷贝 {name} 失败: {e}")
 
 
 def stop_quick():
@@ -3921,120 +4028,137 @@ class ServiceWorker(QThread):
             with open(config_path, 'rb') as f:
                 original_config = f.read()
 
-        results = []
         total = len(downloaded)
+        self.progress.emit(f"正在并发检测全部 {total} 条线路（不再逐条串行）...")
 
-        for i, (name, data, _src) in enumerate(downloaded):
-            self.progress.emit(f"正在检测线路 {i+1}/{total}: {name}...")
-            save_config(quick_dir, data)
+        # ---- 并发检测：每条线路独立子目录 + 独立端口，多线程同时测速 ----
+        # 关键：mihomo 单实例单端口(7890)，要 4 条一起测必须把每条放到独立子目录、
+        # 监听独立端口，否则会抢端口冲突。测完统一回收实例（按 pid 精确终止），
+        # 不误杀用户正在使用的主代理。
+        base_test_dir = os.path.join(quick_dir, "_test")
+        try:
+            if os.path.isdir(base_test_dir):
+                shutil.rmtree(base_test_dir, ignore_errors=True)
+        except Exception:
+            pass
+        os.makedirs(base_test_dir, exist_ok=True)
 
-            # 无论端口是否响应，都先停掉旧内核（避免僵尸进程抢占 7890 端口）
-            stop_quick()
-            time.sleep(1)
+        results = {}          # name -> entry dict
+        procs = []            # 测试实例 Popen 句柄，结束后精确终止
+        rlock = threading.Lock()
 
-            ok, reason = start_quick(quick_dir)
-            if not ok:
-                # 内核启动即致命退出（配置解析失败 / MMDB 缺失等），该线路不可用
-                log.warning(f"{name} 内核启动失败，跳过检测: {reason}")
-                results.append((name, -1.0, -1.0, 0, data, False))
-                self.line_tested.emit(name, -1.0, False)
-                try:
-                    get_health_db().append(name, HealthRecord(
-                        ts=datetime.now().isoformat(timespec="seconds"),
-                        success=False, avg=-1.0, best=-1.0,
-                        count=0, total=len(NODE_TEST_URLS),
-                    ))
-                except Exception as e:
-                    log.warning(f"写健康度记录失败 {name}: {e}")
-                continue
-
-            if not wait_for_proxy(timeout=25):
-                log.warning(f"{name} 代理未就绪，跳过延迟测试")
-                results.append((name, -1.0, -1.0, 0, data, False))
-                self.line_tested.emit(name, -1.0, False)
-                # Batch 3: 代理未就绪也算失败
-                try:
-                    get_health_db().append(name, HealthRecord(
-                        ts=datetime.now().isoformat(timespec="seconds"),
-                        success=False, avg=-1.0, best=-1.0,
-                        count=0, total=len(NODE_TEST_URLS),
-                    ))
-                except Exception as e:
-                    log.warning(f"写健康度记录失败 {name}: {e}")
-                continue
-
-            latencies = []          # 所有可达站点（含境内，用于展示/健康度）
-            abroad_ok = False        # 至少有一个境外站点经代理成功（线路真正可用的硬条件）
-            abroad_latencies = []    # 仅境外站点延迟（用于选路比较）
-            for label, test_url, region in NODE_TEST_URLS:
-                # 单 URL 失败后重试 1 次：quick.exe 刚启动可能尚未完成首次握手/DNS 解析，
-                # 首包超时并不代表线路本身不可用，重试可显著降低误判
-                for attempt in range(2):
-                    try:
-                        proxy_handler = urllib.request.ProxyHandler({
-                            'http': f'http://{PROXY_URL}',
-                            'https': f'http://{PROXY_URL}',
-                        })
-                        opener = urllib.request.build_opener(proxy_handler)
-                        req = urllib.request.Request(test_url, headers={"User-Agent": "Mozilla/5.0"})
-                        start = time.time()
-                        resp = opener.open(req, timeout=NODE_TEST_TIMEOUT)
-                        elapsed = time.time() - start
-                        if resp.status in (200, 204):
-                            latencies.append(elapsed)
-                            if region == "abroad":
-                                abroad_ok = True
-                                abroad_latencies.append(elapsed)
-                            log.info(f"{name} 通过 {label} 测试成功, 延迟 {elapsed:.2f}s" +
-                                     (f" (重试第{attempt}次)" if attempt else "") +
-                                     (" [境内直连]" if region == "cn" else " [境外经代理]"))
-                            break
-                        else:
-                            log.warning(f"{name} {label} 测试返回非 200/204: {resp.status}")
-                    except Exception as e:
-                        log.warning(f"{name} {label} 测试失败 (第{attempt+1}次): {type(e).__name__}: {e}")
-
-            # 线路可用判定：必须至少有一个境外站点经代理成功（Baidu 等境内直连不算）
-            usable = abroad_ok
-            if latencies:
-                avg = sum(latencies) / len(latencies)
-                best = min(latencies)
-                # avg 仅用于展示；选路以 abroad_latencies 为准
-                results.append((name, avg, best, len(latencies), data, usable))
-                self.line_tested.emit(name, (min(abroad_latencies) if abroad_latencies else avg), usable)
-                # Batch 3: 写健康度记录
-                try:
-                    get_health_db().append(name, HealthRecord(
-                        ts=datetime.now().isoformat(timespec="seconds"),
-                        success=usable, avg=(min(abroad_latencies) if abroad_latencies else -1.0),
-                        best=(min(abroad_latencies) if abroad_latencies else -1.0),
-                        count=len(abroad_latencies), total=len([u for u in NODE_TEST_URLS if u[2] == "abroad"]),
-                    ))
-                except Exception as e:
-                    log.warning(f"写健康度记录失败 {name}: {e}")
-                if not usable:
+        def worker(idx, name, data, _src):
+            line_dir = os.path.join(base_test_dir, f"line{idx+1}")
+            entry = {"name": name, "avg": -1.0, "best": -1.0, "count": 0,
+                     "data": data, "usable": False, "abroad_best": -1.0,
+                     "abroad_count": 0}
+            try:
+                _prepare_test_dir(quick_dir, line_dir)
+                mixed = _pick_free_port(17901 + idx)
+                socks = 17911 + idx
+                ctrl = 18901 + idx
+                save_config(line_dir, data, mixed_port=mixed, socks_port=socks,
+                            controller=f"127.0.0.1:{ctrl}")
+                proc = start_quick_proc(line_dir)
+                if proc is None:
+                    log.warning(f"{name} 内核启动失败，跳过检测")
+                    with rlock:
+                        results[name] = entry
+                    return
+                procs.append(proc)
+                if not wait_for_proxy_port(mixed, timeout=8):
+                    log.warning(f"{name} 代理未就绪，跳过延迟测试")
+                    with rlock:
+                        results[name] = entry
+                    return
+                # ---- 测速（走本线路独立端口）----
+                latencies = []          # 所有可达站点（含境内，用于展示/健康度）
+                abroad_ok = False        # 至少有一个境外站点经代理成功（可用硬条件）
+                abroad_latencies = []    # 仅境外站点延迟（用于选路比较）
+                for label, test_url, region in NODE_TEST_URLS:
+                    for attempt in range(2):
+                        try:
+                            proxy_handler = urllib.request.ProxyHandler({
+                                'http': f'http://127.0.0.1:{mixed}',
+                                'https': f'http://127.0.0.1:{mixed}',
+                            })
+                            opener = urllib.request.build_opener(proxy_handler)
+                            req = urllib.request.Request(test_url, headers={"User-Agent": "Mozilla/5.0"})
+                            start = time.time()
+                            resp = opener.open(req, timeout=NODE_TEST_TIMEOUT)
+                            elapsed = time.time() - start
+                            if resp.status in (200, 204):
+                                latencies.append(elapsed)
+                                if region == "abroad":
+                                    abroad_ok = True
+                                    abroad_latencies.append(elapsed)
+                                log.info(f"{name} 通过 {label} 测试成功, 延迟 {elapsed:.2f}s" +
+                                         (f" (重试第{attempt}次)" if attempt else "") +
+                                         (" [境内直连]" if region == "cn" else " [境外经代理]"))
+                                break
+                            else:
+                                log.warning(f"{name} {label} 测试返回非 200/204: {resp.status}")
+                        except Exception as e:
+                            log.warning(f"{name} {label} 测试失败 (第{attempt+1}次): {type(e).__name__}: {e}")
+                usable = abroad_ok
+                entry["avg"] = (sum(latencies) / len(latencies)) if latencies else -1.0
+                entry["best"] = min(latencies) if latencies else -1.0
+                entry["count"] = len(latencies)
+                entry["usable"] = usable
+                entry["abroad_best"] = min(abroad_latencies) if abroad_latencies else -1.0
+                entry["abroad_count"] = len(abroad_latencies)
+                if latencies and not usable:
                     log.warning(f"{name} 仅境内可达（或境外经代理失败），不视为可用线路")
-            else:
-                results.append((name, -1.0, -1.0, 0, data, False))
-                self.line_tested.emit(name, -1.0, False)
-                # Batch 3: 失败也记录
-                try:
-                    get_health_db().append(name, HealthRecord(
-                        ts=datetime.now().isoformat(timespec="seconds"),
-                        success=False, avg=-1.0, best=-1.0,
-                        count=0, total=len([u for u in NODE_TEST_URLS if u[2] == "abroad"]),
-                    ))
-                except Exception as e:
-                    log.warning(f"写健康度记录失败 {name}: {e}")
+            except Exception as e:
+                log.warning(f"{name} 检测异常: {e}")
+            with rlock:
+                results[name] = entry
+
+        threads = []
+        for idx, item in enumerate(downloaded):
+            t = threading.Thread(target=worker, args=(idx, item[0], item[1], item[2]), daemon=True)
+            threads.append(t)
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # ---- 精确终止所有测试实例（不误杀主代理 7890）并清理临时目录 ----
+        for proc in procs:
+            stop_quick_proc(proc)
+        try:
+            shutil.rmtree(base_test_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+        # ---- 汇总结果（主线程统一 emit，避免裸线程直接发 PyQt 信号）----
+        success_results = []
+        total_abroad = len([u for u in NODE_TEST_URLS if u[2] == "abroad"])
+        for name, data, _src in downloaded:
+            entry = results.get(name)
+            if entry is None:
+                continue
+            avg = entry["avg"]; best = entry["best"]; count = entry["count"]
+            usable = entry["usable"]; d = entry["data"]; ab = entry["abroad_best"]
+            self.line_tested.emit(name, (ab if ab > 0 else avg), usable)
+            try:
+                get_health_db().append(name, HealthRecord(
+                    ts=datetime.now().isoformat(timespec="seconds"),
+                    success=usable, avg=(ab if ab > 0 else -1.0),
+                    best=(ab if ab > 0 else -1.0),
+                    count=entry["abroad_count"], total=total_abroad,
+                ))
+            except Exception as e:
+                log.warning(f"写健康度记录失败 {name}: {e}")
+            if usable:
+                success_results.append((name, d))
 
         # 检测完成后自动选路：仅从“真正可用”（境外经代理成功）的线路中选一条
         fastest_name, fastest_data = None, None
-        if results:
-            successful = [(n, d) for n, avg, best, count, d, ok in results if ok]
-            if successful:
-                # 取第一条可用线路（免费节点延迟波动大，可用优先于最快）
-                fastest_name, fastest_data = successful[0]
-                log.info(f"自动选路: 选择可用线路 {fastest_name} (共 {len(successful)} 条可用)")
+        if success_results:
+            # 免费节点延迟波动大，可用优先于最快，取第一条可用线路
+            fastest_name, fastest_data = success_results[0]
+            log.info(f"自动选路: 选择可用线路 {fastest_name} (共 {len(success_results)} 条可用)")
 
         proxy_enabled = self.kwargs.get("proxy_enabled", False)
         current_line = self.kwargs.get("current_line", "")
@@ -4063,7 +4187,12 @@ class ServiceWorker(QThread):
             elif original_config:
                 save_config(quick_dir, original_config)
 
-        self.kwargs["results"] = results
+        # 保留下游(_on_test_finished)需要的 6 元组结构
+        self.kwargs["results"] = [
+            (r["name"], r["avg"], r["best"], r["count"], r["data"], r["usable"])
+            for name, _, _ in downloaded
+            for r in [results.get(name)] if r is not None
+        ]
         # 检测完成后自动切换线路
         if fastest_name:
             self.line_selected.emit(fastest_name)
