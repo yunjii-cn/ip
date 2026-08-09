@@ -2782,19 +2782,32 @@ def _filter_advanced_sections(advanced_text, present_keys):
     return "\n".join(kept).strip("\n")
 
 
-def save_config(quick_dir, config_data, mixed_port=None, socks_port=None, controller=None):
+def save_config(quick_dir, config_data, mixed_port=None, socks_port=None, controller=None,
+                yunji_src=None, inject_advanced=True):
+    """写入配置。
+
+    yunji_src: 指定从哪个配置提取 YUNJI 规则块（并行线路检测用它从【主配置】提取，
+        保证每条测试线都带上与主代理一致的 GEOIP,CN,DIRECT 等路由规则；为 None 时
+        从目标目录既有 config.yaml 提取——串行/主代理路径）。
+    inject_advanced: 是否补充高级段(tun/dns/sniffing)。并行测试实例为临时 ephemeral 进程，
+        不需要也不应启用 TUN（需管理员权限/虚拟网卡，可能初始化失败），故默认关闭。
+    """
     config_path = os.path.join(quick_dir, "config.yaml")
     backup_path = os.path.join(quick_dir, "config.yaml_backup")
     # 先读取已有的 YUNJI 注入规则和高级配置段
     yunji_blocks = []
     advanced_text = ""  # 高级配置（tun / dns / sniffing / global-client-fingerprint）
-    if os.path.isfile(config_path):
-        if os.path.isfile(backup_path):
+    # 提取源：优先用 yunji_src（主配置），否则用目标目录既有 config.yaml
+    src_path = yunji_src if (yunji_src and os.path.isfile(yunji_src)) else \
+        (config_path if os.path.isfile(config_path) else None)
+    if src_path:
+        # 仅当提取源就是目标自身时才做备份（避免并行时把主配置内容备份到测试子目录）
+        if src_path == config_path and os.path.isfile(backup_path):
             os.remove(backup_path)
-        shutil.copy2(config_path, backup_path)
+            shutil.copy2(config_path, backup_path)
         # 提取所有 YUNJI 标记块 和 高级配置段
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with open(src_path, "r", encoding="utf-8") as f:
                 old_content = f.read()
             markers = [
                 ("YUNJI_CUSTOM_RULES_START", "YUNJI_CUSTOM_RULES_END"),
@@ -2883,14 +2896,16 @@ def save_config(quick_dir, config_data, mixed_port=None, socks_port=None, contro
                 content = _inject_yunji_blocks(content, [b for _, b in yunji_blocks])
             # 高级配置：仅补充【新配置缺失】的段（如 tun），避免与下载源自带
             # 的 dns/sniffing 重复而产生顶层键冲突（重复键被 dedup 删除会丢配置）。
-            if advanced_text:
+            # inject_advanced=False 时（并行测试实例）跳过，避免临时进程启用 TUN。
+            if advanced_text and inject_advanced:
                 new_keys = set(re.findall(r'^([a-zA-Z][a-zA-Z0-9_-]*)\s*:', content, re.MULTILINE))
                 adv_to_add = _filter_advanced_sections(advanced_text, new_keys)
                 if adv_to_add:
                     content = adv_to_add + "\n" + content
             with open(config_path, "w", encoding="utf-8") as f:
                 f.write(content)
-            log.info(f"已保留 {len(yunji_blocks)} 个 YUNJI 规则块 + 高级配置")
+            log.info(f"已保留 {len(yunji_blocks)} 个 YUNJI 规则块" +
+                      (" + 高级配置" if (advanced_text and inject_advanced) else "（跳过高级段）"))
         except Exception as e:
             log.warning(f"恢复 YUNJI 规则块和高级配置失败: {e}")
     # 兜底：确保监听端口存在（线路检测用单条订阅覆盖时尤其容易丢失）
@@ -4095,8 +4110,12 @@ class ServiceWorker(QThread):
                 mixed = _pick_free_port(17901 + idx)
                 socks = 17911 + idx
                 ctrl = 18901 + idx
+                # 从【主配置】提取 YUNJI 路由规则（含 GEOIP,CN,DIRECT）注入到本条测试线，
+                # 保证与串行/主代理一致的路由语义——否则境内站点(baidu)会被迫走节点隧道，
+                # 节点一失效全部测速 URL 失败 → 整页“超时”。并行测试实例关闭高级段(TUN)注入。
                 save_config(line_dir, data, mixed_port=mixed, socks_port=socks,
-                            controller=f"127.0.0.1:{ctrl}")
+                            controller=f"127.0.0.1:{ctrl}",
+                            yunji_src=config_path, inject_advanced=False)
                 proc = start_quick_proc(line_dir)
                 if proc is None:
                     log.warning(f"{name} 内核启动失败，跳过检测")
