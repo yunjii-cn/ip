@@ -2695,6 +2695,69 @@ def _preprocess_config_for_quick(config_data):
         issues.append(f"预处理异常（已原样写入）: {e}")
         return text.encode("utf-8"), issues
 
+
+def _inject_yunji_blocks(content, blocks):
+    """把 YUNJI 规则块按本配置 rules: 段的实际缩进对齐后注入。
+
+    背景：_preprocess_config_for_quick 用 PyYAML safe_dump 重排，列表项默认顶格
+    （rules: 下的 - 在列 0）；而 YUNJI 块从历史配置抽取时带 2 空格缩进。两者混排
+    会让 mihomo 报 “did not find expected key” 致命（切换小体积订阅时必现）。
+    这里统一到 rules: 段首个列表项的缩进，保证序列内缩进一致。
+    """
+    lines = content.split("\n")
+    base_indent = 0
+    for i, l in enumerate(lines):
+        if re.match(r'^rules:\s*$', l):
+            for j in range(i + 1, min(i + 30, len(lines))):
+                s = lines[j]
+                if s.strip() == "" or s.strip().startswith("#"):
+                    continue
+                m = re.match(r'^(\s*)-\s', s)
+                if m:
+                    base_indent = len(m.group(1))
+                break
+            break
+    norm = []
+    for b in blocks:
+        for bl in b.split("\n"):
+            if bl.strip() == "":
+                norm.append("")
+            else:
+                norm.append((" " * base_indent) + bl.lstrip(" "))
+        norm.append("")
+    rp = re.compile(r'^(rules:\s*)$', re.MULTILINE)
+    return rp.sub(r'\1\n' + "\n".join(norm), content)
+
+
+def _filter_advanced_sections(advanced_text, present_keys):
+    """从 advanced_text 中只保留【新配置尚未包含】的顶层段（tun/dns/sniffing 等）。
+
+    避免把旧配置的 dns/sniffing 重新拼到顶部，与下载源自带段形成重复顶层键
+    （会被 _dedup_top_level_keys 删除，导致丢配置）。已存在的段直接丢弃。
+    """
+    lines = advanced_text.split("\n")
+    sections = []
+    cur_key = None
+    cur = []
+    for l in lines:
+        m = re.match(r'^([a-zA-Z][a-zA-Z0-9_-]*)\s*:', l)
+        if m and l[:1] not in (" ", "\t"):
+            if cur_key is not None:
+                sections.append((cur_key, cur))
+            cur_key = m.group(1)
+            cur = [l]
+        elif cur_key is not None:
+            cur.append(l)
+    if cur_key is not None:
+        sections.append((cur_key, cur))
+    kept = []
+    for key, sec in sections:
+        if key not in present_keys:
+            kept.extend(sec)
+            kept.append("")
+    return "\n".join(kept).strip("\n")
+
+
 def save_config(quick_dir, config_data):
     config_path = os.path.join(quick_dir, "config.yaml")
     backup_path = os.path.join(quick_dir, "config.yaml_backup")
@@ -2789,26 +2852,21 @@ def save_config(quick_dir, config_data):
                     "- MATCH,", "# YUNJI_ORIGINAL_MATCH_DISABLED   - MATCH,"
                 ) if "- MATCH," in content and "YUNJI_FINAL_RULE" not in content else content
             rules_pattern = re.compile(r'^(rules:\s*)$', re.MULTILINE)
-            if rules_pattern.search(content):
-                all_blocks = []
-                for _, block_text in yunji_blocks:
-                    all_blocks.append(block_text)
-                content = rules_pattern.sub(
-                    r'\1\n' + "\n".join(all_blocks), content
-                )
-                # 高级配置放在文件顶部
-                if advanced_text:
-                    content = advanced_text + "\n" + content
-                with open(config_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                log.info(f"已保留 {len(yunji_blocks)} 个 YUNJI 规则块 + 高级配置")
-            else:
-                # 没有 rules: 段（罕见情况），仍把高级配置写到顶部
-                if advanced_text:
-                    content = advanced_text + "\n" + content
-                    with open(config_path, "w", encoding="utf-8") as f:
-                        f.write(content)
-                    log.info(f"已保留 {len(yunji_blocks)} 个 YUNJI 规则块 + 高级配置（无 rules 段）")
+            if rules_pattern.search(content) and yunji_blocks:
+                # 关键修复：YUNJI 规则块按本配置 rules: 段实际缩进对齐，
+                # 否则 2 空格(YUNJI) 与 0 空格(safe_dump 输出) 混排会让 mihomo
+                # 报 “did not find expected key” 致命（切换小体积订阅时必现）。
+                content = _inject_yunji_blocks(content, [b for _, b in yunji_blocks])
+            # 高级配置：仅补充【新配置缺失】的段（如 tun），避免与下载源自带
+            # 的 dns/sniffing 重复而产生顶层键冲突（重复键被 dedup 删除会丢配置）。
+            if advanced_text:
+                new_keys = set(re.findall(r'^([a-zA-Z][a-zA-Z0-9_-]*)\s*:', content, re.MULTILINE))
+                adv_to_add = _filter_advanced_sections(advanced_text, new_keys)
+                if adv_to_add:
+                    content = adv_to_add + "\n" + content
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            log.info(f"已保留 {len(yunji_blocks)} 个 YUNJI 规则块 + 高级配置")
         except Exception as e:
             log.warning(f"恢复 YUNJI 规则块和高级配置失败: {e}")
     # 兜底：确保监听端口存在（线路检测用单条订阅覆盖时尤其容易丢失）
@@ -8725,7 +8783,7 @@ class MainWindow(QMainWindow):
             results = list(worker.kwargs["results"])
             auto_switch = self.switch_auto_line.isChecked()
 
-            for name, avg, best, count, data in results:
+            for name, avg, best, count, data, usable in results:
                 self.line_results[name] = data
                 if name not in self.line_rows:
                     continue
