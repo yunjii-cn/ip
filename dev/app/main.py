@@ -2026,41 +2026,101 @@ def _try_doh_ip_download(url, host, ips, timeout):
     )
 
 
-def download_config(url, timeout=30):
-    """下载配置文件，使用多级回退策略保证成功率
+def _is_valid_config_bytes(data):
+    """粗略判断下载到的字节是否像 Clash 配置（而非 HTML 错误页/空文件）。"""
+    if not data or len(data) < 20:
+        return False
+    head = data.lstrip()[:1]
+    if head.startswith(b"<"):
+        return False
+    # Clash YAML 常见起始： # / - / { / [ / proxy(s): / port: / mixed-port: / 任意可见文本
+    if head in (b"#", b"-", b"{", b"[", b"p", b"r", b"m", b"v"):
+        return True
+    return bool(head) and head.isalpha()
 
-    策略（按优先级）：
-    0. DNS-over-HTTPS + IP 直连（最优先）—— 对 raw.githubusercontent.com 等非 IP 域名无条件先走 DoH+IP，绕过 DNS 污染与"假正常 IP 直连封锁"导致的静默超时
-    1. 强制直连（ProxyHandler({})），绕过 Windows 系统代理/HTTPS_PROXY 环境变量
-       —— 解决 mihomo 代理"端口在但上游坏掉"导致的 SSL EOF 死循环
-    2. 走 PROXY_URL（应用代理，is_proxy_running() 时）—— 给无法直连的用户留通道
-    3. 走 urllib.request.urlopen()，尊重环境代理 —— 兜底
-    4. 显式走 127.0.0.1:7890 —— 最后兜底
+
+def _expand_mirrors(url):
+    """对 GitHub 原始/API 链接生成国内镜像候选（按可靠性排序），原始链接放最后兜底。
+
+    返回 [(candidate_url, kind), ...]：
+      'mirror' -> 普通直连（镜像站服务端已拉取，无需 DoH）
+      'doh'    -> 原始 GitHub 链接，走 DoH+IP 直连
+      'raw'    -> 非 GitHub 链接，普通直连
+    """
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host.endswith("raw.githubusercontent.com") or host in ("github.com", "api.github.com"):
+        m = re.match(r"^/([^/]+)/([^/]+)/(?:raw/)?([^/]+)/(.*)$", parsed.path)
+        out = []
+        # ghproxy.net 前缀（可代理 raw 与 api），国内最稳
+        out.append(("https://ghproxy.net/" + url, "mirror"))
+        # jsDelivr（仅 raw 类路径可转换为 gh 形式）
+        if m and host.endswith("raw.githubusercontent.com"):
+            owner, repo, branch, path = m.groups()
+            out.append((f"https://cdn.jsdelivr.net/gh/{owner}/{repo}@{branch}/{path}", "mirror"))
+        kind = "doh" if host.endswith("raw.githubusercontent.com") else "raw"
+        out.append((url, kind))
+        return out
+    return [(url, "raw")]
+
+
+def download_config(url, timeout=30):
+    """下载配置文件，多级回退，针对国内网络优化。
+
+    回退顺序：
+    0. 国内 GitHub 镜像直连（ghproxy.net / jsDelivr）—— 专为绕过 GFW 对 GitHub 的
+       IP/SNI 封锁设计，绝大多数国内网络最稳最快，最优先。
+    1. DNS-over-HTTPS + IP 直连 —— 兜底绕过 DNS 污染（部分网络仍可用）。
+    2. 走 PROXY_URL（应用代理在跑时）。
+    3. 强制直连（绕过系统代理/HTTPS_PROXY 环境变量）。
+    4. 走 urlopen() 尊重环境代理。
+    5. 显式走 127.0.0.1:7890。
     """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
-    # 解析 URL 获取 hostname
     parsed = urllib.parse.urlparse(url)
     host = parsed.hostname or ""
     is_ip = bool(host) and host.replace(".", "").isdigit()
 
-    # 层级 0（最优先）：DNS-over-HTTPS + IP 直连
-    # 绕过本地 DNS 污染，以及"DNS 返回看似正常、但直连被封锁的 IP"导致静默超时的情况。
-    # 对 raw.githubusercontent.com / api.github.com 等国内直连常失败的域名最可靠。
-    if host and not is_ip:
+    candidates = _expand_mirrors(url)
+    last_err = None
+
+    # 层级 0：国内镜像直连（最优先，绕过 GFW 对 GitHub 的封锁）
+    for cu, kind in candidates:
+        if kind != "mirror":
+            continue
+        try:
+            proxy_handler = urllib.request.ProxyHandler({})
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=ctx), proxy_handler)
+            req = urllib.request.Request(cu, headers={"User-Agent": "Mozilla/5.0"})
+            with opener.open(req, timeout=timeout) as resp:
+                data = resp.read()
+            if _is_valid_config_bytes(data):
+                log.info(f"镜像下载成功 ({cu}) {len(data)}B")
+                return data
+            else:
+                log.debug(f"镜像返回非配置内容 ({cu})，跳过")
+        except Exception as e:
+            last_err = e
+            log.debug(f"镜像下载失败 ({cu}): {type(e).__name__}: {e}")
+
+    # 层级 1：DoH+IP 直连（原始 GitHub 链接，兜底绕过 DNS 污染）
+    if not is_ip and host:
         try:
             ips = _resolve_via_doh(host)
             if ips:
                 data = _try_doh_ip_download(url, host, ips, timeout)
-                if data:
-                    log.info(f"DoH+IP 优先下载成功 ({host})")
+                if data and _is_valid_config_bytes(data):
+                    log.info(f"DoH+IP 下载成功 ({host})")
                     return data
         except Exception as e:
-            log.debug(f"DoH+IP 优先层失败 ({host}): {type(e).__name__}: {e}")
+            last_err = e
+            log.debug(f"DoH+IP 失败 ({host}): {type(e).__name__}: {e}")
 
-    # 层级 1：走 PROXY_URL（代理进程在跑时优先走代理——国内直连常被封锁）
+    # 层级 2：走 PROXY_URL（代理进程在跑时）
     if is_proxy_running():
         try:
             proxy_handler = urllib.request.ProxyHandler({
@@ -2074,12 +2134,14 @@ def download_config(url, timeout=30):
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with opener.open(req, timeout=timeout) as resp:
                 data = resp.read()
+            if _is_valid_config_bytes(data):
                 log.info(f"代理下载成功 ({url})")
                 return data
         except Exception as e:
+            last_err = e
             log.debug(f"走 PROXY_URL 失败 ({url}): {type(e).__name__}: {e}")
 
-    # 层级 2：强制直连（代理未运行时的回退）
+    # 层级 3：强制直连（绕过 Windows 系统代理/HTTPS_PROXY 环境变量）
     try:
         proxy_handler = urllib.request.ProxyHandler({})
         opener = urllib.request.build_opener(
@@ -2089,22 +2151,26 @@ def download_config(url, timeout=30):
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with opener.open(req, timeout=timeout) as resp:
             data = resp.read()
-            log.debug(f"直连下载成功 ({url})")
+        if _is_valid_config_bytes(data):
+            log.info(f"直连下载成功 ({url})")
             return data
     except Exception as e:
+        last_err = e
         log.debug(f"强制直连失败 ({url}): {type(e).__name__}: {e}")
 
-    # 层级 3：走 urlopen()，尊重环境代理设置（兜底）
+    # 层级 4：走 urlopen()，尊重环境代理设置（兜底）
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
             data = resp.read()
+        if _is_valid_config_bytes(data):
             log.info(f"urlopen 下载成功 ({url})")
             return data
     except Exception as e:
+        last_err = e
         log.debug(f"urlopen 失败 ({url}): {type(e).__name__}: {e}")
 
-    # 层级 4：显式走 127.0.0.1:7890（最后兜底）
+    # 层级 5：显式走 127.0.0.1:7890（最后兜底）
     try:
         proxy_handler = urllib.request.ProxyHandler({
             'http': f'http://127.0.0.1:7890',
@@ -2117,12 +2183,15 @@ def download_config(url, timeout=30):
         req2 = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with opener.open(req2, timeout=8) as resp:
             data = resp.read()
+        if _is_valid_config_bytes(data):
             log.info(f"127.0.0.1:7890 下载成功 ({url})")
             return data
     except Exception as e:
+        last_err = e
         log.debug(f"127.0.0.1:7890 失败 ({url}): {type(e).__name__}: {e}")
 
-    raise urllib.error.URLError("所有下载方式均失败")
+    raise urllib.error.URLError(f"所有下载方式均失败 (last_err={last_err})")
+
 
 
 # ========== free-nodes/clashfree 最新日期文件自动发现 ==========
@@ -2144,6 +2213,17 @@ def _github_api_json(api_path):
     """
     host = "api.github.com"
     url = f"https://{host}{api_path}"
+    # 先试国内 ghproxy 镜像（api.github.com 也常被封锁，镜像站服务端拉取）
+    try:
+        req = urllib.request.Request(
+            "https://ghproxy.net/" + url,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            if r.status == 200:
+                return json.loads(r.read())
+    except Exception as e:
+        log.debug(f"GitHub API ghproxy 镜像失败 ({api_path}): {type(e).__name__}: {e}")
+    # 回退：DoH+IP 直连
     ips = _resolve_via_doh(host)
     if not ips:
         return None
