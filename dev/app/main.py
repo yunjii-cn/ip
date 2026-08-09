@@ -177,9 +177,11 @@ NODE_TEST_URL = "https://www.gstatic.com/generate_204"
 # - 境内：兜底，当境外域名首包慢/被重置时，至少能确认「代理内核本身是通的」
 # 任一 URL 成功即判定该线路可用，避免误判整条线路超时
 NODE_TEST_URLS = [
-    ("Google", "https://www.gstatic.com/generate_204"),
-    ("Baidu", "https://www.baidu.com/"),
-    ("Cloudflare", "https://cp.cloudflare.com/"),
+    # region: "abroad" 表示必须经由代理隧道才能到达（用于判定线路是否真能代理境外）；
+    #         "cn"     表示境内直连可达（GEOIP,CN,DIRECT），仅作参考，不计入可用性。
+    ("Google", "https://www.gstatic.com/generate_204", "abroad"),
+    ("Cloudflare", "https://cp.cloudflare.com/", "abroad"),
+    ("Baidu", "https://www.baidu.com/", "cn"),
 ]
 
 _FREENODES_TOKEN = "__FREENODES_LATEST__"  # 占位符：运行时自动替换为最新日期文件
@@ -2519,6 +2521,107 @@ def _ensure_proxy_port(config_path, port=7890, socks_port=7891, controller="127.
         log.warning(f"补全端口配置失败: {e}")
 
 
+def _ensure_mmdb(quick_dir):
+    """确保 mihomo 工作目录内有 geoip.metadb（GEOIP 规则依赖）。
+
+    mihomo 启动默认从 -d 目录加载 geoip.metadb；缺失时它会去
+    github.com/MetaCubeX/meta-rules-dat 下载，而 GitHub 在国内被墙，
+    会直接导致内核 fatal 退出（"can't download MMDB"）→ 代理未就绪。
+    因此预置一份本地副本，并关闭 geo-auto-update，彻底规避联网下载。
+    """
+    try:
+        target = os.path.join(quick_dir, "geoip.metadb")
+        if os.path.isfile(target) and os.path.getsize(target) > 1_000_000:
+            return True
+        # 项目内已有副本（Android 资源里随包分发）
+        candidates = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "Quick", "geoip.metadb"),
+            r"E:\软件开发\云集智能网联代理专家\web\frontend\android\app\src\main\assets\mihomo\geoip.metadb",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
+                         "web", "frontend", "android", "app", "src", "main",
+                         "assets", "mihomo", "geoip.metadb"),
+        ]
+        for c in candidates:
+            c = os.path.abspath(c)
+            if os.path.isfile(c) and os.path.getsize(c) > 1_000_000:
+                shutil.copy2(c, target)
+                log.info(f"已预置 geoip.metadb -> {target}")
+                return True
+        log.warning("未找到 geoip.metadb 副本，GEOIP 规则可能需联网下载（或失败）")
+        return False
+    except Exception as e:
+        log.warning(f"预置 geoip.metadb 失败: {e}")
+        return False
+
+
+def _preprocess_config_for_quick(config_data):
+    """写入 mihomo 前对订阅配置做兼容预处理。
+
+    核心目标：强制注入本地 geoip 段（指向 ./geoip.metadb）并关闭 geo-auto-update，
+    避免内核启动联网下载 MMDB 被墙导致 fatal 退出（"代理未就绪"主因）。
+
+    策略（安全第一，绝不破坏合法配置）：
+    - 优先用 PyYAML 加载 → 在对象层注入 geoip 段 → dump。对 free-nodes/ripaojiedian
+      这类合法配置，结构零破坏。
+    - 若 YAML 加载失败（如 mfuu 上游脏数据），不做字段级硬修（正则补引号会破坏含
+      正则/转义/已引号的值），仅在文本顶部安全注入 geoip 段，并标记 PARSE_FAILED，
+      交由 mihomo 在测试时判定该线路不可用。
+
+    返回 (bytes, list_of_issues)。issues 末尾可能含 "PARSE_FAILED" 标记。
+    """
+    issues = []
+    if isinstance(config_data, (bytes, bytearray)):
+        text = config_data.decode("utf-8", errors="ignore")
+    else:
+        text = config_data
+
+    geoip_obj = {
+        "geo-auto-update": False,
+        "geoip": {
+            "datgeip": "./geoip.metadb",
+            "download-url": "",
+            "auto-update": False,
+        },
+    }
+
+    # 尝试 PyYAML 安全路径（dev 运行环境自带 PyYAML）
+    try:
+        import yaml as _yaml
+        doc = _yaml.safe_load(text)
+        if isinstance(doc, dict):
+            doc.pop("geosite", None)
+            doc.pop("geo-auto-update", None)
+            doc.update(geoip_obj)
+            out = _yaml.safe_dump(doc, allow_unicode=True, sort_keys=False)
+            issues.append("YAML 重排并注入本地 geoip 段")
+            return out.encode("utf-8"), issues
+    except Exception as e:
+        issues.append(f"YAML 加载失败（脏数据）: {type(e).__name__}")
+
+    # 兜底：文本顶部安全注入 geoip 段（不触碰下方正文，避免破坏结构）
+    try:
+        NL = chr(10)
+        geoip_block = (
+            "geo-auto-update: false" + NL
+            + "geoip:" + NL
+            + "  datgeip: ./geoip.metadb" + NL
+            + "  download-url: ''" + NL
+            + "  auto-update: false" + NL
+            + NL
+        )
+        def _strip_top(content, key):
+            p = re.compile(r'^' + re.escape(key) + r'\s*:.*$(' + NL + r'(?:[ \t]+[^\n]*\n?)*)?', re.MULTILINE)
+            return p.sub("", content)
+        text = _strip_top(text, "geoip")
+        text = _strip_top(text, "geosite")
+        text = re.sub(r'^geo-auto-update\s*:.*$', "", text, flags=re.MULTILINE)
+        out = geoip_block + text
+        issues.append("PARSE_FAILED: 已文本注入 geoip 段，线路可能在测试时因解析失败不可用")
+        return out.encode("utf-8"), issues
+    except Exception as e:
+        issues.append(f"预处理异常（已原样写入）: {e}")
+        return text.encode("utf-8"), issues
+
 def save_config(quick_dir, config_data):
     config_path = os.path.join(quick_dir, "config.yaml")
     backup_path = os.path.join(quick_dir, "config.yaml_backup")
@@ -2591,6 +2694,14 @@ def save_config(quick_dir, config_data):
                 config_data = filtered_text.encode("utf-8")
         except Exception as e:
             log.warning(f"国家筛选失败（已跳过）: {e}")
+    # 预置 geoip.metadb 并预处理配置（注入本地 MMDB 段、容错补 name 引号）
+    _ensure_mmdb(quick_dir)
+    try:
+        config_data, p_issues = _preprocess_config_for_quick(config_data)
+        for it in p_issues:
+            log.info(f"配置预处理: {it}")
+    except Exception as e:
+        log.warning(f"配置预处理失败（原样写入）: {e}")
     # 写入新配置
     with open(config_path, 'wb') as f:
         f.write(config_data)
@@ -2680,28 +2791,56 @@ def _dedup_top_level_keys(config_path):
 
 
 def start_quick(quick_dir):
+    """启动 mihomo(quick.exe)。
+
+    返回 (ok, reason)：
+      - ok=True  已成功拉起且未立即致命退出（端口是否就绪由调用方 wait_for_proxy 判定）
+      - ok=False 启动文件缺失，或进程在 6s 内 fatal 退出（配置解析/MMDB 等错误），
+        reason 含可读错误，便于线路检测区分“配置坏”与“代理未就绪”。
+    """
     quick_exe = os.path.join(quick_dir, "quick.exe")
     if not os.path.isfile(quick_exe):
         log.error(f"quick.exe 不存在: {quick_exe}")
-        return False
+        return False, "quick.exe 不存在"
     config_path = os.path.join(quick_dir, "config.yaml")
     if not os.path.isfile(config_path):
         log.error(f"config.yaml 不存在: {config_path}")
-        return False
+        return False, "config.yaml 不存在"
     # 启动前清理重复的顶层键，避免 mihomo 解析失败崩溃
     _dedup_top_level_keys(config_path)
     log.info(f"配置文件大小: {os.path.getsize(config_path)} bytes")
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     si.wShowWindow = 0
-    subprocess.Popen(
-        [quick_exe, "-d", quick_dir],
-        cwd=quick_dir,
-        startupinfo=si,
-        creationflags=subprocess.CREATE_NO_WINDOW
-    )
+    try:
+        proc = subprocess.Popen(
+            [quick_exe, "-d", quick_dir],
+            cwd=quick_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            startupinfo=si,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+    except Exception as e:
+        log.error(f"启动 quick.exe 异常: {e}")
+        return False, f"启动异常: {e}"
+    # 轮询 6s：若进程已退出且非 0，则为 fatal（配置解析失败/MMDB 缺失等）
+    for _ in range(12):
+        time.sleep(0.5)
+        if proc.poll() is not None:
+            rc = proc.returncode
+            out = b""
+            try:
+                out = proc.stdout.read() if proc.stdout else b""
+            except Exception:
+                pass
+            tail = out.decode("utf-8", errors="ignore")[-400:]
+            if rc != 0 or "level=fatal" in tail:
+                log.error(f"quick.exe 启动即致命退出(rc={rc}): {tail}")
+                return False, f"内核解析/启动失败: {tail[-200:]}"
+            break
     log.info(f"已启动代理内核: {quick_exe}")
-    return True
+    return True, ""
 
 
 def stop_quick():
@@ -3649,10 +3788,25 @@ class ServiceWorker(QThread):
             stop_quick()
             time.sleep(1)
 
-            start_quick(quick_dir)
+            ok, reason = start_quick(quick_dir)
+            if not ok:
+                # 内核启动即致命退出（配置解析失败 / MMDB 缺失等），该线路不可用
+                log.warning(f"{name} 内核启动失败，跳过检测: {reason}")
+                results.append((name, -1.0, -1.0, 0, data, False))
+                self.line_tested.emit(name, -1.0, False)
+                try:
+                    get_health_db().append(name, HealthRecord(
+                        ts=datetime.now().isoformat(timespec="seconds"),
+                        success=False, avg=-1.0, best=-1.0,
+                        count=0, total=len(NODE_TEST_URLS),
+                    ))
+                except Exception as e:
+                    log.warning(f"写健康度记录失败 {name}: {e}")
+                continue
+
             if not wait_for_proxy(timeout=25):
                 log.warning(f"{name} 代理未就绪，跳过延迟测试")
-                results.append((name, -1.0, -1.0, 0, data))
+                results.append((name, -1.0, -1.0, 0, data, False))
                 self.line_tested.emit(name, -1.0, False)
                 # Batch 3: 代理未就绪也算失败
                 try:
@@ -3665,8 +3819,10 @@ class ServiceWorker(QThread):
                     log.warning(f"写健康度记录失败 {name}: {e}")
                 continue
 
-            latencies = []
-            for label, test_url in NODE_TEST_URLS:
+            latencies = []          # 所有可达站点（含境内，用于展示/健康度）
+            abroad_ok = False        # 至少有一个境外站点经代理成功（线路真正可用的硬条件）
+            abroad_latencies = []    # 仅境外站点延迟（用于选路比较）
+            for label, test_url, region in NODE_TEST_URLS:
                 # 单 URL 失败后重试 1 次：quick.exe 刚启动可能尚未完成首次握手/DNS 解析，
                 # 首包超时并不代表线路本身不可用，重试可显著降低误判
                 for attempt in range(2):
@@ -3682,50 +3838,59 @@ class ServiceWorker(QThread):
                         elapsed = time.time() - start
                         if resp.status in (200, 204):
                             latencies.append(elapsed)
+                            if region == "abroad":
+                                abroad_ok = True
+                                abroad_latencies.append(elapsed)
                             log.info(f"{name} 通过 {label} 测试成功, 延迟 {elapsed:.2f}s" +
-                                     (f" (重试第{attempt}次)" if attempt else ""))
+                                     (f" (重试第{attempt}次)" if attempt else "") +
+                                     (" [境内直连]" if region == "cn" else " [境外经代理]"))
                             break
                         else:
                             log.warning(f"{name} {label} 测试返回非 200/204: {resp.status}")
                     except Exception as e:
                         log.warning(f"{name} {label} 测试失败 (第{attempt+1}次): {type(e).__name__}: {e}")
 
+            # 线路可用判定：必须至少有一个境外站点经代理成功（Baidu 等境内直连不算）
+            usable = abroad_ok
             if latencies:
                 avg = sum(latencies) / len(latencies)
                 best = min(latencies)
-                results.append((name, avg, best, len(latencies), data))
-                self.line_tested.emit(name, avg, True)
+                # avg 仅用于展示；选路以 abroad_latencies 为准
+                results.append((name, avg, best, len(latencies), data, usable))
+                self.line_tested.emit(name, (min(abroad_latencies) if abroad_latencies else avg), usable)
                 # Batch 3: 写健康度记录
                 try:
                     get_health_db().append(name, HealthRecord(
                         ts=datetime.now().isoformat(timespec="seconds"),
-                        success=True, avg=avg, best=best,
-                        count=len(latencies), total=len(NODE_TEST_URLS),
+                        success=usable, avg=(min(abroad_latencies) if abroad_latencies else -1.0),
+                        best=(min(abroad_latencies) if abroad_latencies else -1.0),
+                        count=len(abroad_latencies), total=len([u for u in NODE_TEST_URLS if u[2] == "abroad"]),
                     ))
                 except Exception as e:
                     log.warning(f"写健康度记录失败 {name}: {e}")
+                if not usable:
+                    log.warning(f"{name} 仅境内可达（或境外经代理失败），不视为可用线路")
             else:
-                results.append((name, -1.0, -1.0, 0, data))
+                results.append((name, -1.0, -1.0, 0, data, False))
                 self.line_tested.emit(name, -1.0, False)
                 # Batch 3: 失败也记录
                 try:
                     get_health_db().append(name, HealthRecord(
                         ts=datetime.now().isoformat(timespec="seconds"),
                         success=False, avg=-1.0, best=-1.0,
-                        count=0, total=len(NODE_TEST_URLS),
+                        count=0, total=len([u for u in NODE_TEST_URLS if u[2] == "abroad"]),
                     ))
                 except Exception as e:
                     log.warning(f"写健康度记录失败 {name}: {e}")
 
-        # 检测完成后自动选路：选择延迟最低且成功的线路
+        # 检测完成后自动选路：仅从“真正可用”（境外经代理成功）的线路中选一条
         fastest_name, fastest_data = None, None
         if results:
-            # 过滤出成功的线路（avg >= 0）
-            successful = [(n, avg, d) for n, avg, best, count, d in results if avg >= 0]
+            successful = [(n, d) for n, avg, best, count, d, ok in results if ok]
             if successful:
-                # 按平均延迟排序，取最快的
-                fastest_name, _, fastest_data = min(successful, key=lambda x: x[1])
-                log.info(f"自动选路: 选择最快线路 {fastest_name} (延迟 {successful[0][1]:.2f}s)")
+                # 取第一条可用线路（免费节点延迟波动大，可用优先于最快）
+                fastest_name, fastest_data = successful[0]
+                log.info(f"自动选路: 选择可用线路 {fastest_name} (共 {len(successful)} 条可用)")
 
         proxy_enabled = self.kwargs.get("proxy_enabled", False)
         current_line = self.kwargs.get("current_line", "")
@@ -3792,7 +3957,18 @@ class ServiceWorker(QThread):
                 stop_quick()
                 time.sleep(1)
 
-            start_quick(quick_dir)
+            ok, reason = start_quick(quick_dir)
+            if not ok:
+                log.warning(f"{name} 内核启动失败，跳过自动选择: {reason}")
+                try:
+                    health_db.append(name, HealthRecord(
+                        ts=datetime.now().isoformat(timespec="seconds"),
+                        success=False, avg=-1.0, best=-1.0,
+                        count=0, total=1,
+                    ))
+                except Exception:
+                    pass
+                continue
             if not wait_for_proxy(timeout=8):
                 log.warning(f"{name} 代理未就绪，跳过自动选择")
                 # 记录失败
