@@ -2585,6 +2585,42 @@ def _ensure_mmdb(quick_dir):
         return False
 
 
+def _safe_clash_text_fixes(text):
+    """对订阅配置做【纯文本、零风险】兼容修复。
+
+    只动“明确已知会让当前 mihomo 致命/报错”的写法，绝不重排缩进、绝不改动合法结构
+    （历史教训：曾用按段拉齐缩进的 _normalize_clash_indentation，反而把本身合法的
+    37000 行配置打坏，制造 “did not find expected key” 假致命）。
+
+    处理项：
+      1. chacha20-poly1305 → chacha20-ietf-poly1305
+         部分老订阅/合并配置用了旧名，当前 mihomo 已移除，会触发
+         “unknown method: chacha20-poly1305” fatal。
+      2. 删除顶层 global-client-fingerprint
+         当前 mihomo 已移除该顶层键（要求改到每个 proxy 的 client-fingerprint），
+         虽不致命但会刷 error 日志，删掉消除噪音。
+
+    返回 (text, list_of_changes)。
+    """
+    changes = []
+    OLD, NEW = "chacha20-poly1305", "chacha20-ietf-poly1305"
+    if OLD in text:
+        n = text.count(OLD)
+        text = text.replace(OLD, NEW)
+        changes.append(f"修正 {n} 处过时 cipher 名({OLD}→{NEW})")
+    new = re.sub(r'(?m)^global-client-fingerprint\s*:.*\r?\n?', "", text)
+    if new != text:
+        changes.append("移除已废弃的 global-client-fingerprint 顶层键")
+        text = new
+    # 修正 geoip 键名拼写错误 datgeip → datageip
+    # （拼写错会让 mihomo 忽略本地 geoip.metadb，转而去下载被墙的 GitHub MMDB 而 fatal）
+    if "datgeip" in text:
+        n = text.count("datgeip")
+        text = text.replace("datgeip", "datageip")
+        changes.append(f"修正 {n} 处 geoip 键名拼写(datgeip→datageip)")
+    return text, changes
+
+
 def _preprocess_config_for_quick(config_data):
     """写入 mihomo 前对订阅配置做兼容预处理。
 
@@ -2594,8 +2630,8 @@ def _preprocess_config_for_quick(config_data):
     策略（安全第一，绝不破坏合法配置）：
     - 优先用 PyYAML 加载 → 在对象层注入 geoip 段 → dump。对 free-nodes/ripaojiedian
       这类合法配置，结构零破坏。
-    - 若 YAML 加载失败（如 mfuu 上游脏数据），不做字段级硬修（正则补引号会破坏含
-      正则/转义/已引号的值），仅在文本顶部安全注入 geoip 段，并标记 PARSE_FAILED，
+    - 若 YAML 加载失败（如 mfuu 上游脏数据 / rules 段顶格等格式问题），先做缩进修复
+      再尝试，仍失败则在文本顶部安全注入 geoip 段，并标记 PARSE_FAILED，
       交由 mihomo 在测试时判定该线路不可用。
 
     返回 (bytes, list_of_issues)。issues 末尾可能含 "PARSE_FAILED" 标记。
@@ -2606,10 +2642,16 @@ def _preprocess_config_for_quick(config_data):
     else:
         text = config_data
 
+    # 纯文本安全修复：只改明确已知会让 mihomo 致命/报错的写法，
+    # 绝不重排缩进（历史教训：按段拉齐缩进会把合法配置打坏）
+    text, t_changes = _safe_clash_text_fixes(text)
+    if t_changes:
+        issues.extend(t_changes)
+
     geoip_obj = {
         "geo-auto-update": False,
         "geoip": {
-            "datgeip": "./geoip.metadb",
+            "datageip": "./geoip.metadb",
             "download-url": "",
             "auto-update": False,
         },
@@ -2635,7 +2677,7 @@ def _preprocess_config_for_quick(config_data):
         geoip_block = (
             "geo-auto-update: false" + NL
             + "geoip:" + NL
-            + "  datgeip: ./geoip.metadb" + NL
+            + "  datageip: ./geoip.metadb" + NL
             + "  download-url: ''" + NL
             + "  auto-update: false" + NL
             + NL
@@ -2839,6 +2881,19 @@ def start_quick(quick_dir):
         return False, "config.yaml 不存在"
     # 启动前清理重复的顶层键，避免 mihomo 解析失败崩溃
     _dedup_top_level_keys(config_path)
+    # 启动前对配置做一次【纯文本安全修复】（修正过时 cipher / 废弃键 / geoip 拼写），
+    # 保证即使遗留了旧版/损坏的 config.yaml（如 chacha20-poly1305、datgeip 拼写），
+    # 内核也能正常解析启动，而不必依赖用户先手动“更新配置”。文本级改动零风险、幂等。
+    try:
+        with open(config_path, "rb") as _f:
+            _raw = _f.read()
+        _fixed, _chg = _safe_clash_text_fixes(_raw.decode("utf-8", errors="ignore"))
+        if _chg:
+            with open(config_path, "w", encoding="utf-8") as _f:
+                _f.write(_fixed)
+            log.info(f"启动前安全修复 config.yaml: {_chg}")
+    except Exception as _e:
+        log.warning(f"启动前修复 config.yaml 失败（沿用原文件）: {_e}")
     log.info(f"配置文件大小: {os.path.getsize(config_path)} bytes")
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
