@@ -186,20 +186,27 @@ NODE_TEST_URLS = [
 
 _FREENODES_TOKEN = "__FREENODES_LATEST__"  # 占位符：运行时自动替换为最新日期文件
 
+# =====================================================================
+# 配置下载源（2026-08-09 重构）
+# ---------------------------------------------------------------------
+# 经验证，GitHub(raw.githubusercontent.com) 在国内被 GFW 的 IP+SNI 双重封锁，
+# 即便走 DoH+IP / ghproxy / jsDelivr 镜像也极不稳定，导致"配置更新"长期失败。
+# 参考可正常使用的 Chrome143_Quick 项目，其配置更新走的是 GitLab 镜像链路：
+#   主源  gitlabip.xyz  —— 专用于绕过 GFW 的 GitLab 镜像域名（国内直连可达）
+#   备源  gitlab.com    —— 直连兜底（部分网络可用）
+# 二者内容同源（Alvin9999/PAC 与 free9999/ipupdate 两个仓库都托管同一份
+# backup/img/1/2/ipp/quick/{1..4}/config.yaml），故 4 条线路直接映射到 quick/1..4。
+# =====================================================================
+_GITLAB_MIRROR = "https://www.gitlabip.xyz"          # GitLab GFW 绕过镜像
+_GITLAB_RAW_TPL = "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/{n}/config.yaml"
+_GITLAB_MIRROR_TPL = _GITLAB_MIRROR + "/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/{n}/config.yaml"
+
 CONFIG_URLS = [
-    # 活跃维护的免费节点仓库（GitHub raw），通过 DoH+IP 层绕过 DNS 污染
-    # free-nodes/clashfree 使用日期文件名（clashYYYYMMDD.yml），旧文件会被清理，
-    # 故不再硬编码日期，改用 _FREENODES_TOKEN 占位，运行时自动发现最新文件见：
-    #   https://github.com/free-nodes/clashfree （每日更新）
-    # 备选 GitLab 源作为直连回退
-    ("线路1", _FREENODES_TOKEN,
-     "https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml"),
-    ("线路2", "https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml",
-     "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash"),
-    ("线路3", "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash",
-     _FREENODES_TOKEN),
-    ("线路4", _FREENODES_TOKEN,
-     "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash"),
+    # (线路名, 主源=GitLab 镜像[绕过 GFW], 备源=GitLab 直连)
+    ("线路1", _GITLAB_MIRROR_TPL.format(n=1), _GITLAB_RAW_TPL.format(n=1)),
+    ("线路2", _GITLAB_MIRROR_TPL.format(n=2), _GITLAB_RAW_TPL.format(n=2)),
+    ("线路3", _GITLAB_MIRROR_TPL.format(n=3), _GITLAB_RAW_TPL.format(n=3)),
+    ("线路4", _GITLAB_MIRROR_TPL.format(n=4), _GITLAB_RAW_TPL.format(n=4)),
 ]
 
 # ========== 自定义订阅（Batch 1） ==========
@@ -906,7 +913,7 @@ COLOR_ORANGE = "#FF9800"
 # Batch 4: 多上游支持 (备选仓库管理)
 # =====================================================================
 BACKUP_SOURCES_FILE = os.path.join(USER_DATA_DIR, "backup_sources.json")
-BUILTIN_BACKUP_SOURCES_VERSION = 4  # 2026-06-25: 替换失效源为活跃维护的 free-nodes/mfuu/ripaojiedian
+BUILTIN_BACKUP_SOURCES_VERSION = 5  # 2026-08-09: 全量切到 GitLab 镜像链路（gitlabip.xyz + gitlab.com），解决 GitHub 被 GFW 封锁导致配置更新失败
 
 # 已知失效的备选源名称（版本升级时自动删除，避免用户看到一堆"未下载"的死源）
 DEPRECATED_BACKUP_SOURCE_NAMES = {
@@ -915,8 +922,11 @@ DEPRECATED_BACKUP_SOURCE_NAMES = {
     "Alvin9999/PAC (GitHub 原始)",
     "v2ray-free (GitHub)",
     "free-nodes (GitHub)",
+    "free-nodes/clashfree (GitHub)",
     "Jsnzkpg/Jsnzkpg (GitHub)",
+    "mfuu/v2ray (GitHub)",
     "mfuu/v2ray (GitHub→ghfast)",         # ghfast.top DNS 污染后失效
+    "ripaojiedian/freenode (GitHub)",
     "ripaojiedian/freenode (GitHub→ghfast)",  # ghfast.top DNS 污染后失效
 }
 
@@ -924,28 +934,30 @@ DEPRECATED_BACKUP_SOURCE_NAMES = {
 # 内置默认备选上游仓库（首次启动时自动写入 backup_sources.json）
 # 每条: (备注名, 主URL, 备用URL列表, 默认启用?)
 # 备用 URL 会在主 URL 失败时按顺序尝试。多个备用 URL 能大幅提升可达率。
-# 2026-06-25: 替换为活跃维护的免费仓库（free-nodes 每日更新, mfuu/ripaojiedian 持续维护）
-# 使用原始 raw.githubusercontent.com 地址，download_config 内置 DoH+IP 回退
+# 2026-08-09: 全部改为 GitLab 镜像链路（参考可正常使用的 Chrome143_Quick 项目）。
+#   主源 gitlabip.xyz 绕过 GFW；备源 gitlab.com 直连兜底。
+#   与 CONFIG_URLS 不同的聚合仓库（free9999/ipupdate 主 + Alvin9999/PAC 备）提供额外冗余。
 BUILTIN_BACKUP_SOURCES = [
     (
-        "free-nodes/clashfree (GitHub)",
-        "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260622.yml",
+        "free9999/ipupdate 线路合集 (GitLab镜像)",
+        "https://www.gitlabip.xyz/free9999/ipupdate/refs/heads/master/backup/img/1/2/ipp/quick/1/config.yaml",
         [
-            "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260621.yml",
-            "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260620.yml",
+            "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/2/config.yaml",
+            "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/3/config.yaml",
+            "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/4/config.yaml",
+            "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/1/config.yaml",
         ],
         True,
     ),
     (
-        "mfuu/v2ray (GitHub)",
-        "https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml",
-        [],
-        True,
-    ),
-    (
-        "ripaojiedian/freenode (GitHub)",
-        "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash",
-        [],
+        "Alvin9999/PAC 线路合集 (GitLab镜像)",
+        "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/2/config.yaml",
+        [
+            "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/1/config.yaml",
+            "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/3/config.yaml",
+            "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/4/config.yaml",
+            "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/2/config.yaml",
+        ],
         True,
     ),
 ]
@@ -2048,6 +2060,9 @@ def _expand_mirrors(url):
       'mirror' -> 普通直连（镜像站服务端已拉取，无需 DoH）
       'doh'    -> 原始 GitHub 链接，走 DoH+IP 直连
       'raw'    -> 非 GitHub 链接，普通直连
+
+    2026-08-09: 新增 GitLab 镜像链路。gitlab.com 的 raw 链接自动转为
+      gitlabip.xyz（专用于绕过 GFW 的 GitLab 镜像域名），作为最优先直连候选。
     """
     parsed = urllib.parse.urlparse(url)
     host = (parsed.hostname or "").lower()
@@ -2063,6 +2078,13 @@ def _expand_mirrors(url):
         kind = "doh" if host.endswith("raw.githubusercontent.com") else "raw"
         out.append((url, kind))
         return out
+    # GitLab 镜像链路：gitlab.com 的 /-/raw/ 链接转 gitlabip.xyz/refs/heads/ 形式
+    if host == "gitlab.com":
+        m = re.match(r"^/([^/]+)/([^/]+)/-/raw/([^/]+)/(.*)$", parsed.path)
+        if m:
+            owner, repo, branch, path = m.groups()
+            mirror = f"https://www.gitlabip.xyz/{owner}/{repo}/refs/heads/{branch}/{path}"
+            return [(mirror, "mirror"), (url, "raw")]
     return [(url, "raw")]
 
 
@@ -2341,8 +2363,17 @@ def get_freenodes_latest_url(force=False):
 
 
 def get_effective_config_urls():
-    """把 CONFIG_URLS 中的 _FREENODES_TOKEN 替换为运行时发现的最新 URL。"""
-    fn = get_freenodes_latest_url()
+    """把 CONFIG_URLS 中的 _FREENODES_TOKEN 替换为运行时发现的最新 URL。
+
+    2026-08-09: 若 CONFIG_URLS 中已无任何 _FREENODES_TOKEN（当前默认如此，
+    主源已全部切到 GitLab 镜像链路），则跳过 free-nodes 的 GitHub 发现，
+    避免每次"更新配置"都徒增一次被 GFW 掐断的 GitHub API 请求（10~30s 延迟）。
+    """
+    uses_token = any(
+        primary == _FREENODES_TOKEN or fallback == _FREENODES_TOKEN
+        for _, primary, fallback in CONFIG_URLS
+    )
+    fn = get_freenodes_latest_url() if uses_token else ""
     out = []
     for name, primary, fallback in CONFIG_URLS:
         p = fn if primary == _FREENODES_TOKEN else primary
