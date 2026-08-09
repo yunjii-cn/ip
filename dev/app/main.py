@@ -2525,29 +2525,53 @@ def download_all_configs():
 
 
 def _ensure_proxy_port(config_path, port=7890, socks_port=7891, controller="127.0.0.1:9090"):
-    """保证配置文件含有监听端口与外部控制端口。
+    """保证配置文件含有监听端口与外部控制端口，且【强制覆盖】为指定值。
 
-    线路检测时 save_config 会用单条订阅配置覆盖 config.yaml，而部分订阅源
-    （如 free-nodes/clashfree）原始内容不含 port/socks-port/external-controller，
-    导致 mihomo 不在 7890 监听，wait_for_proxy 永远超时（"代理未就绪"）。
-    本函数在写入后兜底补全缺失的端口键。
+    为什么强制覆盖（而不是“缺失才补”）：
+      并发线路检测时每条线路通过 save_config 传入独立的 mixed_port/socks_port/
+      controller（如 17901/17911/18901），用以避免多实例抢同一端口。但下载源
+      配置自身常带 mixed-port（通常 7890 或上游固定值），若只在“缺失时补”，
+      传入的独立端口会被忽略，导致多条线路内核全部抢占同一端口、互相 bind 失败
+      / 测速串线。因此这里始终用传入值替换已有的监听端口键。
+
+    订阅源（如 free-nodes/clashfree）原始内容不含这些键时，本函数同样会补上，
+    避免 mihomo 不在指定端口监听、wait_for_proxy 永远超时（“代理未就绪”）。
     """
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             content = f.read()
-        has_listen = re.search(r'^\s*(port|mixed-port|socks-port)\s*:', content, re.MULTILINE)
-        has_controller = re.search(r'^\s*external-controller\s*:', content, re.MULTILINE)
-        add = []
-        if not has_listen:
-            add.append(f"port: {port}")
-            add.append(f"socks-port: {socks_port}")
-        if not has_controller:
-            add.append(f"external-controller: {controller}")
-        if add:
-            content = "\n".join(add) + "\n" + content
-            with open(config_path, "w", encoding="utf-8") as f:
-                f.write(content)
-            log.info(f"已补全监听端口配置: {add}")
+        # 强制替换【顶层（列 0）】的 port / mixed-port / socks-port / external-controller 行。
+        # 注意：只匹配列 0 的键，绝不碰节点内部缩进的 port:（否则会把代理节点的
+        # 内部端口误改成 mixed-port，导致 “proxy N: '' has unset fields: port” fatal）。
+        content = re.sub(r'^(mixed-port|socks-port|external-controller)\s*:.*$',
+                         lambda m: (f"mixed-port: {port}" if m.group(1) == "mixed-port"
+                                    else f"socks-port: {socks_port}" if m.group(1) == "socks-port"
+                                    else f"external-controller: {controller}"),
+                         content, flags=re.MULTILINE)
+        # 顶层 port:（singular，部分旧源使用）统一改为 mixed-port
+        content = re.sub(r'^port\s*:.*$', f"mixed-port: {port}", content, flags=re.MULTILINE)
+        # 若经替换后仍未出现（原配置完全没有这些顶层键），则补到顶部
+        if not re.search(r'^mixed-port\s*:', content, re.MULTILINE):
+            content = f"mixed-port: {port}\nsocks-port: {socks_port}\n" + content
+        if not re.search(r'^external-controller\s*:', content, re.MULTILINE):
+            content = f"external-controller: {controller}\n" + content
+        # 去重：同一端口键（mixed-port / socks-port / external-controller）可能原配置
+        # 与下载源各有一份，正则已全部统一为传入值，但会留下重复顶层键，mihomo 会报
+        # “mapping key already defined”。这里每个键只保留第一份。
+        out_lines = []
+        seen = set()
+        for line in content.split("\n"):
+            m = re.match(r'^(mixed-port|socks-port|external-controller)\s*:', line)
+            if m:
+                key = m.group(1)
+                if key in seen:
+                    continue
+                seen.add(key)
+            out_lines.append(line)
+        content = "\n".join(out_lines)
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        log.info(f"已补全监听端口配置: ['mixed-port: {port}', 'socks-port: {socks_port}', 'external-controller: {controller}']")
     except Exception as e:
         log.warning(f"补全端口配置失败: {e}")
 
@@ -3077,10 +3101,24 @@ def _prepare_test_dir(base_quick_dir, line_dir):
     Country.mmdb / cache.db / logs）都相对该目录。为避免多实例抢同一 cache.db、
     又能共享只读的 MMDB，这里：
       - makedirs(line_dir)
+      - 把 quick.exe 也硬链接进子目录（_launch_quick 依赖该目录内有 quick.exe，
+        否则会报“quick.exe 不存在”导致该线路直接失败——这是并发改造初期
+        所有线路瞬间失败、进而触发“全部失败→更新配置→重测”死循环的根因）
       - 对只读的 geoip.metadb / Country.mmdb 做硬链接（同卷零成本），失败则拷贝
       - cache.db / logs 由 mihomo 在子目录内自行创建（天然隔离）
     """
     os.makedirs(line_dir, exist_ok=True)
+    # quick.exe 是自包含单文件（无配套 dll），必须进子目录，否则启动失败
+    exe_src = os.path.join(base_quick_dir, "quick.exe")
+    exe_dst = os.path.join(line_dir, "quick.exe")
+    if os.path.isfile(exe_src) and not os.path.exists(exe_dst):
+        try:
+            os.link(exe_src, exe_dst)  # 53MB 同卷硬链接，零额外空间
+        except Exception:
+            try:
+                shutil.copy2(exe_src, exe_dst)
+            except Exception as e:
+                log.warning(f"准备测试目录拷贝 quick.exe 失败: {e}")
     for name in ("geoip.metadb", "Country.mmdb"):
         src = os.path.join(base_quick_dir, name)
         dst = os.path.join(line_dir, name)
@@ -8821,6 +8859,8 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             return
         self._cleanup_worker()
+        # 用户手动发起新一轮检测：重置“全部失败后自动重测”的计数（仅允许自动重测 1 次）
+        self._test_retry_count = 0
         if self._should_skip_config_update():
             self._start_line_test()
             return
@@ -8941,6 +8981,12 @@ class MainWindow(QMainWindow):
                     self._pending_browser_open = self.switch_auto_browser.isChecked()
                     self._on_use_line(fastest[0])
             else:
+                # 全部失败后，最多再更新配置重测【一次】，避免节点普遍失效时无限循环
+                self._test_retry_count = getattr(self, "_test_retry_count", 0) + 1
+                if self._test_retry_count > 1:
+                    self.line_progress.setText("检测完成 - 无可用线路（已重试 1 次仍失败）")
+                    self.line_progress.setStyleSheet("font-size: 8pt; color: #FF6B80;")
+                    return
                 self.line_progress.setText("检测完成 - 无可用线路，正在更新配置并重测...")
                 self.line_progress.setStyleSheet("font-size: 8pt; color: #FF6B80;")
                 # 全部失败后，更新配置并重测一次
