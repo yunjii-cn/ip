@@ -2845,6 +2845,14 @@ def save_config(quick_dir, config_data, mixed_port=None, socks_port=None, contro
                 advanced_text += fp_match.group(0)
         except Exception:
             pass
+    # 健壮性：无论主配置是否存在 / 是否带 YUNJI 标记，并行线路检测都必须保证
+    # 境内直连规则 GEOIP,CN,DIRECT 存在。否则当主配置缺失（首次运行/损坏）或无标记
+    # （旧版配置）时，yunji_blocks 为空 → baidu 等境内站点被迫走失效节点隧道 →
+    # 全部测速 URL 失败 → 整页“超时”。这是 2026-08-10 并行检测“全部超时”的根因之一。
+    if not any("GEOIP,CN,DIRECT" in b for _, b in yunji_blocks):
+        yunji_blocks.append(("YUNJI_PROXY_MODE_START",
+                             "# YUNJI_PROXY_MODE_START\n- GEOIP,CN,DIRECT\n# YUNJI_PROXY_MODE_END"))
+        log.info("已强制补注入境内直连规则 GEOIP,CN,DIRECT（主配置无标记或缺失）")
     # Batch 2: 国家白名单过滤（在写入前生效）
     try:
         wl = load_country_whitelist()
