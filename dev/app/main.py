@@ -2645,6 +2645,40 @@ def _safe_clash_text_fixes(text):
     return text, changes
 
 
+def _repair_rules_indentation(text):
+    """把 rules: 段里混排(列0 / 有缩进)的列表项与注释统一拉到列0，消除 mihomo 严格
+    YAML 的 "did not find expected key"。
+
+    只作用于 rules: 块内部的列表项('- ...')与注释('# ...')行，绝不改动其它段
+    （如节点的 server:/port: 等），因此不会重蹈 _normalize_clash_indentation 把
+    整个文件拉齐而打坏合法配置的覆辙。幂等：列0 项保持列0 不变。
+    """
+    lines = text.split("\n")
+    out = []
+    in_rules = False
+    for ln in lines:
+        if re.match(r'^rules\s*:\s*$', ln):
+            in_rules = True
+            out.append(ln)
+            continue
+        if in_rules:
+            if ln and ln[0] not in (" ", "\t", "-", "#"):
+                # 遇到下一个顶层键（列0 非列表/非注释行）→ 退出 rules 块
+                in_rules = False
+                out.append(ln)
+                continue
+            stripped = ln.lstrip()
+            if stripped == "" or stripped[0] in ("-", "#"):
+                # rules 块内的空行/列表项/注释：统一列0
+                out.append(stripped)
+                continue
+            # rules 块内其它（极少见）原样保留
+            out.append(ln)
+            continue
+        out.append(ln)
+    return "\n".join(out)
+
+
 def _preprocess_config_for_quick(config_data):
     """写入 mihomo 前对订阅配置做兼容预处理。
 
@@ -2671,6 +2705,11 @@ def _preprocess_config_for_quick(config_data):
     text, t_changes = _safe_clash_text_fixes(text)
     if t_changes:
         issues.extend(t_changes)
+    # rules: 段内混合缩进(numbered list 项与 YUNJI 注释列0/有缩进混排)是 mihomo
+    # 严格 YAML 的致命源，且恰好会让下方 safe_load 失败。此处精准修复 rules 段缩进
+    # （只动 rules 块内列表项/注释，列0 对齐），既不会打坏其它段，也能让下方
+    # safe_load 从“加载失败”转为“成功重排”。
+    text = _repair_rules_indentation(text)
 
     geoip_obj = {
         "geo-auto-update": False,
@@ -2991,17 +3030,23 @@ def _launch_quick(quick_dir):
         return None
     # 启动前清理重复的顶层键，避免 mihomo 解析失败崩溃
     _dedup_top_level_keys(config_path)
-    # 启动前对配置做一次【纯文本安全修复】（修正过时 cipher / 废弃键 / geoip 拼写），
-    # 保证即使遗留了旧版/损坏的 config.yaml（如 chacha20-poly1305、datgeip 拼写），
-    # 内核也能正常解析启动。文本级改动零风险、幂等。
+    # 启动前对配置做一次【确定性自愈】（纯文本安全修复 + rules 段缩进修复），
+    # 保证即使遗留了旧版/损坏的 config.yaml（如 global-client-fingerprint 残留、
+    # rules 段混合缩进导致的 did not find expected key），内核也能正常解析启动。
+    # 改动零风险、幂等；对合法配置不产生影响。
     try:
         with open(config_path, "rb") as _f:
             _raw = _f.read()
-        _fixed, _chg = _safe_clash_text_fixes(_raw.decode("utf-8", errors="ignore"))
-        if _chg:
+        _text = _raw.decode("utf-8", errors="ignore")
+        _fixed, _chg = _safe_clash_text_fixes(_text)
+        _fixed = _repair_rules_indentation(_fixed)
+        if _chg or _fixed != _text:
             with open(config_path, "w", encoding="utf-8") as _f:
                 _f.write(_fixed)
-            log.info(f"启动前安全修复 config.yaml: {_chg}")
+            if _chg:
+                log.info(f"启动前安全修复 config.yaml: {_chg}")
+            else:
+                log.info("启动前自愈 config.yaml: 已修复 rules 段缩进")
     except Exception as _e:
         log.warning(f"启动前修复 config.yaml 失败（沿用原文件）: {_e}")
     log.info(f"配置文件大小: {os.path.getsize(config_path)} bytes")
