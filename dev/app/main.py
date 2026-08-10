@@ -4089,141 +4089,120 @@ class ServiceWorker(QThread):
             with open(config_path, 'rb') as f:
                 original_config = f.read()
 
+        results = []
         total = len(downloaded)
-        self.progress.emit(f"正在并发检测全部 {total} 条线路（不再逐条串行）...")
 
-        # ---- 并发检测：每条线路独立子目录 + 独立端口，多线程同时测速 ----
-        # 关键：mihomo 单实例单端口(7890)，要 4 条一起测必须把每条放到独立子目录、
-        # 监听独立端口，否则会抢端口冲突。测完统一回收实例（按 pid 精确终止），
-        # 不误杀用户正在使用的主代理。
-        base_test_dir = os.path.join(quick_dir, "_test")
-        try:
-            if os.path.isdir(base_test_dir):
-                shutil.rmtree(base_test_dir, ignore_errors=True)
-        except Exception:
-            pass
-        os.makedirs(base_test_dir, exist_ok=True)
+        for i, (name, data, _src) in enumerate(downloaded):
+            self.progress.emit(f"正在检测线路 {i+1}/{total}: {name}...")
+            save_config(quick_dir, data)
 
-        results = {}          # name -> entry dict
-        procs = []            # 测试实例 Popen 句柄，结束后精确终止
-        rlock = threading.Lock()
+            # 无论端口是否响应，都先停掉旧内核（避免僵尸进程抢占 7890 端口）
+            stop_quick()
+            time.sleep(1)
 
-        def worker(idx, name, data, _src):
-            line_dir = os.path.join(base_test_dir, f"line{idx+1}")
-            entry = {"name": name, "avg": -1.0, "best": -1.0, "count": 0,
-                     "data": data, "usable": False, "abroad_best": -1.0,
-                     "abroad_count": 0}
-            try:
-                _prepare_test_dir(quick_dir, line_dir)
-                mixed = _pick_free_port(17901 + idx)
-                socks = 17911 + idx
-                ctrl = 18901 + idx
-                # 从【主配置】提取 YUNJI 路由规则（含 GEOIP,CN,DIRECT）注入到本条测试线，
-                # 保证与串行/主代理一致的路由语义——否则境内站点(baidu)会被迫走节点隧道，
-                # 节点一失效全部测速 URL 失败 → 整页“超时”。并行测试实例关闭高级段(TUN)注入。
-                save_config(line_dir, data, mixed_port=mixed, socks_port=socks,
-                            controller=f"127.0.0.1:{ctrl}",
-                            yunji_src=config_path, inject_advanced=False)
-                proc = start_quick_proc(line_dir)
-                if proc is None:
-                    log.warning(f"{name} 内核启动失败，跳过检测")
-                    with rlock:
-                        results[name] = entry
-                    return
-                procs.append(proc)
-                if not wait_for_proxy_port(mixed, timeout=8):
-                    log.warning(f"{name} 代理未就绪，跳过延迟测试")
-                    with rlock:
-                        results[name] = entry
-                    return
-                # ---- 测速（走本线路独立端口）----
-                latencies = []          # 所有可达站点（含境内，用于展示/健康度）
-                abroad_ok = False        # 至少有一个境外站点经代理成功（可用硬条件）
-                abroad_latencies = []    # 仅境外站点延迟（用于选路比较）
-                for label, test_url, region in NODE_TEST_URLS:
-                    for attempt in range(2):
-                        try:
-                            proxy_handler = urllib.request.ProxyHandler({
-                                'http': f'http://127.0.0.1:{mixed}',
-                                'https': f'http://127.0.0.1:{mixed}',
-                            })
-                            opener = urllib.request.build_opener(proxy_handler)
-                            req = urllib.request.Request(test_url, headers={"User-Agent": "Mozilla/5.0"})
-                            start = time.time()
-                            resp = opener.open(req, timeout=NODE_TEST_TIMEOUT)
-                            elapsed = time.time() - start
-                            if resp.status in (200, 204):
-                                latencies.append(elapsed)
-                                if region == "abroad":
-                                    abroad_ok = True
-                                    abroad_latencies.append(elapsed)
-                                log.info(f"{name} 通过 {label} 测试成功, 延迟 {elapsed:.2f}s" +
-                                         (f" (重试第{attempt}次)" if attempt else "") +
-                                         (" [境内直连]" if region == "cn" else " [境外经代理]"))
-                                break
-                            else:
-                                log.warning(f"{name} {label} 测试返回非 200/204: {resp.status}")
-                        except Exception as e:
-                            log.warning(f"{name} {label} 测试失败 (第{attempt+1}次): {type(e).__name__}: {e}")
-                usable = abroad_ok
-                entry["avg"] = (sum(latencies) / len(latencies)) if latencies else -1.0
-                entry["best"] = min(latencies) if latencies else -1.0
-                entry["count"] = len(latencies)
-                entry["usable"] = usable
-                entry["abroad_best"] = min(abroad_latencies) if abroad_latencies else -1.0
-                entry["abroad_count"] = len(abroad_latencies)
-                if latencies and not usable:
-                    log.warning(f"{name} 仅境内可达（或境外经代理失败），不视为可用线路")
-            except Exception as e:
-                log.warning(f"{name} 检测异常: {e}")
-            with rlock:
-                results[name] = entry
-
-        threads = []
-        for idx, item in enumerate(downloaded):
-            t = threading.Thread(target=worker, args=(idx, item[0], item[1], item[2]), daemon=True)
-            threads.append(t)
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        # ---- 精确终止所有测试实例（不误杀主代理 7890）并清理临时目录 ----
-        for proc in procs:
-            stop_quick_proc(proc)
-        try:
-            shutil.rmtree(base_test_dir, ignore_errors=True)
-        except Exception:
-            pass
-
-        # ---- 汇总结果（主线程统一 emit，避免裸线程直接发 PyQt 信号）----
-        success_results = []
-        total_abroad = len([u for u in NODE_TEST_URLS if u[2] == "abroad"])
-        for name, data, _src in downloaded:
-            entry = results.get(name)
-            if entry is None:
+            ok, reason = start_quick(quick_dir)
+            if not ok:
+                # 内核启动即致命退出（配置解析失败 / MMDB 缺失等），该线路不可用
+                log.warning(f"{name} 内核启动失败，跳过检测: {reason}")
+                results.append((name, -1.0, -1.0, 0, data, False))
+                self.line_tested.emit(name, -1.0, False)
+                try:
+                    get_health_db().append(name, HealthRecord(
+                        ts=datetime.now().isoformat(timespec="seconds"),
+                        success=False, avg=-1.0, best=-1.0,
+                        count=0, total=len(NODE_TEST_URLS),
+                    ))
+                except Exception as e:
+                    log.warning(f"写健康度记录失败 {name}: {e}")
                 continue
-            avg = entry["avg"]; best = entry["best"]; count = entry["count"]
-            usable = entry["usable"]; d = entry["data"]; ab = entry["abroad_best"]
-            self.line_tested.emit(name, (ab if ab > 0 else avg), usable)
-            try:
-                get_health_db().append(name, HealthRecord(
-                    ts=datetime.now().isoformat(timespec="seconds"),
-                    success=usable, avg=(ab if ab > 0 else -1.0),
-                    best=(ab if ab > 0 else -1.0),
-                    count=entry["abroad_count"], total=total_abroad,
-                ))
-            except Exception as e:
-                log.warning(f"写健康度记录失败 {name}: {e}")
-            if usable:
-                success_results.append((name, d))
+
+            if not wait_for_proxy(timeout=25):
+                log.warning(f"{name} 代理未就绪，跳过延迟测试")
+                results.append((name, -1.0, -1.0, 0, data, False))
+                self.line_tested.emit(name, -1.0, False)
+                # Batch 3: 代理未就绪也算失败
+                try:
+                    get_health_db().append(name, HealthRecord(
+                        ts=datetime.now().isoformat(timespec="seconds"),
+                        success=False, avg=-1.0, best=-1.0,
+                        count=0, total=len(NODE_TEST_URLS),
+                    ))
+                except Exception as e:
+                    log.warning(f"写健康度记录失败 {name}: {e}")
+                continue
+
+            latencies = []          # 所有可达站点（含境内，用于展示/健康度）
+            abroad_ok = False        # 至少有一个境外站点经代理成功（线路真正可用的硬条件）
+            abroad_latencies = []    # 仅境外站点延迟（用于选路比较）
+            for label, test_url, region in NODE_TEST_URLS:
+                # 单 URL 失败后重试 1 次：quick.exe 刚启动可能尚未完成首次握手/DNS 解析，
+                # 首包超时并不代表线路本身不可用，重试可显著降低误判
+                for attempt in range(2):
+                    try:
+                        proxy_handler = urllib.request.ProxyHandler({
+                            'http': f'http://{PROXY_URL}',
+                            'https': f'http://{PROXY_URL}',
+                        })
+                        opener = urllib.request.build_opener(proxy_handler)
+                        req = urllib.request.Request(test_url, headers={"User-Agent": "Mozilla/5.0"})
+                        start = time.time()
+                        resp = opener.open(req, timeout=NODE_TEST_TIMEOUT)
+                        elapsed = time.time() - start
+                        if resp.status in (200, 204):
+                            latencies.append(elapsed)
+                            if region == "abroad":
+                                abroad_ok = True
+                                abroad_latencies.append(elapsed)
+                            log.info(f"{name} 通过 {label} 测试成功, 延迟 {elapsed:.2f}s" +
+                                     (f" (重试第{attempt}次)" if attempt else "") +
+                                     (" [境内直连]" if region == "cn" else " [境外经代理]"))
+                            break
+                        else:
+                            log.warning(f"{name} {label} 测试返回非 200/204: {resp.status}")
+                    except Exception as e:
+                        log.warning(f"{name} {label} 测试失败 (第{attempt+1}次): {type(e).__name__}: {e}")
+
+            # 线路可用判定：必须至少有一个境外站点经代理成功（Baidu 等境内直连不算）
+            usable = abroad_ok
+            if latencies:
+                avg = sum(latencies) / len(latencies)
+                best = min(latencies)
+                # avg 仅用于展示；选路以 abroad_latencies 为准
+                results.append((name, avg, best, len(latencies), data, usable))
+                self.line_tested.emit(name, (min(abroad_latencies) if abroad_latencies else avg), usable)
+                # Batch 3: 写健康度记录
+                try:
+                    get_health_db().append(name, HealthRecord(
+                        ts=datetime.now().isoformat(timespec="seconds"),
+                        success=usable, avg=(min(abroad_latencies) if abroad_latencies else -1.0),
+                        best=(min(abroad_latencies) if abroad_latencies else -1.0),
+                        count=len(abroad_latencies), total=len([u for u in NODE_TEST_URLS if u[2] == "abroad"]),
+                    ))
+                except Exception as e:
+                    log.warning(f"写健康度记录失败 {name}: {e}")
+                if not usable:
+                    log.warning(f"{name} 仅境内可达（或境外经代理失败），不视为可用线路")
+            else:
+                results.append((name, -1.0, -1.0, 0, data, False))
+                self.line_tested.emit(name, -1.0, False)
+                # Batch 3: 失败也记录
+                try:
+                    get_health_db().append(name, HealthRecord(
+                        ts=datetime.now().isoformat(timespec="seconds"),
+                        success=False, avg=-1.0, best=-1.0,
+                        count=0, total=len([u for u in NODE_TEST_URLS if u[2] == "abroad"]),
+                    ))
+                except Exception as e:
+                    log.warning(f"写健康度记录失败 {name}: {e}")
 
         # 检测完成后自动选路：仅从“真正可用”（境外经代理成功）的线路中选一条
         fastest_name, fastest_data = None, None
-        if success_results:
-            # 免费节点延迟波动大，可用优先于最快，取第一条可用线路
-            fastest_name, fastest_data = success_results[0]
-            log.info(f"自动选路: 选择可用线路 {fastest_name} (共 {len(success_results)} 条可用)")
+        if results:
+            successful = [(n, d) for n, avg, best, count, d, ok in results if ok]
+            if successful:
+                # 取第一条可用线路（免费节点延迟波动大，可用优先于最快）
+                fastest_name, fastest_data = successful[0]
+                log.info(f"自动选路: 选择可用线路 {fastest_name} (共 {len(successful)} 条可用)")
 
         proxy_enabled = self.kwargs.get("proxy_enabled", False)
         current_line = self.kwargs.get("current_line", "")
@@ -4252,12 +4231,7 @@ class ServiceWorker(QThread):
             elif original_config:
                 save_config(quick_dir, original_config)
 
-        # 保留下游(_on_test_finished)需要的 6 元组结构
-        self.kwargs["results"] = [
-            (r["name"], r["avg"], r["best"], r["count"], r["data"], r["usable"])
-            for name, _, _ in downloaded
-            for r in [results.get(name)] if r is not None
-        ]
+        self.kwargs["results"] = results
         # 检测完成后自动切换线路
         if fastest_name:
             self.line_selected.emit(fastest_name)
