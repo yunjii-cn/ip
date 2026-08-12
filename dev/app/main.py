@@ -3098,7 +3098,16 @@ def _launch_quick(quick_dir, _heal=True):
                 out = proc.stdout.read() if proc.stdout else b""
             except Exception:
                 pass
-            tail = out.decode("utf-8", errors="ignore")[-400:]
+            _txt = out.decode("utf-8", errors="ignore")
+            tail = _txt[-400:]
+            # 端口被占用：mihomo 绑 7890/9090 失败（level=error 而非 fatal）。
+            # 常见于残留的 quick.exe 未退出、或其它代理软件(Clash/v2rayN)占用了端口。
+            if ("address already in use" in _txt) or ("Only one usage" in _txt) or \
+               ("bind:" in _txt and ("已被占用" in _txt or "in use" in _txt)):
+                log.error("启动失败：端口 7890/9090 被其它进程占用（可能是残留的 quick.exe 或未关闭的其它代理软件）。"
+                          "请先结束占用端口的进程后重试：任务管理器结束 quick.exe / mihomo*.exe，"
+                          "或命令行 netstat -ano | findstr :7890 查 PID 后 taskkill /f /pid <PID>")
+                return None
             if rc != 0 or "level=fatal" in tail:
                 # 自愈：配置解析失败，用 PyYAML 安全重排兜底后重启一次（仅一次）
                 if _heal:
