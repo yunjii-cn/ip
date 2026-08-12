@@ -2597,10 +2597,11 @@ def _ensure_mmdb(quick_dir):
         target = os.path.join(quick_dir, "geoip.metadb")
         if os.path.isfile(target) and os.path.getsize(target) > 1_000_000:
             return True
-        # 项目内已有副本（Android 资源里随包分发）
+        # 项目内已有副本（EXE 内嵌资源 / 应用目录 / Android 资源，全部走相对路径，避免写死开发机绝对路径）
         candidates = [
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "Quick", "geoip.metadb"),
-            r"E:\软件开发\云集智能网联代理专家\web\frontend\android\app\src\main\assets\mihomo\geoip.metadb",
+            os.path.join(get_app_dir(), "Quick", "geoip.metadb"),
+            os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "Quick", "geoip.metadb"),
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
                          "web", "frontend", "android", "app", "src", "main",
                          "assets", "mihomo", "geoip.metadb"),
@@ -4074,6 +4075,13 @@ class ServiceWorker(QThread):
         # （新上游 ghfast.top 下载需 10s+，不应阻塞内核启动）
         if has_local_config:
             self.progress.emit("正在启动代理内核...")
+            # 启动前确保 geoip.metadb 就位（GEOIP,CN,DIRECT 规则依赖）。
+            # 若 _restore_bundled_kernel 未还原或文件丢失，这里兜底补一份，
+            # 否则内核加载 GEOIP 规则失败、不绑端口 → “代理未就绪”。
+            try:
+                _ensure_mmdb(quick_dir)
+            except Exception as _e:
+                log.warning(f"启动前预置 geoip.metadb 失败: {_e}")
             quick_exe = os.path.join(quick_dir, "quick.exe")
             if not os.path.isfile(quick_exe):
                 self.finished.emit(False, "代理内核不存在，请先更新代理内核")
@@ -5001,6 +5009,7 @@ class MainWindow(QMainWindow):
         top_level_whitelist = {
             "_kernel_version.txt",  # 当前内核版本号
             "config.yaml",          # mihomo 启动配置
+            "geoip.metadb",         # GEOIP 规则依赖（缺失会让内核启动即失败/卡死）
             "Country.mmdb",         # IP 地理位置库
             "GeoSite.dat",          # 域名分类库
         }
