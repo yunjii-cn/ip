@@ -3133,6 +3133,79 @@ def _launch_quick(quick_dir, _heal=True):
     return proc
 
 
+def _is_config_yaml_valid(quick_dir):
+    """判断运行目录的 config.yaml 是否能被 mihomo 内核正常解析。
+
+    必须用【真实内核】(quick.exe -d) 校验，不能用 PyYAML 近似：mihomo 是严格
+    YAML 解析器，对 rules 段 0/2 空格混排等会报 "did not find expected key" 致命，
+    而 PyYAML 对此类缩进较宽松会漏判（解析成功）。用户日志的 line 358 正是这类
+    mihomo 专属错误，PyYAML 校验会误判为合法 → 漏掉重下载 → 内核持续 fatal。
+
+    实现：以 -d 拉起内核做解析探测，把输出重定向到临时日志轮询：
+      - 出现 "Initial configuration complete" → 合法（随后杀掉探测进程）
+      - 出现 "did not find expected key" / "level=fatal" → 损坏
+      - 端口被占用导致绑不上 → 既无完成行也无致命行 → 保守判为无效（触发重建/重启）
+    任何异常均保守返回 False（宁可重下载，不能拿坏配置启动）。
+    """
+    config_path = os.path.join(quick_dir, "config.yaml")
+    if not os.path.isfile(config_path):
+        return False
+    quick_exe = os.path.join(quick_dir, "quick.exe")
+    if not os.path.isfile(quick_exe):
+        # 无内核可用时退回 PyYAML 启发式（仅兜底，可能漏判 mihomo 专属错误）
+        try:
+            import yaml as _yaml
+            with open(config_path, "rb") as _f:
+                _text = _f.read().decode("utf-8", errors="ignore")
+            _fixed, _ = _safe_clash_text_fixes(_text)
+            _fixed = _repair_rules_indentation(_fixed)
+            _yaml.safe_load(_fixed)
+            return True
+        except Exception:
+            return False
+    import tempfile
+    _logf = os.path.join(tempfile.gettempdir(), f"_yunji_cfgchk_{os.getpid()}.log")
+    proc = None
+    try:
+        with open(_logf, "w", encoding="utf-8", errors="ignore") as _lf:
+            proc = subprocess.Popen(
+                [quick_exe, "-d", quick_dir], cwd=quick_dir,
+                stdout=_lf, stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        _valid = False
+        for _ in range(20):  # 最多 10s
+            time.sleep(0.5)
+            try:
+                with open(_logf, "r", encoding="utf-8", errors="ignore") as _lf2:
+                    _txt = _lf2.read()
+            except Exception:
+                _txt = ""
+            if "did not find expected key" in _txt or "level=fatal" in _txt:
+                _valid = False
+                break
+            if "Initial configuration complete" in _txt:
+                _valid = True
+                break
+            if proc.poll() is not None:
+                # 进程已退出但未命中完成/致命关键字（如端口被占），保守判无效
+                _valid = False
+                break
+        return _valid
+    except Exception:
+        return False
+    finally:
+        try:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+        try:
+            os.remove(_logf)
+        except Exception:
+            pass
+
+
 def start_quick(quick_dir):
     """启动 mihomo(quick.exe)（单实例便捷封装）。
 
@@ -4072,17 +4145,30 @@ class ServiceWorker(QThread):
 
     def _do_start(self):
         quick_dir = self.kwargs.get("quick_dir")
-        if is_proxy_running():
+        config_path = os.path.join(quick_dir, "config.yaml")
+        _cfg_exists = os.path.isfile(config_path)
+        _cfg_valid = _is_config_yaml_valid(quick_dir) if _cfg_exists else False
+
+        # 本地配置缺失/已损坏时，可能有旧内核占着 7890 → 先停掉，确保后续能重新
+        # 下载合法配置并成功绑定端口。仅当“有合法本地配置且代理已在运行”才直接复用。
+        if (not _cfg_valid) and is_proxy_running():
+            log.warning("本地配置缺失/损坏，先停止运行中的旧内核以便重建")
+            try:
+                stop_quick()
+            except Exception:
+                pass
+        elif _cfg_valid and is_proxy_running():
             self.finished.emit(True, "代理已在运行")
             return
         log.info("开始启动代理服务")
 
         config_path = os.path.join(quick_dir, "config.yaml")
-        has_local_config = os.path.isfile(config_path)
+        has_local_config = _cfg_exists
 
-        # 优化启动速度：本地已有 config.yaml 时先立即启动内核，再后台下载更新配置
-        # （新上游 ghfast.top 下载需 10s+，不应阻塞内核启动）
-        if has_local_config:
+        # 优化启动速度：本地已有【合法】config.yaml 时先立即启动内核，再后台下载更新配置
+        # （新上游 ghfast.top 下载需 10s+，不应阻塞内核启动）。
+        # 注意：配置已损坏时必须走下面“下载重建”分支，否则会拿坏配置启动内核 → 致命退出。
+        if has_local_config and _cfg_valid:
             self.progress.emit("正在启动代理内核...")
             # 启动前确保 geoip.metadb 就位（GEOIP,CN,DIRECT 规则依赖）。
             # 若 _restore_bundled_kernel 未还原或文件丢失，这里兜底补一份，
@@ -4127,8 +4213,12 @@ class ServiceWorker(QThread):
             threading.Thread(target=_bg_download, daemon=True).start()
             return
 
-        # 本地无 config.yaml：必须下载才能启动（首次启动场景）
+        # 本地无【合法】config.yaml：必须下载才能启动（首次启动 / 配置损坏重建场景）
         self.progress.emit("正在获取线路配置...")
+        try:
+            stop_quick()
+        except Exception:
+            pass
         downloaded = download_all_configs()
         if downloaded:
             saved_line = self.kwargs.get("current_line")
@@ -9433,9 +9523,18 @@ class MainWindow(QMainWindow):
         proxy_enabled = self.settings.get("proxy_enabled", False)
         def do_download():
             try:
-                if proxy_enabled or is_proxy_running():
+                _cfg_valid = _is_config_yaml_valid(quick_dir)
+                if proxy_enabled or (is_proxy_running() and _cfg_valid):
                     log.info("代理服务已启用或运行中，跳过启动时配置覆盖")
                     return
+                # 配置已损坏但代理在运行：先停掉旧内核，避免残留坏配置占着 7890，
+                # 然后重新下载一份合法配置覆盖（否则坏配置会被持续复用 → 内核 fatal）。
+                if (not _cfg_valid) and is_proxy_running():
+                    log.warning("启动时检测到本地配置损坏，先停止旧内核并重新下载")
+                    try:
+                        stop_quick()
+                    except Exception:
+                        pass
                 downloaded = download_all_configs()
                 if downloaded:
                     selected = None
