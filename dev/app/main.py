@@ -1909,14 +1909,23 @@ def find_system_browsers():
 
 
 def is_proxy_running():
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(0.5)
-        result = sock.connect_ex((PROXY_HOST, PROXY_PORT))
-        sock.close()
-        return result == 0
-    except Exception:
-        return False
+    # 依次尝试配置主机与 127.0.0.1（IPv4 兜底）：当 proxy_host 为 "localhost" 时，
+    # getaddrinfo 可能优先返回 ::1(IPv6)，而 mihomo 仅绑定 IPv4 的 127.0.0.1，
+    # 仅连 ::1 会误报“代理未就绪”。强制补试 127.0.0.1 规避该 IPv4/IPv6 错配。
+    hosts = [PROXY_HOST]
+    if PROXY_HOST != "127.0.0.1":
+        hosts.append("127.0.0.1")
+    for host in hosts:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.5)
+            result = sock.connect_ex((host, PROXY_PORT))
+            sock.close()
+            if result == 0:
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def wait_for_proxy(timeout=15):
@@ -2836,6 +2845,7 @@ def save_config(quick_dir, config_data, mixed_port=None, socks_port=None, contro
     # 先读取已有的 YUNJI 注入规则和高级配置段
     yunji_blocks = []
     advanced_text = ""  # 高级配置（tun / dns / sniffing / global-client-fingerprint）
+    old_content = ""  # 提取源原文；src_path 为空时保持空串，避免下方引用未定义
     # 提取源：优先用 yunji_src（主配置），否则用目标目录既有 config.yaml
     src_path = yunji_src if (yunji_src and os.path.isfile(yunji_src)) else \
         (config_path if os.path.isfile(config_path) else None)
@@ -3013,12 +3023,15 @@ def _dedup_top_level_keys(config_path):
         return False
 
 
-def _launch_quick(quick_dir):
+def _launch_quick(quick_dir, _heal=True):
     """拉起一个 mihomo(quick.exe) 实例（不等待端口就绪，仅做 6s 启动期 fatal 探测）。
 
     返回 subprocess.Popen 对象；若 exe/config 缺失或启动 6s 内 fatal 退出，返回 None
     （调用方据此判定该实例不可用）。并发线路检测会为每个线路启动独立实例并保留 proc
     句柄，以便结束时精确终止，避免误杀其它实例（如用户正在使用的主代理 7890）。
+
+    _heal: 内核因配置解析 fatal 退出时，自动用 PyYAML 安全重排兜底并重试一次
+    （仅一次，避免无限递归）。即使启动前文本修复把合法配置意外打坏，也能自愈启动。
     """
     quick_exe = os.path.join(quick_dir, "quick.exe")
     if not os.path.isfile(quick_exe):
@@ -3030,16 +3043,25 @@ def _launch_quick(quick_dir):
         return None
     # 启动前清理重复的顶层键，避免 mihomo 解析失败崩溃
     _dedup_top_level_keys(config_path)
-    # 启动前对配置做一次【确定性自愈】（纯文本安全修复 + rules 段缩进修复），
-    # 保证即使遗留了旧版/损坏的 config.yaml（如 global-client-fingerprint 残留、
-    # rules 段混合缩进导致的 did not find expected key），内核也能正常解析启动。
-    # 改动零风险、幂等；对合法配置不产生影响。
+    # 启动前对配置做一次【确定性自愈】（纯文本安全修复 + rules 段缩进修复）。
+    # 改动零风险、幂等；但为防“修复反而打坏合法配置”（罕见的交互性错误，会触发
+    # mihomo "did not find expected key" 致命），修复后做 YAML 合法性校验，若仍非法
+    # 则退回 PyYAML 安全重排（产出标准合法 YAML，mihomo 必能解析；代价是丢失注释标记，
+    # 但 rules 内实际路由规则保留）。
     try:
         with open(config_path, "rb") as _f:
             _raw = _f.read()
         _text = _raw.decode("utf-8", errors="ignore")
         _fixed, _chg = _safe_clash_text_fixes(_text)
         _fixed = _repair_rules_indentation(_fixed)
+        try:
+            import yaml as _yaml
+            _yaml.safe_load(_fixed)
+        except Exception:
+            _fb, _fb_chg = _preprocess_config_for_quick(_text)
+            _fixed = _fb.decode("utf-8") if isinstance(_fb, (bytes, bytearray)) else _fb
+            _chg = (_chg or []) + _fb_chg
+            log.warning("启动前修复后配置仍非法，已用 PyYAML 安全重排兜底自愈")
         if _chg or _fixed != _text:
             with open(config_path, "w", encoding="utf-8") as _f:
                 _f.write(_fixed)
@@ -3077,6 +3099,24 @@ def _launch_quick(quick_dir):
                 pass
             tail = out.decode("utf-8", errors="ignore")[-400:]
             if rc != 0 or "level=fatal" in tail:
+                # 自愈：配置解析失败，用 PyYAML 安全重排兜底后重启一次（仅一次）
+                if _heal:
+                    try:
+                        with open(config_path, "rb") as _f:
+                            _raw2 = _f.read()
+                        _t2 = _raw2.decode("utf-8", errors="ignore")
+                        _fb2, _fb_chg2 = _preprocess_config_for_quick(_t2)
+                        _fixed2 = _fb2.decode("utf-8") if isinstance(_fb2, (bytes, bytearray)) else _fb2
+                        with open(config_path, "w", encoding="utf-8") as _f:
+                            _f.write(_fixed2)
+                        log.warning(f"内核解析失败，已安全重排配置并自愈重试: {_fb_chg2}")
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        return _launch_quick(quick_dir, _heal=False)
+                    except Exception as _he:
+                        log.warning(f"自愈重试失败: {_he}")
                 log.error(f"quick.exe 启动即致命退出(rc={rc}): {tail}")
                 return None
             break
@@ -4143,7 +4183,23 @@ class ServiceWorker(QThread):
 
             # 无论端口是否响应，都先停掉旧内核（避免僵尸进程抢占 7890 端口）
             stop_quick()
-            time.sleep(1)
+            # taskkill /f 异步生效，socket 释放有延迟；轮询等待 7890 真正空闲，
+            # 否则旧内核残留仍占 7890，新内核绑不上 → 整页“代理未就绪”。
+            _free_deadline = time.time() + 6
+            while time.time() < _free_deadline:
+                _s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                _s.settimeout(0.5)
+                try:
+                    _s.connect(("127.0.0.1", 7890))
+                    _busy = True  # 仍有进程在监听 7890
+                except Exception:
+                    _busy = False  # 端口已空闲
+                finally:
+                    _s.close()
+                if not _busy:
+                    break
+                time.sleep(0.3)
+            time.sleep(0.5)
 
             ok, reason = start_quick(quick_dir)
             if not ok:
