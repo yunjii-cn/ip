@@ -1567,90 +1567,273 @@ if not getattr(sys, 'frozen', False):
 
 
 
-def _self_deploy(exe_dir):
-    base_name = BRAND_NAME
-    src_exe = os.path.abspath(sys.executable)
-    exe_basename = os.path.basename(src_exe)
-    if base_name not in exe_basename:
-        correct_name = f"{base_name}-v{VERSION}.exe"
-        QMessageBox.critical(None, "品牌校验失败",
-            f"可执行文件名已被修改，无法运行。\n\n当前文件名: {exe_basename}\n正确文件名: {correct_name}\n\n请将文件名改回「{correct_name}」后重试。")
-        sys.exit(1)
-    deploy_dir = os.path.join(exe_dir, base_name)
-    already_deployed = os.path.isdir(deploy_dir) and os.path.isfile(os.path.join(deploy_dir, _CFG["paths"]["lock_file"]))
+# ── 自动部署（参考 云集智能音乐创意台 launcher._self_relocate 的成熟范式）──
+# 机制：
+#   - 便携版本号 EXE 首次运行 → 在同级建 <BRAND_NAME>/ 品牌文件夹（含 app/ver/），
+#     写 version.txt + .yunji.lock，复制自身进 ver/，生成固定名入口 <BRAND_NAME>.exe，
+#     分离式 spawn 入口（携带 --cleanup=<原始便携exe>）+ os._exit 退出自身；
+#   - 入口 / 已部署运行 → 解析到品牌目录，先把“原始便携 exe”归档进 ver/ 并删除
+#     （--cleanup），并确保固定名入口始终指向 ver/ 中最新版本（软件更新下载到 ver/ 切换版本）。
+ENTRY_EXE_NAME = f"{BRAND_NAME}.exe"
+VERSION_TXT = "version.txt"
+_DEPLOY_SUBDIRS = [_CFG["paths"]["app"], _CFG["paths"]["ver"]]
 
-    # 构造静默启动新进程的参数（彻底避免新 EXE 弹出黑框）
-    # DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP 三重保险：
-    # - DETACHED_PROCESS：脱离父进程控制台
-    # - CREATE_NO_WINDOW：不创建新控制台窗口
-    # - CREATE_NEW_PROCESS_GROUP：创建新进程组，避免继承父进程的任何控制台资源
-    _silent_popen_kwargs = dict(
-        creationflags=0x00000008 | 0x08000000 | 0x00000200,  # DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if os.name == 'nt':
+
+def _resolve_deploy_dir(exe_path):
+    """解析部署根目录（<exe_dir>/<BRAND_NAME>/ 或向上找到已存在的品牌目录）。
+
+    与参考 launcher._resolve_deploy_dir 同源：逐级向上查找已存在的品牌目录
+    （已部署时命中，避免把部署目录算成自身子目录导致无限嵌套 WinError 206）；
+    找不到则回退到 exe 同级 <BRAND_NAME>。
+    """
+    exe_dir = os.path.dirname(os.path.abspath(exe_path))
+    d = exe_dir
+    while True:
+        if os.path.basename(d) == BRAND_NAME:
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return os.path.join(exe_dir, BRAND_NAME)
+
+
+def _safe_delete(path):
+    """带重试地删除文件（Windows 偶发 PermissionError）。"""
+    for _ in range(15):
         try:
-            _si = subprocess.STARTUPINFO()
-            _si.dwFlags |= 0x00000001  # STARTF_USESHOWWINDOW
-            _si.wShowWindow = 0        # SW_HIDE
-            _silent_popen_kwargs['startupinfo'] = _si
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        except PermissionError:
+            time.sleep(0.3)
+        except Exception:
+            return
+
+
+def _parse_cleanup():
+    for a in sys.argv[1:]:
+        if a.startswith("--cleanup="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def _find_newest_versioned_exe(deploy_dir, current_exe):
+    """在 ver/ 中找出版本号最大的版本号 exe；当前运行的版本号 exe 也参与比较。"""
+    candidates = []
+    ver_dir = os.path.join(deploy_dir, _CFG["paths"]["ver"])
+    if os.path.isdir(ver_dir):
+        for name in os.listdir(ver_dir):
+            mm = re.search(r'v(\d+\.\d+\.\d+\.\d+)', name)
+            if name.lower().endswith(".exe") and mm:
+                candidates.append((mm.group(1), os.path.join(ver_dir, name)))
+    cur_m = re.search(r'v(\d+\.\d+\.\d+\.\d+)', os.path.basename(current_exe))
+    if cur_m:
+        candidates.append((cur_m.group(1), os.path.abspath(current_exe)))
+    if not candidates:
+        return None
+    def _vt(v):
+        try:
+            return tuple(int(x) for x in v.split("."))
+        except Exception:
+            return (0,)
+    try:
+        return max(candidates, key=lambda c: _vt(c[0]))[1]
+    except Exception:
+        return candidates[-1][1]
+
+
+def _entry_points_to(entry_exe, target_exe):
+    """判断 entry_exe 是否已硬链接/指向 target_exe（按 st_dev+st_ino 文件标识）。"""
+    try:
+        s1 = os.stat(entry_exe)
+        s2 = os.stat(target_exe)
+        return (s1.st_dev, s1.st_ino) == (s2.st_dev, s2.st_ino)
+    except Exception:
+        return False
+
+
+def _ensure_entry_current(deploy_dir, current_exe):
+    """确保固定名入口始终指向 ver/ 中最新的版本号 exe（软件更新切换版本）。"""
+    entry_exe = os.path.join(deploy_dir, ENTRY_EXE_NAME)
+    newest = _find_newest_versioned_exe(deploy_dir, current_exe)
+    if newest is None:
+        return entry_exe if os.path.exists(entry_exe) else None
+    if os.path.exists(entry_exe) and _entry_points_to(entry_exe, newest):
+        return entry_exe
+    try:
+        if os.path.exists(entry_exe):
+            _safe_delete(entry_exe)
+        try:
+            os.link(newest, entry_exe)
+        except Exception:
+            shutil.copy2(newest, entry_exe)
+    except Exception:
+        pass
+    return entry_exe if os.path.exists(entry_exe) else None
+
+
+def _self_deploy():
+    """自动部署闭环（参考 launcher._self_relocate）。
+
+    返回部署根目录（品牌文件夹）。首跑会 spawn 入口并 os._exit(0) 退出自身。
+    必须在单实例之前、GUI 创建之前调用（main() 顶部），以保证 os._exit 干净且
+    便携 exe 部署阶段不持有互斥体（避免入口被自身 mutex 误判“已运行”而退出）。
+    """
+    if not getattr(sys, 'frozen', False):
+        return _find_dev_dir()
+
+    exe = os.path.abspath(sys.executable)
+    exe_name = os.path.basename(exe)
+    exe_dir = os.path.dirname(exe)
+
+    # 入口被拉起时携带 --cleanup=<原始便携 exe>：删除原始便携 exe（f7d9105 proven 机制，
+    # os.remove 无需管理员、不触发杀软——即用户所说“入口启动新 exe 就可以删除自身 exe”）。
+    cleanup_target = _parse_cleanup()
+
+    deploy_dir = _resolve_deploy_dir(exe)
+    already = os.path.isdir(deploy_dir) and (
+        os.path.isfile(os.path.join(deploy_dir, VERSION_TXT))
+        or os.path.isfile(os.path.join(deploy_dir, _CFG["paths"]["lock_file"]))
+    )
+
+    if already:
+        # 已部署：归档并删除被我们拉起的原始便携 exe（若有）
+        if cleanup_target and os.path.exists(cleanup_target):
+            try:
+                ver_dir = os.path.join(deploy_dir, _CFG["paths"]["ver"])
+                os.makedirs(ver_dir, exist_ok=True)
+                dst = os.path.join(ver_dir, os.path.basename(cleanup_target))
+                if not os.path.exists(dst):
+                    shutil.copy2(cleanup_target, dst)
+            except Exception:
+                pass
+            _safe_delete(cleanup_target)
+        # 版本切换：若当前运行的不是 ver/ 中最新版（如手动双击新下载的便携 exe），
+        # 归档进 ver/、重建入口指向它、重启入口、退出自身，保证运行的是入口。
+        newest = _find_newest_versioned_exe(deploy_dir, exe)
+        if newest and not _entry_points_to(exe, newest):
+            try:
+                ver_dir = os.path.join(deploy_dir, _CFG["paths"]["ver"])
+                os.makedirs(ver_dir, exist_ok=True)
+                # 守卫：ver/ 只接受「版本号 exe」。禁止把固定名入口(普通名 exe_name)
+                # 归档进 ver/，否则会多出一份与版本号 exe 内容完全相同的冗余 exe（白占 ~84MB）。
+                if re.search(r'v\d+\.\d+\.\d+\.\d+', exe_name):
+                    dst = os.path.join(ver_dir, exe_name)
+                    if not os.path.exists(dst):
+                        shutil.copy2(exe, dst)
+            except Exception:
+                pass
+            _ensure_entry_current(deploy_dir, exe)
+            entry_exe = os.path.join(deploy_dir, ENTRY_EXE_NAME)
+            if os.path.exists(entry_exe) and os.path.abspath(entry_exe) != exe:
+                try:
+                    subprocess.Popen([entry_exe],
+                                    creationflags=0x00000008 | 0x08000000 | 0x00000200,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+                time.sleep(1.2)
+                os._exit(0)
+        _ensure_entry_current(deploy_dir, exe)
+        return deploy_dir
+
+    # ── 首次运行：建品牌文件夹 ──
+    os.makedirs(deploy_dir, exist_ok=True)
+    for sub in _DEPLOY_SUBDIRS:
+        os.makedirs(os.path.join(deploy_dir, sub), exist_ok=True)
+
+    # 历史兼容：旧版（≤1540/0717）把数据散落在 exe_dir 根下（.yunji.lock / app / Quick /
+    # launcher_settings.json），迁移到品牌文件夹，避免重复与污染（仅当目标不存在时移动）。
+    _legacy_lock = os.path.join(exe_dir, _CFG["paths"]["lock_file"])
+    if os.path.isfile(_legacy_lock):
+        try:
+            os.remove(_legacy_lock)
+        except Exception:
+            pass
+    _old_app = os.path.join(exe_dir, "app")
+    _new_app = os.path.join(deploy_dir, "app")
+    if os.path.isdir(_old_app) and not os.path.isdir(_new_app):
+        try:
+            shutil.move(_old_app, _new_app)
+        except Exception:
+            pass
+    _old_quick = os.path.join(exe_dir, "Quick")
+    _new_quick = os.path.join(deploy_dir, "app", "Quick")
+    if os.path.isdir(_old_quick) and not os.path.isdir(_new_quick):
+        try:
+            shutil.move(_old_quick, _new_quick)
+        except Exception:
+            pass
+    _old_cfg = os.path.join(exe_dir, "launcher_settings.json")
+    _new_cfg = os.path.join(deploy_dir, "app", "launcher_settings.json")
+    if os.path.isfile(_old_cfg) and not os.path.isfile(_new_cfg):
+        try:
+            shutil.move(_old_cfg, _new_cfg)
         except Exception:
             pass
 
-    if already_deployed:
-        entry_exe = os.path.join(deploy_dir, f"{base_name}.exe")
-        if os.path.isfile(entry_exe) and os.path.normpath(src_exe) != os.path.normpath(entry_exe):
-            # 已部署：启动入口并自销毁，保持进度条不间断
-            subprocess.Popen([entry_exe, f"--cleanup={src_exe}"], **_silent_popen_kwargs)
-            time.sleep(1.2)  # 让新进程的进度条先显示出来再退出，避免闪屏
-            os._exit(0)
-        return deploy_dir
+    # 写 version.txt（main.py 按 ^\d+\.\d+\.\d+(\.\d+)?$ 解析）
+    m = re.search(r'v(\d+\.\d+\.\d+\.\d+)', exe_name)
+    version = m.group(1) if m else datetime.now().strftime("%Y.%m.%d.%H%M")
+    try:
+        with open(os.path.join(deploy_dir, VERSION_TXT), "w", encoding="utf-8") as f:
+            f.write(version)
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(deploy_dir, _CFG["paths"]["lock_file"]), "w", encoding="utf-8") as f:
+            f.write("yunji")
+    except Exception:
+        pass
 
-    os.makedirs(deploy_dir, exist_ok=True)
+    # 生成固定名入口（硬链接优先，失败回退复制）
+    entry_exe = os.path.join(deploy_dir, ENTRY_EXE_NAME)
+    if not os.path.exists(entry_exe) and os.path.abspath(entry_exe) != exe:
+        try:
+            os.link(exe, entry_exe)
+        except Exception:
+            try:
+                shutil.copy2(exe, entry_exe)
+            except Exception:
+                entry_exe = None
 
+    # 归档一份进 ver/（供 _ensure_entry_current 指向最新版、版本回滚）
     ver_dir = os.path.join(deploy_dir, _CFG["paths"]["ver"])
     os.makedirs(ver_dir, exist_ok=True)
-    app_dir = os.path.join(deploy_dir, _CFG["paths"]["app"])
-    os.makedirs(app_dir, exist_ok=True)
-
-    lock_path = os.path.join(deploy_dir, _CFG["paths"]["lock_file"])
-    with open(lock_path, "w", encoding="utf-8") as f:
-        f.write("yunji")
-
-    exe_basename = os.path.basename(src_exe)
-    if not exe_basename.startswith(base_name + "-v"):
-        m = re.search(r'v(\d+\.\d+\.\d+\.\d+)', exe_basename)
-        ver_str = m.group(1) if m else datetime.now().strftime("%Y.%m.%d.%H%M")
-        new_name = f"{base_name}-v{ver_str}.exe"
-    else:
-        new_name = exe_basename
-
-    target_exe = os.path.join(ver_dir, new_name)
-    if os.path.normpath(src_exe) != os.path.normpath(target_exe):
-        shutil.copy2(src_exe, target_exe)
-
-    entry_exe = os.path.join(deploy_dir, f"{base_name}.exe")
-    if not os.path.isfile(entry_exe):
+    ver_target = os.path.join(ver_dir, exe_name)
+    if os.path.abspath(ver_target) != exe and not os.path.exists(ver_target):
         try:
-            os.link(target_exe, entry_exe)
-        except OSError:
-            shutil.copy2(target_exe, entry_exe)
+            shutil.copy2(exe, ver_target)
+        except Exception:
+            pass
 
-    # 在桌面创建硬链接快捷方式（必须完全静默，不能出现任何窗口）
-    # 用守护线程异步执行，不阻塞新进程的启动，让进度条更快出现
-    import threading
-    threading.Thread(
-        target=_create_desktop_shortcut,
-        args=(entry_exe,),
-        daemon=True,
-    ).start()
+    # 桌面快捷方式（异步，静默）
+    if entry_exe and os.path.exists(entry_exe):
+        import threading
+        threading.Thread(target=_create_desktop_shortcut, args=(entry_exe,), daemon=True).start()
 
-    # 启动新进程并等待其进度条显示出来，再彻底退出原进程
-    subprocess.Popen([entry_exe, f"--cleanup={src_exe}"], **_silent_popen_kwargs)
-    time.sleep(1.5)  # 让新进程的进度条先出现，避免桌面闪现
-    os._exit(0)
+    # 首跑：分离式拉起固定名入口（携带 --cleanup=<原始便携exe>）后退出自身
+    if entry_exe and os.path.exists(entry_exe) and os.path.abspath(entry_exe) != exe:
+        try:
+            _child = subprocess.Popen(
+                [entry_exe, "--cleanup=" + exe],
+                creationflags=0x00000008 | 0x08000000 | 0x00000200,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            _child = None
+        if _child is not None:
+            try:
+                ctypes.windll.user32.AllowSetForegroundWindow(_child.pid)
+            except Exception:
+                pass
+            time.sleep(1.5)
+            os._exit(0)
+
+    # 兜底：入口未拉起（被杀软拦截）→ 本进程直接继续运行
+    return deploy_dir
 
 
 def _create_desktop_shortcut(entry_exe):
@@ -1719,15 +1902,10 @@ def _create_windows_shortcut(lnk_path, target_exe):
 
 def _find_dev_dir():
     if getattr(sys, 'frozen', False):
-        d = os.path.dirname(os.path.abspath(sys.executable))
-        for _ in range(5):
-            if os.path.isfile(os.path.join(d, _CFG["paths"]["lock_file"])) or os.path.isdir(os.path.join(d, _CFG["paths"]["app"])):
-                return d
-            parent = os.path.dirname(d)
-            if parent == d:
-                break
-            d = parent
-        return _self_deploy(os.path.dirname(os.path.abspath(sys.executable)))
+        # 已部署态：部署根由 _self_deploy 在 main() 顶部完成（含品牌文件夹创建与版本切换），
+        # 这里只负责解析部署根目录（<exe_dir>/<BRAND_NAME>/ 或向上找到已存在的品牌目录），
+        # 不再在此触发部署，避免递归/双重部署。
+        return _resolve_deploy_dir(sys.executable)
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -1736,8 +1914,29 @@ def get_base_dir():
 
 
 def get_app_dir():
+    # 开发态与打包态使用同一套公式：<根目录>/app。
+    # - 开发态：根目录 = dev/         → dev/app/（内核 Quick、配置、日志、设置全在此）
+    # - 打包态：根目录 = EXE 所在目录 → <EXE目录>/app/（与 dev/app 完全镜像，
+    #   相对 EXE 目录、绿色便携，换机器/目录即可运行，彻底消除扁平 exe 目录差异）
     d = os.path.join(get_base_dir(), _CFG["paths"]["app"])
     os.makedirs(d, exist_ok=True)
+    # 一次性迁移：旧版扁平 exe_dir/Quick（及 launcher_settings.json）迁移到镜像 dev 的
+    # exe_dir/app/，避免丢失已下载的真实配置与本地设置（仅当目标不存在时才移动）。
+    if getattr(sys, 'frozen', False):
+        _old_quick = os.path.join(get_base_dir(), "Quick")
+        if os.path.isdir(_old_quick) and not os.path.isdir(os.path.join(d, "Quick")):
+            try:
+                shutil.move(_old_quick, os.path.join(d, "Quick"))
+                _diagnose(f"已迁移旧数据目录 {_old_quick} -> {os.path.join(d, 'Quick')}")
+            except Exception as _e:
+                log.warning(f"迁移旧 Quick 目录失败(可忽略): {_e}")
+        _old_cfg = os.path.join(get_base_dir(), "launcher_settings.json")
+        _new_cfg = os.path.join(d, "launcher_settings.json")
+        if os.path.isfile(_old_cfg) and not os.path.isfile(_new_cfg):
+            try:
+                shutil.move(_old_cfg, _new_cfg)
+            except Exception:
+                pass
     return d
 
 
@@ -1906,6 +2105,24 @@ def find_system_browsers():
             seen.add(path)
             unique.append((name, path))
     return unique
+
+
+def _diagnose(msg):
+    """把启动诊断写入用户易找到的日志文件：<app目录>/启动诊断.log。
+
+    开发能跑、EXE 跑不了的差异定位长期卡在“用户只说‘还是不行’、拿不到真机报错”。
+    本函数把所有关键启动事件（内核 fatal 行号、选线结果、端口占用）写到一个固定路径，
+    用户只需把该文件贴回即可精确定位，避免在 config/端口/坏订阅之间反复盲猜。
+    """
+    try:
+        d = get_app_dir()
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, "启动诊断.log")
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(p, "a", encoding="utf-8") as _f:
+            _f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
 
 
 def is_proxy_running():
@@ -2599,9 +2816,9 @@ def _ensure_mmdb(quick_dir):
             return True
         # 项目内已有副本（EXE 内嵌资源 / 应用目录 / Android 资源，全部走相对路径，避免写死开发机绝对路径）
         candidates = [
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "Quick", "geoip.metadb"),
             os.path.join(get_app_dir(), "Quick", "geoip.metadb"),
-            os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "Quick", "geoip.metadb"),
+            os.path.join(getattr(sys, '_MEIPASS', ''), "Quick", "geoip.metadb"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "Quick", "geoip.metadb"),
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
                          "web", "frontend", "android", "app", "src", "main",
                          "assets", "mihomo", "geoip.metadb"),
@@ -3073,6 +3290,10 @@ def _launch_quick(quick_dir, _heal=True):
     except Exception as _e:
         log.warning(f"启动前修复 config.yaml 失败（沿用原文件）: {_e}")
     log.info(f"配置文件大小: {os.path.getsize(config_path)} bytes")
+    # 内核输出落盘到 quick_out.log（行缓冲），便于“代理未就绪”时回看 mihomo 真实报错。
+    # 旧逻辑用 PIPE 且仅在 6s 内读取，内核稍晚崩溃/卡死即丢失输出 → 诊断盲区。
+    # Windows 下 subprocess 会 DuplicateHandle 给子进程，父进程句柄被回收不影响子进程写入。
+    _out_log = os.path.join(quick_dir, "quick_out.log")
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     si.wShowWindow = 0
@@ -3080,7 +3301,7 @@ def _launch_quick(quick_dir, _heal=True):
         proc = subprocess.Popen(
             [quick_exe, "-d", quick_dir],
             cwd=quick_dir,
-            stdout=subprocess.PIPE,
+            stdout=open(_out_log, "w", encoding="utf-8", errors="ignore", buffering=1),
             stderr=subprocess.STDOUT,
             startupinfo=si,
             creationflags=subprocess.CREATE_NO_WINDOW
@@ -3088,18 +3309,20 @@ def _launch_quick(quick_dir, _heal=True):
     except Exception as e:
         log.error(f"启动 quick.exe 异常: {e}")
         return None
-    # 轮询 6s：若进程已退出且非 0，则为 fatal（配置解析失败/MMDB 缺失等）
+    # 轮询 6s：若进程已退出且非 0，则为 fatal（配置解析失败/MMDB 缺失等）。
+    # 通过读取 quick_out.log 尾部判定（与 _is_config_yaml_valid 同思路），
+    # 这样即使内核在 6s 之后才崩溃，输出也已落盘，wait_for_proxy 失败时可回看。
     for _ in range(12):
         time.sleep(0.5)
         if proc.poll() is not None:
             rc = proc.returncode
-            out = b""
+            _txt = ""
             try:
-                out = proc.stdout.read() if proc.stdout else b""
+                with open(_out_log, "r", encoding="utf-8", errors="ignore") as _lf:
+                    _txt = _lf.read()
             except Exception:
                 pass
-            _txt = out.decode("utf-8", errors="ignore")
-            tail = _txt[-400:]
+            tail = _txt[-600:]
             # 端口被占用：mihomo 绑 7890/9090 失败（level=error 而非 fatal）。
             # 常见于残留的 quick.exe 未退出、或其它代理软件(Clash/v2rayN)占用了端口。
             if ("address already in use" in _txt) or ("Only one usage" in _txt) or \
@@ -3120,6 +3343,7 @@ def _launch_quick(quick_dir, _heal=True):
                         with open(config_path, "w", encoding="utf-8") as _f:
                             _f.write(_fixed2)
                         log.warning(f"内核解析失败，已安全重排配置并自愈重试: {_fb_chg2}")
+                        _diagnose(f"内核解析失败，已安全重排并自愈重试（改动: {_fb_chg2}）")
                         try:
                             proc.kill()
                         except Exception:
@@ -3128,6 +3352,7 @@ def _launch_quick(quick_dir, _heal=True):
                     except Exception as _he:
                         log.warning(f"自愈重试失败: {_he}")
                 log.error(f"quick.exe 启动即致命退出(rc={rc}): {tail}")
+                _diagnose(f"内核启动致命退出 rc={rc} 关键输出: {tail}")
                 return None
             break
     return proc
@@ -3204,6 +3429,114 @@ def _is_config_yaml_valid(quick_dir):
             os.remove(_logf)
         except Exception:
             pass
+
+
+def _port_owner_info(port=7890):
+    """返回 (pid, name) 占用指定端口的进程；无人占用返回 (None, '')。
+
+    用于“代理未就绪”时定位真凶：开发机能跑、打包 EXE 跑不了，最常见原因是
+    部署机上有 Clash / v2rayN / 其它代理软件占着 7890，而开发机没有。
+    本函数直接查 netstat + tasklist，把占用者 PID 与进程名暴露给用户，
+    比笼统的“代理未就绪”更有行动指引。
+    """
+    try:
+        out = subprocess.run(
+            ["netstat", "-ano"], capture_output=True, text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW, timeout=12,
+        ).stdout
+        for line in out.splitlines():
+            cols = line.split()
+            if len(cols) >= 5 and f":{port}" in cols[1] and cols[3] == "LISTENING":
+                pid = cols[4]
+                name = ""
+                try:
+                    tl = subprocess.run(
+                        ["tasklist", "/fi", f"PID eq {pid}"],
+                        capture_output=True, text=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW, timeout=12,
+                    ).stdout
+                    for l in tl.splitlines()[3:]:
+                        if pid in l:
+                            name = l.split()[0]
+                            break
+                except Exception:
+                    pass
+                return pid, name
+    except Exception:
+        pass
+    return None, ""
+
+
+def _read_kernel_log(quick_dir, n=1000):
+    """读取内核上次运行的输出（quick_out.log）尾部，用于“代理未就绪”时定位真凶。
+
+    内核由 _launch_quick 以行缓冲落盘到此文件：卡死（如联网下载被墙的 GEOIP/MMDB）、
+    配置致命解析、端口冲突等真实报错都在里面。wait_for_proxy 超时但端口未被他人占用时，
+    读取它能把模糊的“代理未就绪”变成可定位的具体原因。
+    """
+    try:
+        p = os.path.join(quick_dir, "quick_out.log")
+        if os.path.isfile(p):
+            with open(p, "r", encoding="utf-8", errors="ignore") as _f:
+                return _f.read()[-n:]
+    except Exception:
+        pass
+    return ""
+
+
+def _select_first_valid_config(downloaded, preferred, quick_dir):
+    """从下载结果中挑选第一个能被真实内核解析的合法配置。
+
+    背景：某些订阅源（自定义订阅 / 备选上游 / 活订阅轮换）可能产出 mihomo 专属
+    错误的坏 YAML（如 rules 段特殊缩进），PyYAML 漏判，必须用真实内核校验。
+    旧逻辑只认 current_line（或 downloaded[0]），一旦它指向坏配置，就会反复
+    下载同一份坏配置 → 内核持续 fatal → “代理未就绪”死循环。
+
+    本函数：
+      - 优先保留用户选定的线路（preferred），其余按下载顺序兜底；
+      - 每条配置在独立临时目录用【真实内核】校验（绑定空闲端口，避免与 7890
+        冲突造成误判），第一个合法的即返回；
+      - 全部损坏返回 None（调用方给出清晰报错，而不是死循环）。
+    """
+    if not downloaded:
+        return None
+    order = []
+    if preferred:
+        for it in downloaded:
+            if it[0] == preferred:
+                order.append(it)
+                break
+    order += [it for it in downloaded if it not in order]
+    valid = []
+    for name, data, _src in order:
+        sub = tempfile.mkdtemp(prefix="_cfgv_")
+        try:
+            for f in ("quick.exe", "geoip.metadb", "Country.mmdb"):
+                s = os.path.join(quick_dir, f)
+                if os.path.isfile(s):
+                    try:
+                        os.link(s, os.path.join(sub, f))
+                    except Exception:
+                        shutil.copy2(s, os.path.join(sub, f))
+            cfg = os.path.join(sub, "config.yaml")
+            with open(cfg, "wb") as fh:
+                fh.write(data)
+            # 用空闲端口探测，隔离 7890 占用造成的误判
+            fp = _pick_free_port(18000)
+            _ensure_proxy_port(sub, port=fp, socks_port=fp + 1,
+                               controller=f"127.0.0.1:{fp + 2}")
+            if _is_config_yaml_valid(sub):
+                valid.append((name, data))
+                if name == preferred or not preferred:
+                    return (name, data)
+        except Exception:
+            pass
+        finally:
+            try:
+                shutil.rmtree(sub)
+            except Exception:
+                pass
+    return valid[0] if valid else None
 
 
 def start_quick(quick_dir):
@@ -3502,7 +3835,7 @@ def load_settings():
     defaults = {
         "auto_start": True,
         "auto_open_browser": True,
-        "global_proxy": False,
+        "global_proxy": True,
         "browser_proxy_enabled": True,
         "custom_apps_enabled": False,
         "custom_apps_scope": "all",
@@ -4148,6 +4481,7 @@ class ServiceWorker(QThread):
         config_path = os.path.join(quick_dir, "config.yaml")
         _cfg_exists = os.path.isfile(config_path)
         _cfg_valid = _is_config_yaml_valid(quick_dir) if _cfg_exists else False
+        _diagnose(f"启动入口 quick_dir={quick_dir} config_exists={_cfg_exists} config_valid={_cfg_valid}")
 
         # 本地配置缺失/已损坏时，可能有旧内核占着 7890 → 先停掉，确保后续能重新
         # 下载合法配置并成功绑定端口。仅当“有合法本地配置且代理已在运行”才直接复用。
@@ -4185,7 +4519,16 @@ class ServiceWorker(QThread):
                 self.finished.emit(False, "代理内核启动失败")
                 return
             if not wait_for_proxy(timeout=15):
-                self.finished.emit(False, "代理内核启动失败")
+                pid, name = _port_owner_info(7890)
+                if pid and name and name.lower() != "quick.exe":
+                    _diagnose(f"端口 7890 被 {name}(PID {pid}) 占用，内核无法绑定")
+                    self.finished.emit(False,
+                        f"端口 7890 被 {name}(PID {pid}) 占用，内核无法绑定。"
+                        f"请先结束该进程，或到“设置→代理地址”改用其它端口后重试。")
+                else:
+                    _klog = _read_kernel_log(quick_dir)
+                    _diagnose(f"端口 7890 在 15s 内未就绪（无其它进程占用，可能内核静默退出）；内核最后输出: {_klog}")
+                    self.finished.emit(False, "代理内核启动失败（端口 7890 未能就绪）")
                 return
             log.info("代理内核已启动（使用本地配置），后台下载最新配置...")
             self.finished.emit(True, "代理已启动 (后台更新配置中)")
@@ -4196,17 +4539,14 @@ class ServiceWorker(QThread):
                 try:
                     downloaded = download_all_configs()
                     if downloaded:
-                        selected = None
-                        if saved_line:
-                            for name, data, _src in downloaded:
-                                if name == saved_line:
-                                    selected = (name, data)
-                                    break
-                        if not selected:
-                            selected = (downloaded[0][0], downloaded[0][1])
-                        save_config(quick_dir, selected[1])
-                        self.line_selected.emit(selected[0])
-                        log.info(f"后台配置更新完成: {selected[0]}")
+                        # 同样用真实内核校验挑合法配置，避免把坏配置静默写回
+                        chosen = _select_first_valid_config(downloaded, saved_line, quick_dir)
+                        if chosen:
+                            save_config(quick_dir, chosen[1])
+                            self.line_selected.emit(chosen[0])
+                            log.info(f"后台配置更新完成: {chosen[0]}")
+                        else:
+                            log.warning("后台更新：所有订阅配置均无法解析，保留当前运行配置")
                 except Exception as e:
                     log.warning(f"后台下载配置失败: {e}")
             import threading
@@ -4221,19 +4561,30 @@ class ServiceWorker(QThread):
             pass
         downloaded = download_all_configs()
         if downloaded:
-            saved_line = self.kwargs.get("current_line")
-            selected = None
-            if saved_line:
-                for name, data, _src in downloaded:
-                    if name == saved_line:
-                        selected = (name, data)
-                        break
-            if not selected:
-                selected = (downloaded[0][0], downloaded[0][1])
-            save_config(quick_dir, selected[1])
-            self.line_selected.emit(selected[0])
-            self.progress.emit(f"已选择: {selected[0]}")
-            log.info(f"启动线路: {selected[0]}, 配置大小: {len(selected[1])} bytes")
+            # 用真实内核校验挑选第一条合法配置：优先保留用户选定线路，
+            # 否则回退到第一条能起来的线；全部坏则清晰报错，不陷入死循环。
+            chosen = _select_first_valid_config(
+                downloaded, self.kwargs.get("current_line"), quick_dir)
+            if chosen:
+                selected = chosen
+                # 启动前再确保 geoip.metadb 就位（GEOIP 规则依赖），避免内核卡在加载
+                try:
+                    _ensure_mmdb(quick_dir)
+                except Exception:
+                    pass
+                save_config(quick_dir, selected[1])
+                self.line_selected.emit(selected[0])
+                self.progress.emit(f"已选择: {selected[0]}")
+                _diagnose(f"启动线路已选合法配置: {selected[0]} (配置 {len(selected[1])} bytes)")
+                log.info(f"启动线路: {selected[0]}, 配置大小: {len(selected[1])} bytes")
+            else:
+                broken_names = "、".join(n for n, _, _ in downloaded)
+                _diagnose(f"所有 {len(downloaded)} 条订阅均无法被内核解析: {broken_names}")
+                self.finished.emit(False,
+                    f"所有 {len(downloaded)} 条订阅配置均无法被内核解析"
+                    f"（可能上游格式损坏：{broken_names}）。"
+                    f"请到“上游管理”检查/移除损坏的订阅源后重试。")
+                return
         else:
             if not has_local_config:
                 self.finished.emit(False, "无可用配置")
@@ -4248,7 +4599,15 @@ class ServiceWorker(QThread):
             self.finished.emit(False, "代理内核启动失败")
             return
         if not wait_for_proxy(timeout=15):
-            self.finished.emit(False, "代理内核启动失败")
+            pid, name = _port_owner_info(7890)
+            if pid and name and name.lower() != "quick.exe":
+                self.finished.emit(False,
+                    f"端口 7890 被 {name}(PID {pid}) 占用，内核无法绑定。"
+                    f"请先结束该进程，或到“设置→代理地址”改用其它端口后重试。")
+            else:
+                _klog = _read_kernel_log(quick_dir)
+                _diagnose(f"代理内核启动失败（端口 7890 未能就绪）；内核最后输出: {_klog}")
+                self.finished.emit(False, "代理内核启动失败（端口 7890 未能就绪）")
             return
         log.info("代理内核已启动，正在验证连接...")
         connected, latency = verify_proxy_connection(timeout=10)
@@ -4325,7 +4684,14 @@ class ServiceWorker(QThread):
                 continue
 
             if not wait_for_proxy(timeout=25):
-                log.warning(f"{name} 代理未就绪，跳过延迟测试")
+                pid, owner = _port_owner_info(7890)
+                if pid and owner and owner.lower() != "quick.exe":
+                    log.warning(f"{name} 代理未就绪：端口 7890 被 {owner}(PID {pid}) 占用（非本内核），"
+                                f"请结束该进程或改用其它端口")
+                else:
+                    # 端口未被他人占用却绑不上 → 内核大概率卡死/崩溃。读取内核真实输出定位。
+                    _klog = _read_kernel_log(quick_dir)
+                    log.warning(f"{name} 代理未就绪，跳过延迟测试；内核最后输出: {_klog}")
                 results.append((name, -1.0, -1.0, 0, data, False))
                 self.line_tested.emit(name, -1.0, False)
                 # Batch 3: 代理未就绪也算失败
@@ -5053,40 +5419,59 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(500, self._force_foreground)
 
     def _resolve_quick_dir(self):
+        """内核目录 = EXE 所在目录下的 Quick/（相对目录，绝不写死绝对路径）。
+
+        设计铁律（呼应“不要硬编码路径”）：
+        - 内核目录永远 = os.path.join(get_app_dir(), "Quick")，而 get_app_dir() 在打包态
+          直接返回 EXE 自身所在目录（dirname(sys.executable)），因此无论 EXE 被拷贝到
+          哪台机器、哪个文件夹，只要同目录释放出 Quick/ 即可运行，是纯相对路径。
+        - 绝不把绝对路径写进 launcher_settings.json 的 quick_dir_path：一旦写死，EXE
+          移动后该绝对路径就指向错误位置，导致“内嵌内核还原到 A、实际运行从 B”。
+        - 因此这里不再读取/持久化 quick_dir_path，内核目录每启动都按 EXE 相对位置重算。
+        """
+        # 永远相对 EXE：get_app_dir() 打包态 = EXE 所在目录
         quick_dir = os.path.join(get_app_dir(), "Quick")
-        if os.path.isfile(os.path.join(quick_dir, "quick.exe")):
-            log.info(f"内核目录: {quick_dir}")
-            return quick_dir
-        saved = self.settings.get("quick_dir_path", "")
-        if saved and os.path.isfile(os.path.join(saved, "quick.exe")):
-            log.info(f"使用保存的内核路径: {saved}")
-            return saved
         os.makedirs(quick_dir, exist_ok=True)
 
-        # 尝试从EXE内嵌资源还原代理核心（构建时通过 --add-data 打包）
-        self._restore_bundled_kernel(quick_dir)
+        # 1) 优先从 EXE 内嵌资源还原到 EXE 相对目录（首启 / 版本刷新都会补齐内核）
+        try:
+            self._restore_bundled_kernel(quick_dir)
+        except Exception as _e:
+            log.warning(f"还原内嵌内核失败: {_e}")
 
-        # 还原成功则直接使用，无需自动下载
+        # 2) EXE 相对目录已有可用内核 → 直接采用（不再把绝对路径写进 settings）
         if os.path.isfile(os.path.join(quick_dir, "quick.exe")):
-            log.info(f"已从内嵌资源还原代理核心: {quick_dir}")
-            self.settings["quick_dir_path"] = quick_dir
-            save_settings(self.settings)
+            # 显式打印推导来源，证明路径是 dirname(sys.executable)/Quick（相对 EXE，
+            # 非写死）。用户把 EXE 放到哪，内核目录就解析到哪，换机器/目录零改动。
+            log.info(f"内核目录(EXE相对): {quick_dir}  [推导自 sys.executable={sys.executable}]")
+            # 防御：geoip.metadb 缺失会让 mihomo 联网下载被墙资源 → 卡死不绑 7890
+            # （表现为“代理未就绪”）。该文件应已随 EXE 内嵌并还原，若仍缺失说明被杀软
+            # 误删或还原失败，此处告警并强制再还原一次，便于从日志一眼定位。
+            _geo = os.path.join(quick_dir, "geoip.metadb")
+            if not os.path.isfile(_geo):
+                log.warning("⚠️ 运行目录缺 geoip.metadb：内核可能因联网下载 GEOIP 被墙而卡死、"
+                            "不绑 7890。本 EXE 应已内嵌该文件，请确认未被杀软误删；将强制再还原一次。")
+                try:
+                    self._restore_bundled_kernel(quick_dir)
+                except Exception as _e:
+                    log.warning(f"补齐 geoip.metadb 失败: {_e}")
             return quick_dir
 
-        self.settings["quick_dir_path"] = quick_dir
-        save_settings(self.settings)
+        # 3) 既无内嵌可还原、也无有效内核 → 等待远程下载内核（仍落到 EXE 相对目录）
         log.info(f"内核目录已创建，等待下载内核: {quick_dir}")
         self._auto_download_kernel = True
         return quick_dir
 
     def _restore_bundled_kernel(self, quick_dir):
-        """从EXE内嵌资源还原代理核心到Quick目录。
-        构建时将 mihomo 内核通过 --add-data 打包进EXE的 _MEIPASS/Quick/ 目录。
-        首次运行时自动还原，避免用户没有核心或下载不到核心。
+        """从EXE内嵌资源完整还原代理核心到Quick目录。
+        构建时将整个 dev/app/Quick/（除运行时 config.yaml/backup）通过 --add-data
+        打包进 EXE 的 _MEIPASS/Quick/ 目录。首次运行时把内嵌 Quick/ 完整递归还原到
+        运行目录，使运行目录与开发模式字节级一致（含 ui/、kernels/、geoip.metadb、
+        Country.mmdb、GeoSite.dat 等全部文件），彻底排除“缺文件导致开发能跑、EXE 跑不了”。
 
-        精简策略（白名单复制）：只还原 mihomo 启动必需的文件，
-        跳过 ui/（pywebview 单独路径加载）、cache.db（运行时自动生成）、
-        config.yaml_backup（运行时自动备份）等冗余文件，加快首次启动速度。
+        仅排除运行时生成/陈旧状态文件：config.yaml、config.yaml_backup、cache.db、
+        _bundled_build.txt 标记、以及 Windows 保留名 nul。config.yaml 由运行时下载生成，
+        绝不被内嵌副本覆盖（构建时也已从包中剔除）。
         """
         if not getattr(sys, 'frozen', False):
             return
@@ -5102,54 +5487,72 @@ class MainWindow(QMainWindow):
         if not os.path.isfile(bundled_exe):
             return
 
-        # 顶层文件白名单：mihomo 启动必需的配置文件和数据文件
-        # 不含 ui/（pywebview 走其他路径）、cache.db（运行时自动生成）、
-        #      config.yaml_backup（运行时自动备份）
-        top_level_whitelist = {
-            "_kernel_version.txt",  # 当前内核版本号
-            "config.yaml",          # mihomo 启动配置
-            "geoip.metadb",         # GEOIP 规则依赖（缺失会让内核启动即失败/卡死）
-            "Country.mmdb",         # IP 地理位置库
-            "GeoSite.dat",          # 域名分类库
+        # 运行时状态文件：保留用户已下载的真实配置与本地缓存，不被内嵌副本覆盖
+        _skip_names = {
+            "config.yaml",        # 运行时下载的真实多节点配置（包内本就无此文件）
+            "config.yaml_backup",  # 运行时自动备份
+            "cache.db",           # mihomo 运行时缓存，自动生成
+            "_bundled_build.txt",  # 本函数的版本标记，非内核文件
         }
 
+        # 版本感知刷新标记：记录“上次还原来自哪个 EXE 构建版本”，构建版本变化则强制
+        # 完整覆盖内核与数据文件，避免陈旧 runtime 永远不被新 EXE 覆盖——这正是“开发能跑、
+        # EXE 跑不了、且换多个新 EXE 仍问题依旧”的根因（旧文件因“存在即跳过”永不更新）。
+        _build_marker = os.path.join(quick_dir, "_bundled_build.txt")
+        bundled_build = ""
+        _bv = os.path.join(meipass, "_build_version.txt")
+        if os.path.isfile(_bv):
+            try:
+                bundled_build = open(_bv, "r", encoding="utf-8").read().strip()
+            except Exception:
+                pass
+        deployed_build = ""
+        if os.path.isfile(_build_marker):
+            try:
+                deployed_build = open(_build_marker, "r", encoding="utf-8").read().strip()
+            except Exception:
+                pass
+        need_refresh = bool(bundled_build) and (bundled_build != deployed_build)
+
         try:
-            kernels_dir = os.path.join(quick_dir, "kernels")
-            os.makedirs(kernels_dir, exist_ok=True)
+            os.makedirs(quick_dir, exist_ok=True)
 
-            # 1. 复制白名单内的顶层文件（不存在才复制，避免覆盖用户已有配置）
-            for basename in top_level_whitelist:
-                src = os.path.join(bundled_quick, basename)
-                if not os.path.isfile(src):
-                    continue
-                dst = os.path.join(quick_dir, basename)
-                if not os.path.exists(dst):
-                    shutil.copy2(src, dst)
+            # 需刷新且旧内核可能正在运行（占用文件导致无法覆盖）时，先停掉旧内核
+            if need_refresh:
+                try:
+                    stop_quick()
+                except Exception:
+                    pass
 
-            # 2. 复制 kernels/ 下所有内核文件（不限制后缀，便于未来扩展多平台内核）
-            bundled_kernels = os.path.join(bundled_quick, "kernels")
-            if os.path.isdir(bundled_kernels):
-                import glob as _glob
-                for item in _glob.glob(os.path.join(bundled_kernels, "*")):
-                    basename = os.path.basename(item)
-                    target = os.path.join(kernels_dir, basename)
-                    if not os.path.exists(target):
-                        shutil.copy2(item, target)
+            # 完整递归还原内嵌 Quick/：缺失即复制；构建版本变化则强制覆盖全部内核/数据文件
+            _refresh_ok = True
+            for _root, _dirs, _files in os.walk(bundled_quick):
+                _rel = os.path.relpath(_root, bundled_quick)
+                _target_root = quick_dir if _rel == "." else os.path.join(quick_dir, _rel)
+                os.makedirs(_target_root, exist_ok=True)
+                for _fn in _files:
+                    if _fn.lower() == "nul":  # Windows 保留名，无法写入
+                        continue
+                    if _fn in _skip_names:
+                        continue
+                    _src = os.path.join(_root, _fn)
+                    _dst = os.path.join(_target_root, _fn)
+                    if (not os.path.exists(_dst)) or need_refresh:
+                        try:
+                            shutil.copy2(_src, _dst)
+                        except OSError as _e:
+                            _refresh_ok = False
+                            log.warning(f"还原内核文件 {_fn} 失败(可能被占用): {_e}")
 
-            # 3. 创建 quick.exe 硬链接指向还原的内核（选择最新版本）
-            quick_exe = os.path.join(quick_dir, "quick.exe")
-            if not os.path.isfile(quick_exe):
-                kernel_files = [f for f in os.listdir(kernels_dir) if f.endswith('.exe')]
-                if kernel_files:
-                    kernel_files.sort(reverse=True)  # 字符串倒序，单版本时也成立
-                    source_kernel = os.path.join(kernels_dir, kernel_files[0])
-                    try:
-                        os.link(source_kernel, quick_exe)
-                    except OSError:
-                        # 不支持硬链接时退化为普通复制
-                        shutil.copy2(source_kernel, quick_exe)
+            # 仅当刷新成功（或本就无需刷新）才更新标记，确保刷新失败会在下次启动重试
+            if (not need_refresh) or _refresh_ok:
+                try:
+                    with open(_build_marker, "w", encoding="utf-8") as _f:
+                        _f.write(bundled_build)
+                except Exception:
+                    pass
 
-            log.info(f"代理核心已从内嵌资源还原: {quick_dir}")
+            log.info(f"代理核心已从内嵌资源完整还原: {quick_dir}" + (f" (构建 {bundled_build})" if bundled_build else ""))
         except Exception as e:
             log.error(f"还原内嵌代理核心失败: {e}")
 
@@ -5164,8 +5567,9 @@ class MainWindow(QMainWindow):
         if not meipass:
             return
 
-        dev_dir = self._get_dev_dir()
-        app_dir = os.path.join(dev_dir, _CFG["paths"]["app"])
+        # 打包态 get_app_dir() = EXE 所在目录；开发态 = dev/app。统一用 get_app_dir()，
+        # 避免 frozen 模式下多写一层 app/ 子目录导致与 load_settings/save_settings 错位。
+        app_dir = get_app_dir()
 
         for filename in ["versions.json", "gitlog.json", "kernel_versions_cache.json"]:
             local_path = os.path.join(app_dir, filename)
@@ -8679,8 +9083,18 @@ class MainWindow(QMainWindow):
                 mode_label = "全局系统代理"
             mode_lines = ["  # YUNJI_PROXY_MODE_START"]
             if mode == "foreign":
-                # 绕过境内：国内IP直连，其他走代理
-                mode_lines.append("  - GEOIP,CN,DIRECT")
+                # 绕过境内：国内IP直连，其他走代理。
+                # 关键安全网：GEOIP 规则依赖 geoip.metadb。若该库缺失（极旧 EXE /
+                # 还原白名单漏掉 / 部署机异常），mihomo 加载 GEOIP 规则会 fatal 或
+                # 挂起（尝试联网下载被墙的 GitHub MMDB）→ 内核不绑端口 → “代理未就绪”。
+                # 此时退化为全局代理（不注入 GEOIP 规则），宁可境内流量也走代理，
+                # 也绝不让内核起不来。
+                geoip_path = os.path.join(quick_dir, "geoip.metadb")
+                if not os.path.isfile(geoip_path):
+                    log.warning("geoip.metadb 缺失，跳过 GEOIP,CN,DIRECT 注入"
+                                "（退化为全局代理，避免内核因缺库致命）")
+                else:
+                    mode_lines.append("  - GEOIP,CN,DIRECT")
             mode_lines.append("  # YUNJI_PROXY_MODE_END")
             # 优先在自定义规则块之后插入，否则在 rules: 后插入
             custom_end_pattern = re.compile(r'^(\s*# YUNJI_CUSTOM_RULES_END\s*\n)', re.MULTILINE)
@@ -9524,9 +9938,14 @@ class MainWindow(QMainWindow):
         def do_download():
             try:
                 _cfg_valid = _is_config_yaml_valid(quick_dir)
-                if proxy_enabled or (is_proxy_running() and _cfg_valid):
-                    log.info("代理服务已启用或运行中，跳过启动时配置覆盖")
+                if _cfg_valid:
+                    # 本地配置合法 → 不自动覆盖（保留打包内置/上次可用的活节点配置）。
+                    # 内置免费源(gitlabip / free9999/ipupdate)节点已全部失效，若启动期盲目用
+                    # downloaded[0]（即死节点 线路1）覆盖，会把活配置换成死节点 → “代理未就绪/线路不通”。
+                    # 需要更新请手动点击「更新配置 / 检测线路」。
+                    log.info("本地配置合法，跳过启动时配置覆盖（如需更新请手动点击“更新配置/检测线路”）")
                     return
+                # 本地配置缺失/损坏 → 才下载一份合法配置覆盖
                 # 配置已损坏但代理在运行：先停掉旧内核，避免残留坏配置占着 7890，
                 # 然后重新下载一份合法配置覆盖（否则坏配置会被持续复用 → 内核 fatal）。
                 if (not _cfg_valid) and is_proxy_running():
@@ -10262,8 +10681,7 @@ class MainWindow(QMainWindow):
 
     def _get_local_gitlog(self):
         """读取本地开发动态，优先从本地文件，回退到内嵌资源。"""
-        dev_dir = self._get_dev_dir()
-        path = os.path.join(dev_dir, _CFG["paths"]["app"], "gitlog.json")
+        path = os.path.join(get_app_dir(), "gitlog.json")
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as f:
@@ -10352,8 +10770,7 @@ class MainWindow(QMainWindow):
         return exes
 
     def _get_local_version_history(self):
-        dev_dir = self._get_dev_dir()
-        path = os.path.join(dev_dir, _CFG["paths"]["app"], "versions.json")
+        path = os.path.join(get_app_dir(), "versions.json")
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as f:
@@ -10775,7 +11192,7 @@ class MainWindow(QMainWindow):
         if tag.endswith(".exe"):
             tag = tag[:-4]
 
-        settings_path = os.path.join(dev_dir, _CFG["paths"]["app"], "launcher_settings.json")
+        settings_path = os.path.join(get_app_dir(), "launcher_settings.json")
         try:
             with open(settings_path, "r", encoding="utf-8") as f:
                 settings = json.load(f)
@@ -10889,8 +11306,7 @@ class MainWindow(QMainWindow):
 
             if commits:
                 # 覆盖本地gitlog.json
-                dev_dir = self._get_dev_dir()
-                gitlog_path = os.path.join(dev_dir, _CFG["paths"]["app"], "gitlog.json")
+                gitlog_path = os.path.join(get_app_dir(), "gitlog.json")
                 try:
                     os.makedirs(os.path.dirname(gitlog_path), exist_ok=True)
                     with open(gitlog_path, "w", encoding="utf-8") as f:
@@ -11675,6 +12091,12 @@ class MainWindow(QMainWindow):
                 self.monitor.wait()
         except Exception:
             pass
+        # 真正退出：先停止代理内核（强杀 quick.exe 及其子进程），避免关闭程序后
+        # 内核进程残留占用 7890/9090 端口、并在后台持续运行。
+        try:
+            stop_quick()
+        except Exception:
+            pass
         # 隐藏托盘图标，避免退出后托盘残留
         if self._tray:
             self._tray.hide()
@@ -12336,10 +12758,47 @@ def _cleanup_single_instance():
         _instance_mutex = None
 
 
+def _kill_stale_kernels():
+    """启动硬防护：清空上一会话遗留的 quick.exe 孤儿内核。
+
+    关闭窗口(X)默认最小化到托盘而非真正退出，旧内核进程不会随窗口关闭而被
+    stop_quick() 终止，会一直占用 7890/9090。单实例机制在启动早期会杀掉旧 EXE，
+    但被杀 EXE 的子进程 quick.exe 会变成孤儿继续占端口；下次启动新内核因子端口被占
+    无法绑定 → “代理未就绪”。
+
+    单实例已保证当前只有本 app 一个实例，故启动初期尚不存在任何“本实例”内核，
+    此时全盘 taskkill quick.exe 是安全的（不会误杀正在用的内核）。
+    """
+    try:
+        _si = subprocess.STARTUPINFO()
+        _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        _si.wShowWindow = 0
+        _r = subprocess.run(
+            ["taskkill", "/f", "/im", "quick.exe"],
+            capture_output=True, startupinfo=_si,
+            creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
+        )
+        _out = (_r.stdout or b"").decode("gbk", "ignore")
+        if "SUCCESS" in _out:
+            log.info("启动清理：已终止上一会话遗留的 quick.exe 孤儿进程")
+    except Exception as e:
+        log.debug(f"启动清理遗留内核失败（可忽略）: {e}")
+
+
 def main():
+    # 自动部署（首跑建品牌文件夹+入口并 os._exit 切换到入口；已部署态清理/切版本）。
+    # 必须放在单实例之前：便携 exe 部署阶段不持有互斥体，避免入口（子进程）被
+    # 自身 mutex 误判“已运行”而退出（见 _ensure_single_instance 的祖先链跳过逻辑）。
+    if getattr(sys, 'frozen', False):
+        _self_deploy()
+
     # 单实例控制：杀同名前缀的旧 EXE / 旧 python main.py → mutex 占位
     # 这是整个进程生命周期的第一步，必须在任何 QApplication 资源创建之前完成
     _ensure_single_instance()
+
+    # 启动硬防护：单实例刚杀掉旧 EXE，其遗留的 quick.exe 孤儿仍占 7890/9090。
+    # 在启动任何内核之前先清空，避免新内核因端口被占绑不上 → “代理未就绪”。
+    _kill_stale_kernels()
 
     # 清除残留的代理环境变量（上次关闭时未清理会导致所有网络请求指向死代理）
     _DEFAULT_PROXY_ENVS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy")
@@ -12350,6 +12809,23 @@ def main():
             pass
 
     sys.excepthook = _global_exception_handler
+
+    # 退出兜底：任何退出路径（正常退出、未捕获异常）都强杀代理内核，
+    # 杜绝 quick.exe 进程残留（_self_deploy 的 os._exit 不经过 atexit，故不影响部署切换）。
+    import atexit
+    def _atexit_kill_kernel():
+        try:
+            _si = subprocess.STARTUPINFO()
+            _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            _si.wShowWindow = 0
+            subprocess.run(
+                ["taskkill", "/f", "/im", "quick.exe"],
+                capture_output=True, startupinfo=_si,
+                creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
+            )
+        except Exception:
+            pass
+    atexit.register(_atexit_kill_kernel)
 
     # 启动时确保内置默认备选上游仓库存在（首次启动自动写入 backup_sources.json）
     ensure_builtin_backup_sources()
