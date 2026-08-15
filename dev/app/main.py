@@ -4722,13 +4722,10 @@ class ServiceWorker(QThread):
         except Exception:
             pass
 
-        # 构造竞速线路列表：内置/订阅下载的配置 + 烤入的 anytls2 默认活节点。
-        # 内置免费源(gitlabip)节点常集体失效，若无任何存活线路，“检测线路”会整页超时、
-        # 用户误以为软件坏掉；anytls2 是真实可用节点，作为内置可测线路保证开箱至少一条绿。
+        # 竞速线路列表：严格为内置/订阅下载的配置（内置 4 条 gitlabip + 用户订阅）。
+        # 按用户要求不再把 anytls2 默认节点作为可见竞速线路；它仅作为主代理的静默
+        # 兜底默认配置（首启用/全部失败时由启动逻辑处理），不参与面板竞速展示。
         lines = list(downloaded)
-        _dd = _load_builtin_default_config(quick_dir)
-        if _dd:
-            lines.append((BUILTIN_DEFAULT_LINE_NAME, _dd, "builtin-default"))
 
         original_config = None
         config_path = os.path.join(quick_dir, "config.yaml")
@@ -4857,7 +4854,7 @@ class ServiceWorker(QThread):
                     save_config(quick_dir, original_config)
                 except Exception:
                     pass
-            self.finished.emit(True, "检测完成（所有线路均不可用）")
+            self.finished.emit(True, "检测完成：内置免费节点已全部失效，请到「上游管理」添加你的存活订阅")
             return
 
         # 已即时选中胜者（内核已启用）；末尾仅做 finalize，避免重复重启
@@ -6108,9 +6105,7 @@ class MainWindow(QMainWindow):
                 w.setParent(None)
                 w.deleteLater()
         self.line_rows = {}
-        # 内置存活默认节点(anytls2)：保证开箱即有一条可测可用线路
-        self._line_rows_layout.addWidget(self._make_line_row(BUILTIN_DEFAULT_LINE_NAME, is_custom=False))
-        # 内置 4 条
+        # 内置 4 条（严格竞速线路，不含 anytls2 默认节点——它仅作静默兜底）
         for name, _, _ in CONFIG_URLS:
             self._line_rows_layout.addWidget(self._make_line_row(name, is_custom=False))
         # 启用的自定义订阅
@@ -12282,7 +12277,6 @@ class HealthDetailDialog(QDialog):
         all_names = set()
         for name, _, _ in CONFIG_URLS:
             all_names.add(name)
-        all_names.add(BUILTIN_DEFAULT_LINE_NAME)
         try:
             for sub in get_subscription_manager().get_all():
                 all_names.add(sub.name)
