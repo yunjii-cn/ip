@@ -352,11 +352,22 @@ def build():
             # _do_start 走“无本地配置→下载真实配置→启动”分支，与 dev 首次运行完全一致。
             import shutil as _shutil
 
+            # 运行时垃圾/大文件，绝不烤进 EXE：否则 test_lines/ 每条含 53MB quick.exe
+            # 硬链会把 EXE 从 ~85MB 撑到 ~187MB，且这些目录是运行检测时临时生成的。
+            _EXCLUDE_NAMES = {
+                "nul", "test_lines", "cache.db", "config.yaml_backup",
+            }
+
             def _copytree_skip_nul(src, dst):
-                """递归复制，跳过 Windows 保留名文件 nul（普通 copytree/os.walk 会崩）。"""
+                """递归复制，跳过 Windows 保留名 nul 与运行时垃圾（test_lines/cache.db/*.log 等）。"""
                 os.makedirs(dst, exist_ok=True)
                 for _e in os.scandir(src):
-                    if _e.name.lower() == "nul":
+                    _ln = _e.name.lower()
+                    if _ln in _EXCLUDE_NAMES:
+                        continue
+                    if _ln.endswith(".log"):
+                        continue
+                    if _ln.startswith("_realrun") and _ln.endswith(".py"):
                         continue
                     _s = _e.path
                     _d = os.path.join(dst, _e.name)
@@ -366,7 +377,7 @@ def build():
                         else:
                             _shutil.copy2(_s, _d)
                     except OSError as _err:
-                        if _e.name.lower() == "nul":
+                        if _ln == "nul":
                             continue
                         print(f"  ⚠ 跳过无法复制的项 {_s}: {_err}")
 
