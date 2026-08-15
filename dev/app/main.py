@@ -5407,6 +5407,9 @@ class MainWindow(QMainWindow):
         self.quick_dir = self._resolve_quick_dir()
         self.current_line = self.settings.get("current_line", "")
         self.line_results = {}
+        self.line_latencies = {}      # name -> 最佳境外延迟(秒)，-1 表示不可用
+        self.line_usable = {}         # name -> 是否真正能代理境外
+        self._last_auto_switch_ts = 0.0
         self.worker = None
         self._auto_line_timer = None
 
@@ -9421,44 +9424,40 @@ class MainWindow(QMainWindow):
             self._auto_switch_on_disconnect()
 
     def _auto_switch_on_disconnect(self):
-        """断线时自动检测所有线路并切换到最快的线路"""
-        if not self.line_results:
+        """断线时自动切换到最快的『可用』线路；若无可用线路则不重启死配置（避免循环）。"""
+        results = getattr(self, "line_results", {}) or {}
+        if not results:
             # 没有线路数据时，直接启动代理
             if self.quick_dir:
                 self._on_start()
             return
-        # 检测所有线路延迟，选择最快的
-        best_line = None
-        best_latency = 999999
-        for name, data in self.line_results.items():
-            if not data:
-                continue
-            latency = self.line_latencies.get(name, 0)
-            if latency > 0 and latency < best_latency:
-                best_latency = latency
-                best_line = name
-        if best_line and best_line != self.current_line:
-            log.info(f"断线切换: 从 {self.current_line} 切换到最快线路 {best_line} ({best_latency}ms)")
-            self.worker = ServiceWorker("use_line", name=best_line,
-                                        data=self.line_results[best_line],
-                                        quick_dir=self.quick_dir,
-                                        proxy_enabled=True)
-            self.worker.line_selected.connect(self._on_line_selected)
-            self.worker.progress.connect(lambda t: self.line_progress.setText(t))
-            self.worker.finished.connect(self._on_use_line_finished)
-            self.worker.start()
-        elif self.current_line and self.current_line in self.line_results and self.line_results[self.current_line]:
-            # 没有更好的线路，重连当前线路
-            self.worker = ServiceWorker("use_line", name=self.current_line,
-                                        data=self.line_results[self.current_line],
-                                        quick_dir=self.quick_dir,
-                                        proxy_enabled=True)
-            self.worker.line_selected.connect(self._on_line_selected)
-            self.worker.progress.connect(lambda t: self.line_progress.setText(t))
-            self.worker.finished.connect(self._on_use_line_finished)
-            self.worker.start()
-        elif self.quick_dir:
-            self._on_start()
+        latencies = getattr(self, "line_latencies", {}) or {}
+        usable = getattr(self, "line_usable", {}) or {}
+
+        # 只在“真正能代理境外”的线路里挑最快（best>0 即等价可用，避免误选死节点）
+        candidates = [(n, latencies.get(n, -1.0))
+                      for n in results
+                      if usable.get(n) and latencies.get(n, -1.0) > 0]
+        if candidates:
+            candidates.sort(key=lambda x: x[1])
+            best_line, best_latency = candidates[0]
+            if best_line != self.current_line:
+                log.info(f"断线切换: 从 {self.current_line} 切换到最快可用线路 {best_line} ({best_latency:.2f}s)")
+                self._on_use_line(best_line)
+            else:
+                # 当前即最快可用线路：重连当前线路（瞬时断线恢复）
+                log.info(f"断线恢复: 重连当前最快可用线路 {self.current_line}")
+                self._on_use_line(self.current_line)
+            return
+
+        # 无可用线路：不重启死配置（否则会无限重连循环），明确提示用户。
+        # 防抖：实时检测定时器周期性触发，60s 内只提示一次，避免日志刷屏。
+        now = time.time()
+        if now - getattr(self, "_last_auto_switch_ts", 0.0) < 60:
+            return
+        self._last_auto_switch_ts = now
+        log.warning("断线自动切换失败: 当前无可用线路（内置免费节点可能已全部失效），"
+                    "请到「上游管理」添加存活订阅，或手动选择一条线路")
 
     def _on_auto_start_toggled(self, checked):
         self._save_setting("auto_start", checked)
@@ -9625,6 +9624,8 @@ class MainWindow(QMainWindow):
 
             for name, avg, best, count, data, usable in results:
                 self.line_results[name] = data
+                self.line_latencies[name] = best if best > 0 else -1.0
+                self.line_usable[name] = bool(usable)
                 if name not in self.line_rows:
                     continue
                 info = self.line_rows[name]
