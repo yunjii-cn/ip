@@ -12430,6 +12430,13 @@ class MainWindow(QMainWindow):
             stop_quick()
         except Exception:
             pass
+        # 还原系统代理：否则注册表残留 ProxyEnable=1 + ProxyServer=127.0.0.1:7890
+        # 而内核已死 -> 用户退出后整机指向死代理无法上网（"网络代理设置异常"）。
+        # 退出即视为关闭代理，必须清掉系统代理开关与残留地址。
+        try:
+            set_system_proxy(False)
+        except Exception:
+            pass
         # 隐藏托盘图标，避免退出后托盘残留
         if self._tray:
             self._tray.hide()
@@ -13156,6 +13163,12 @@ def main():
                 capture_output=True, startupinfo=_si,
                 creationflags=subprocess.CREATE_NO_WINDOW, timeout=5,
             )
+        except Exception:
+            pass
+        # 兜底还原系统代理（覆盖崩溃/硬退出等未走 _quit_app 的路径），
+        # 避免退出后注册表残留死代理导致用户无法上网。
+        try:
+            set_system_proxy(False)
         except Exception:
             pass
     atexit.register(_atexit_kill_kernel)
