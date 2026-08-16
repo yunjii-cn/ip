@@ -2820,38 +2820,47 @@ def _ensure_proxy_port(config_path, port=7890, socks_port=7891, controller="127.
         log.warning(f"补全端口配置失败: {e}")
 
 
-def _ensure_mmdb(quick_dir):
-    """确保 mihomo 工作目录内有 geoip.metadb（GEOIP 规则依赖）。
+def _restore_one_mmdb(quick_dir, fname, min_size=1_000_000):
+    """从内嵌/项目副本强制还原单个只读内核数据文件（geoip.metadb / Country.mmdb）。
 
-    mihomo 启动默认从 -d 目录加载 geoip.metadb；缺失时它会去
-    github.com/MetaCubeX/meta-rules-dat 下载，而 GitHub 在国内被墙，
-    会直接导致内核 fatal 退出（"can't download MMDB"）→ 代理未就绪。
-    因此预置一份本地副本，并关闭 geo-auto-update，彻底规避联网下载。
+    被杀软隔离/损坏时，启动前还原一份完好副本，避免内核卡在加载 GEOIP/GEOSITE
+    → 不绑 7890 → “dev 能跑、EXE 跑不了”。仅还原 geoip 不够：Country.mmdb 缺失
+    同样会让内核卡在加载阶段，且 EXE 部署目录比 dev 目录更容易被 Defender 实时隔离。
     """
     try:
-        target = os.path.join(quick_dir, "geoip.metadb")
-        if os.path.isfile(target) and os.path.getsize(target) > 1_000_000:
+        target = os.path.join(quick_dir, fname)
+        if os.path.isfile(target) and os.path.getsize(target) > min_size:
             return True
-        # 项目内已有副本（EXE 内嵌资源 / 应用目录 / Android 资源，全部走相对路径，避免写死开发机绝对路径）
         candidates = [
-            os.path.join(get_app_dir(), "Quick", "geoip.metadb"),
-            os.path.join(getattr(sys, '_MEIPASS', ''), "Quick", "geoip.metadb"),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "Quick", "geoip.metadb"),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
-                         "web", "frontend", "android", "app", "src", "main",
-                         "assets", "mihomo", "geoip.metadb"),
+            os.path.join(get_app_dir(), "Quick", fname),
+            os.path.join(getattr(sys, '_MEIPASS', ''), "Quick", fname),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "Quick", fname),
         ]
         for c in candidates:
             c = os.path.abspath(c)
-            if os.path.isfile(c) and os.path.getsize(c) > 1_000_000:
+            if os.path.isfile(c) and os.path.getsize(c) > min_size:
                 shutil.copy2(c, target)
-                log.info(f"已预置 geoip.metadb -> {target}")
+                log.info(f"已预置 {fname} -> {target}")
                 return True
-        log.warning("未找到 geoip.metadb 副本，GEOIP 规则可能需联网下载（或失败）")
+        log.warning(f"未找到 {fname} 副本，GEOIP/GEOSITE 规则可能需联网下载（或失败）")
         return False
     except Exception as e:
-        log.warning(f"预置 geoip.metadb 失败: {e}")
+        log.warning(f"预置 {fname} 失败: {e}")
         return False
+
+
+def _ensure_mmdb(quick_dir):
+    """确保 mihomo 工作目录内有 geoip.metadb 与 Country.mmdb（GEOIP/GEOSITE 规则依赖）。
+
+    mihomo 启动默认从 -d 目录加载；缺失时它会去 github.com/MetaCubeX/meta-rules-dat
+    下载，而 GitHub 在国内被墙，会直接导致内核 fatal 退出（"can't download MMDB"）
+    → 代理未就绪。因此预置本地副本，并关闭 geo-auto-update，彻底规避联网下载。
+    两个只读数据文件被杀软隔离后都必须每次启动前强制还原（仅还原 geoip 不够，
+    Country.mmdb 缺失同样会让内核卡在加载 GEOIP → 不绑 7890 → EXE 跑不了而 dev 能跑）。
+    """
+    ok1 = _restore_one_mmdb(quick_dir, "geoip.metadb")
+    ok2 = _restore_one_mmdb(quick_dir, "Country.mmdb")
+    return ok1 and ok2
 
 
 def _safe_clash_text_fixes(text):
@@ -3273,6 +3282,20 @@ def _launch_quick(quick_dir, _heal=True):
     if not os.path.isfile(quick_exe):
         log.error(f"quick.exe 不存在: {quick_exe}")
         return None
+    # 启动前对 quick.exe 本体做完整性自检（杀软可能在启动后再次隔离它）。
+    # 体积异常偏小（< 内嵌源的 90%）立即从 _MEIPASS 重新还原一次，避免拉起损坏副本
+    # 导致“内核未启动”。
+    try:
+        _src_exe = os.path.join(getattr(sys, '_MEIPASS', ''), "Quick", "quick.exe")
+        if os.path.isfile(_src_exe):
+            _dst_sz = os.path.getsize(quick_exe)
+            _src_sz = os.path.getsize(_src_exe)
+            if _src_sz > 0 and _dst_sz < _src_sz * 0.9:
+                log.warning(f"quick.exe 体积异常偏小({_dst_sz}B < 源 {_src_sz}B，疑似被杀软隔离)，"
+                            f"启动前重新还原")
+                shutil.copy2(_src_exe, quick_exe)
+    except Exception as _qe:
+        log.warning(f"quick.exe 完整性自检/还原失败(继续尝试): {_qe}")
     config_path = os.path.join(quick_dir, "config.yaml")
     if not os.path.isfile(config_path):
         log.error(f"config.yaml 不存在: {config_path}")
@@ -3307,6 +3330,16 @@ def _launch_quick(quick_dir, _heal=True):
                 log.info("启动前自愈 config.yaml: 已修复 rules 段缩进")
     except Exception as _e:
         log.warning(f"启动前修复 config.yaml 失败（沿用原文件）: {_e}")
+    # 启动前确保 geoip.metadb 就位（GEOIP,CN,DIRECT 规则依赖）。
+    # 这是【主代理 + 线路检测】共用的唯一内核启动入口；此前仅主代理路径(_do_start)
+    # 调过 _ensure_mmdb，线路检测走 start_quick→_launch_quick 漏掉了它。EXE 运行时若
+    # geoip.metadb 被杀软隔离/损坏，内核会卡在加载 GEOIP → 不绑 7890 → 线路全超时。
+    # 在此兜底，使每一次内核拉起都从内嵌 _MEIPASS 还原一份完好 geoip，彻底消除
+    # “dev 能跑、EXE 跑不了”的运行时差异（dev 的 geoip 永不被部署逻辑触碰）。
+    try:
+        _ensure_mmdb(quick_dir)
+    except Exception as _ge:
+        log.warning(f"启动前预置 geoip.metadb 失败(继续尝试启动): {_ge}")
     log.info(f"配置文件大小: {os.path.getsize(config_path)} bytes")
     # 内核输出落盘到 quick_out.log（行缓冲），便于“代理未就绪”时回看 mihomo 真实报错。
     # 旧逻辑用 PIPE 且仅在 6s 内读取，内核稍晚崩溃/卡死即丢失输出 → 诊断盲区。
@@ -4716,149 +4749,184 @@ class ServiceWorker(QThread):
             self.finished.emit(False, "代理内核不存在，请先更新代理内核")
             return
 
-        # 确保主目录 MMDB 就绪（并发测试目录会硬链接它）
-        try:
-            _ensure_mmdb(quick_dir)
-        except Exception:
-            pass
-
-        # 竞速线路列表：严格为内置/订阅下载的配置（内置 4 条 gitlabip + 用户订阅）。
-        # 按用户要求不再把 anytls2 默认节点作为可见竞速线路；它仅作为主代理的静默
-        # 兜底默认配置（首启用/全部失败时由启动逻辑处理），不参与面板竞速展示。
-        lines = list(downloaded)
-
         original_config = None
         config_path = os.path.join(quick_dir, "config.yaml")
         if os.path.isfile(config_path):
             with open(config_path, 'rb') as f:
                 original_config = f.read()
 
-        total = len(lines)
-        self.progress.emit(f"并发竞速检测 {total} 条线路（最先可用的即时启用）...")
+        results = []
+        total = len(downloaded)
 
-        # 竞速前：若主代理正在运行，先停掉，腾出 7890；测试实例走独立端口(18xxx)，互不影响。
-        if is_proxy_running():
-            try:
-                stop_quick()
-            except Exception:
-                pass
-            time.sleep(1)
+        for i, (name, data, _src) in enumerate(downloaded):
+            self.progress.emit(f"正在检测线路 {i+1}/{total}: {name}...")
+            save_config(quick_dir, data)
 
-        # 为每条线路准备独立工作目录 + 内核实例（独立 mixed/socks/controller 端口）
-        test_base = os.path.join(quick_dir, "test_lines")
-        prepared = []  # (name, data, proc, port, line_dir)
-        for i, (name, data, _src) in enumerate(lines):
-            try:
-                line_dir = os.path.join(test_base, f"line_{i}")
-                _prepare_test_dir(quick_dir, line_dir)
-                base = _pick_free_port_triple(18000 + i * 100)
-                port = base
-                socks = base + 1
-                controller = f"127.0.0.1:{base + 2}"
-                # 写该线路配置：强制独立端口；不启用 TUN（临时实例无需虚拟网卡）
-                save_config(line_dir, data, mixed_port=port, socks_port=socks,
-                            controller=controller, yunji_src=config_path, inject_advanced=False)
-                proc = start_quick_proc(line_dir)
-                if proc is None:
-                    log.warning(f"{name} 内核启动失败，跳过竞速")
-                    self.line_tested.emit(name, -1.0, False)
-                    continue
-                prepared.append((name, data, proc, port, line_dir))
-            except Exception as e:
-                log.warning(f"{name} 准备竞速失败: {e}")
-                self.line_tested.emit(name, -1.0, False)
-
-        if not prepared:
-            self.finished.emit(False, "所有线路内核均无法启动")
-            return
-
-        results = {}                 # name -> (name, avg, best, count, data, usable)
-        results_lock = threading.Lock()
-        winner_event = threading.Event()
-        winner_name = [None]
-        winner_data = [None]
-
-        def _apply_winner(name, data):
-            """第一条可用线路即时选中：写回主配置并（按需）重启主内核，用户无需等待其余线路。"""
-            proxy_enabled = self.kwargs.get("proxy_enabled", False)
-            try:
-                if proxy_enabled:
-                    save_config(quick_dir, data)
-                    if not is_proxy_running():
-                        start_quick(quick_dir)
-                        wait_for_proxy(timeout=8)
-                    log.info(f"竞速即时选路并已启用: {name}")
-                else:
-                    # 未启动代理：仅把胜者写入主配置，供下次启动/一键使用
-                    save_config(quick_dir, data)
-                    log.info(f"竞速即时选路（未启用代理，仅写入主配置）: {name}")
-            except Exception as e:
-                log.warning(f"应用胜者线路 {name} 失败: {e}")
-
-        def _on_line_done(name, data, port, proc):
-            best, usable, avg, count = _measure_line_through_port(name, port)
-            with results_lock:
-                results[name] = (name, avg, best, count, data, usable)
-            # 实时回报该线路结果（作为参考，无论是否胜者都展示）
-            self.line_tested.emit(name, (best if best > 0 else avg), usable)
-            try:
-                get_health_db().append(name, HealthRecord(
-                    ts=datetime.now().isoformat(timespec="seconds"),
-                    success=usable, avg=(best if best > 0 else -1.0),
-                    best=(best if best > 0 else -1.0),
-                    count=count, total=len([u for u in NODE_TEST_URLS if u[2] == "abroad"]),
-                ))
-            except Exception as e:
-                log.warning(f"写健康度记录失败 {name}: {e}")
-            # 第一条“真正能代理境外”的线路 → 立即选中（用户不用等其他线路）
-            if usable and not winner_event.is_set():
-                with results_lock:
-                    if not winner_event.is_set():
-                        winner_event.set()
-                        winner_name[0] = name
-                        winner_data[0] = data
-                log.info(f"竞速抢答命中：{name} 率先可用，立即自动选路（其余线路继续作为参考）")
-                _apply_winner(name, data)
-                self.line_selected.emit(name)
-
-        # 并发启动所有线路的测速（线程池），各自独立内核实例 + 独立端口
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(prepared))
-        futures = [executor.submit(_on_line_done, name, data, port, proc)
-                   for (name, data, proc, port, line_dir) in prepared]
-        # 等待全部完成（或超时兜底）；胜者已在首个可用时即时应用。
-        try:
-            concurrent.futures.wait(futures, timeout=180)
-        except Exception:
-            pass
-        executor.shutdown(wait=False)
-
-        # 收尾：停掉所有测试实例（释放资源），主内核(若有)不受影响
-        for (name, data, proc, port, line_dir) in prepared:
-            stop_quick_proc(proc)
-
-        # 产出与 UI 约定一致的 results 列表（顺序同 lines）
-        out_results = []
-        for (name, data, proc, port, line_dir) in prepared:
-            r = results.get(name)
-            if r is None:
-                r = (name, -1.0, -1.0, 0, data, False)
-            out_results.append(r)
-        self.kwargs["results"] = out_results
-        self.kwargs["_instant_winner"] = winner_name[0]
-
-        if not winner_event.is_set():
-            # 全部不可用：回退原配置，不切换
-            log.warning("竞速检测：所有线路均不可用")
-            if original_config:
+            # 无论端口是否响应，都先停掉旧内核（避免僵尸进程抢占 7890 端口）
+            stop_quick()
+            # taskkill /f 异步生效，socket 释放有延迟；轮询等待 7890 真正空闲，
+            # 否则旧内核残留仍占 7890，新内核绑不上 → 整页“代理未就绪”。
+            _free_deadline = time.time() + 6
+            while time.time() < _free_deadline:
+                _s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                _s.settimeout(0.5)
                 try:
-                    save_config(quick_dir, original_config)
+                    _s.connect(("127.0.0.1", 7890))
+                    _busy = True  # 仍有进程在监听 7890
                 except Exception:
-                    pass
-            self.finished.emit(True, "检测完成：内置免费节点已全部失效，请到「上游管理」添加你的存活订阅")
-            return
+                    _busy = False  # 端口已空闲
+                finally:
+                    _s.close()
+                if not _busy:
+                    break
+                time.sleep(0.3)
+            time.sleep(0.5)
 
-        # 已即时选中胜者（内核已启用）；末尾仅做 finalize，避免重复重启
-        self.finished.emit(True, f"检测完成 (已自动切换至最快线路: {winner_name[0]})")
+            ok, reason = start_quick(quick_dir)
+            if not ok:
+                # 内核启动即致命退出（配置解析失败 / MMDB 缺失等），该线路不可用
+                log.warning(f"{name} 内核启动失败，跳过检测: {reason}")
+                results.append((name, -1.0, -1.0, 0, data, False))
+                self.line_tested.emit(name, -1.0, False)
+                try:
+                    get_health_db().append(name, HealthRecord(
+                        ts=datetime.now().isoformat(timespec="seconds"),
+                        success=False, avg=-1.0, best=-1.0,
+                        count=0, total=len(NODE_TEST_URLS),
+                    ))
+                except Exception as e:
+                    log.warning(f"写健康度记录失败 {name}: {e}")
+                continue
+
+            if not wait_for_proxy(timeout=25):
+                pid, owner = _port_owner_info(7890)
+                if pid and owner and owner.lower() != "quick.exe":
+                    log.warning(f"{name} 代理未就绪：端口 7890 被 {owner}(PID {pid}) 占用（非本内核），"
+                                f"请结束该进程或改用其它端口")
+                else:
+                    # 端口未被他人占用却绑不上 → 内核大概率卡死/崩溃。读取内核真实输出定位。
+                    _klog = _read_kernel_log(quick_dir)
+                    log.warning(f"{name} 代理未就绪，跳过延迟测试；内核最后输出: {_klog}")
+                results.append((name, -1.0, -1.0, 0, data, False))
+                self.line_tested.emit(name, -1.0, False)
+                # Batch 3: 代理未就绪也算失败
+                try:
+                    get_health_db().append(name, HealthRecord(
+                        ts=datetime.now().isoformat(timespec="seconds"),
+                        success=False, avg=-1.0, best=-1.0,
+                        count=0, total=len(NODE_TEST_URLS),
+                    ))
+                except Exception as e:
+                    log.warning(f"写健康度记录失败 {name}: {e}")
+                continue
+
+            latencies = []          # 所有可达站点（含境内，用于展示/健康度）
+            abroad_ok = False        # 至少有一个境外站点经代理成功（线路真正可用的硬条件）
+            abroad_latencies = []    # 仅境外站点延迟（用于选路比较）
+            for label, test_url, region in NODE_TEST_URLS:
+                # 单 URL 失败后重试 1 次：quick.exe 刚启动可能尚未完成首次握手/DNS 解析，
+                # 首包超时并不代表线路本身不可用，重试可显著降低误判
+                for attempt in range(2):
+                    try:
+                        proxy_handler = urllib.request.ProxyHandler({
+                            'http': f'http://{PROXY_URL}',
+                            'https': f'http://{PROXY_URL}',
+                        })
+                        opener = urllib.request.build_opener(proxy_handler)
+                        req = urllib.request.Request(test_url, headers={"User-Agent": "Mozilla/5.0"})
+                        start = time.time()
+                        resp = opener.open(req, timeout=NODE_TEST_TIMEOUT)
+                        elapsed = time.time() - start
+                        if resp.status in (200, 204):
+                            latencies.append(elapsed)
+                            if region == "abroad":
+                                abroad_ok = True
+                                abroad_latencies.append(elapsed)
+                            log.info(f"{name} 通过 {label} 测试成功, 延迟 {elapsed:.2f}s" +
+                                     (f" (重试第{attempt}次)" if attempt else "") +
+                                     (" [境内直连]" if region == "cn" else " [境外经代理]"))
+                            break
+                        else:
+                            log.warning(f"{name} {label} 测试返回非 200/204: {resp.status}")
+                    except Exception as e:
+                        log.warning(f"{name} {label} 测试失败 (第{attempt+1}次): {type(e).__name__}: {e}")
+
+            # 线路可用判定：必须至少有一个境外站点经代理成功（Baidu 等境内直连不算）
+            usable = abroad_ok
+            if latencies:
+                avg = sum(latencies) / len(latencies)
+                best = min(latencies)
+                # avg 仅用于展示；选路以 abroad_latencies 为准
+                results.append((name, avg, best, len(latencies), data, usable))
+                self.line_tested.emit(name, (min(abroad_latencies) if abroad_latencies else avg), usable)
+                # Batch 3: 写健康度记录
+                try:
+                    get_health_db().append(name, HealthRecord(
+                        ts=datetime.now().isoformat(timespec="seconds"),
+                        success=usable, avg=(min(abroad_latencies) if abroad_latencies else -1.0),
+                        best=(min(abroad_latencies) if abroad_latencies else -1.0),
+                        count=len(abroad_latencies), total=len([u for u in NODE_TEST_URLS if u[2] == "abroad"]),
+                    ))
+                except Exception as e:
+                    log.warning(f"写健康度记录失败 {name}: {e}")
+                if not usable:
+                    log.warning(f"{name} 仅境内可达（或境外经代理失败），不视为可用线路")
+            else:
+                results.append((name, -1.0, -1.0, 0, data, False))
+                self.line_tested.emit(name, -1.0, False)
+                # Batch 3: 失败也记录
+                try:
+                    get_health_db().append(name, HealthRecord(
+                        ts=datetime.now().isoformat(timespec="seconds"),
+                        success=False, avg=-1.0, best=-1.0,
+                        count=0, total=len([u for u in NODE_TEST_URLS if u[2] == "abroad"]),
+                    ))
+                except Exception as e:
+                    log.warning(f"写健康度记录失败 {name}: {e}")
+
+        # 检测完成后自动选路：仅从“真正可用”（境外经代理成功）的线路中选一条
+        fastest_name, fastest_data = None, None
+        if results:
+            successful = [(n, d) for n, avg, best, count, d, ok in results if ok]
+            if successful:
+                # 取第一条可用线路（免费节点延迟波动大，可用优先于最快）
+                fastest_name, fastest_data = successful[0]
+                log.info(f"自动选路: 选择可用线路 {fastest_name} (共 {len(successful)} 条可用)")
+
+        proxy_enabled = self.kwargs.get("proxy_enabled", False)
+        current_line = self.kwargs.get("current_line", "")
+        if proxy_enabled:
+            restore_data = original_config
+            if fastest_data:
+                restore_data = fastest_data
+                log.info(f"检测后自动选路: {fastest_name}")
+            elif current_line:
+                for n, d, _src in downloaded:
+                    if n == current_line:
+                        restore_data = d
+                        break
+            if restore_data:
+                save_config(quick_dir, restore_data)
+            if is_proxy_running():
+                stop_quick()
+                time.sleep(1)
+            start_quick(quick_dir)
+            wait_for_proxy(timeout=8)
+        else:
+            stop_quick()
+            if fastest_data:
+                save_config(quick_dir, fastest_data)
+                log.info(f"检测后自动选路（未启动代理）: {fastest_name}")
+            elif original_config:
+                save_config(quick_dir, original_config)
+
+        self.kwargs["results"] = results
+        # 检测完成后自动切换线路
+        if fastest_name:
+            self.line_selected.emit(fastest_name)
+            self.finished.emit(True, f"检测完成 (已自动切换至最快线路: {fastest_name})")
+        else:
+            self.finished.emit(True, "检测完成")
 
     def _do_auto_select(self):
         self.progress.emit("正在下载配置文件...")
@@ -5545,6 +5613,14 @@ class MainWindow(QMainWindow):
             "_bundled_build.txt",  # 本函数的版本标记，非内核文件
         }
 
+        # 只读内核数据文件：被杀软隔离/损坏后绝不能“存在即跳过”，必须每次强制覆盖，
+        # 否则陈旧损坏副本永驻 → 内核卡在加载 GEOIP/MMDB → “dev 能跑、EXE 跑不了”。
+        _force_overwrite = {
+            "geoip.metadb",
+            "Country.mmdb",
+            "GeoSite.dat",
+        }
+
         # 版本感知刷新标记：记录“上次还原来自哪个 EXE 构建版本”，构建版本变化则强制
         # 完整覆盖内核与数据文件，避免陈旧 runtime 永远不被新 EXE 覆盖——这正是“开发能跑、
         # EXE 跑不了、且换多个新 EXE 仍问题依旧”的根因（旧文件因“存在即跳过”永不更新）。
@@ -5587,7 +5663,22 @@ class MainWindow(QMainWindow):
                         continue
                     _src = os.path.join(_root, _fn)
                     _dst = os.path.join(_target_root, _fn)
-                    if (not os.path.exists(_dst)) or need_refresh:
+                    _need_copy = (not os.path.exists(_dst)) or need_refresh or (_fn in _force_overwrite)
+                    # 杀软隔离特征：部署文件明显小于内嵌源（如 quick.exe 被杀软替换为
+                    # 0 字节/损坏占位）→ 强制重新覆盖。否则“存在即跳过”会让损坏副本永驻，
+                    # 直接导致内核进程起不来（表现为“代理内核未启动”），这是 dev 能跑、
+                    # EXE 跑不了的另一真凶（geoip 修复只管“起了不绑 7890”，不管“起不来”）。
+                    if (not _need_copy) and os.path.isfile(_dst):
+                        try:
+                            _dst_sz = os.path.getsize(_dst)
+                            _src_sz = os.path.getsize(_src)
+                            if _src_sz > 0 and _dst_sz < _src_sz * 0.9:
+                                _need_copy = True
+                                log.warning(f"部署文件 {_fn} 体积异常偏小({_dst_sz}B < 源 {_src_sz}B，"
+                                            f"疑似被杀软隔离)，强制重新还原")
+                        except Exception:
+                            pass
+                    if _need_copy:
                         try:
                             shutil.copy2(_src, _dst)
                         except OSError as _e:

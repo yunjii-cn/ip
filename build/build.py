@@ -409,7 +409,8 @@ def build():
             return False
 
         src_exe = os.path.join(pyinstaller_dist_dir, f"{exe_name}.exe")
-        dist_dir = os.path.join(DEV_DIR, "dist")
+        # 构建产物统一输出到项目根 dist/（2026-08-16 起约定，见 MEMORY/架构说明）
+        dist_dir = os.path.join(PROJECT_ROOT, "dist")
         os.makedirs(dist_dir, exist_ok=True)
         dist_exe = os.path.join(dist_dir, f"{exe_name}.exe")
 
@@ -498,7 +499,7 @@ def build():
         print(f"版本号: {version}")
         print(f"构建记录: {version_build_dir}")
         print(f"\n提示: 双击 dev/{_CFG['brand_name']}.exe 测试")
-        print(f"提示: 确认稳定后，手动将EXE从 dev/{_CFG['paths']['dist']}/ 移入 dev/{_CFG['paths']['ver']}/ 目录")
+        print(f"提示: 确认稳定后，手动将EXE从 dist/（项目根） 移入 dev/{_CFG['paths']['ver']}/ 目录")
         print(f"提示: 运行 release.py 可全自动发布到 GitHub + Gitee")
 
         return True
