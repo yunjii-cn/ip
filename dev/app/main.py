@@ -2143,7 +2143,33 @@ def _diagnose(msg):
         pass
 
 
+def _controller_healthy(host="127.0.0.1", port=9090, timeout=0.6):
+    """mihomo external-controller 健康检查（内核原生，最可靠的运行判定）。
+
+    内核启动后必绑 127.0.0.1:9090（配置已由 save_config 强制注入）。
+    即便 mixed-port(7890) 的 socket 在 EXE 环境下被防火墙/沙箱拦截，
+    控制器端口通常同样可探测；任一 HTTP 响应（含 401 带 secret）都代表内核在跑。
+    绕过系统/环境变量代理，直连本地，避免 urllib 把请求转给自身代理而自环失败。
+    """
+    try:
+        import urllib.request
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        req = urllib.request.Request(f"http://{host}:{port}/version")
+        try:
+            with opener.open(req, timeout=timeout) as _:
+                return True
+        except urllib.error.HTTPError:
+            return True  # 控制器回了 401(带 secret) 也说明端口在监听 -> 内核在跑
+    except Exception:
+        return False
+    return False
+
+
 def is_proxy_running():
+    # 三层探测，逐级兜底，专门解决“EXE 环境下 Python 本地 socket 连不上已绑端口”
+    # 导致的误报“代理未运行”（dev 的 python.exe 被防火墙放行、EXE 未放行所致）。
+
+    # Tier 1：直接 socket 探测（开发机/正常环境秒回）
     # 依次尝试配置主机与 127.0.0.1（IPv4 兜底）：当 proxy_host 为 "localhost" 时，
     # getaddrinfo 可能优先返回 ::1(IPv6)，而 mihomo 仅绑定 IPv4 的 127.0.0.1，
     # 仅连 ::1 会误报“代理未就绪”。强制补试 127.0.0.1 规避该 IPv4/IPv6 错配。
@@ -2160,6 +2186,19 @@ def is_proxy_running():
                 return True
         except Exception:
             pass
+
+    # Tier 2：mihomo external-controller 健康检查（内核原生，最可靠）
+    if _controller_healthy():
+        return True
+
+    # Tier 3：EXE 环境下 Python 本地 socket 可能被 Windows 防火墙/沙箱拦截，
+    # 用 netstat 直接问操作系统端口是否真的在 LISTEN（完全绕过 Python 连接能力）。
+    # 若 7890 确实被某进程监听，则内核确实已绑端口 -> 视为运行中。
+    try:
+        if _port_owner_info(PROXY_PORT)[0]:
+            return True
+    except Exception:
+        pass
     return False
 
 
