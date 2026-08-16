@@ -3630,18 +3630,36 @@ def _port_owner_info(port=7890):
     return None, ""
 
 
-def _read_kernel_log(quick_dir, n=1000):
-    """读取内核上次运行的输出（quick_out.log）尾部，用于“代理未就绪”时定位真凶。
+def _read_kernel_log(quick_dir, n=3000):
+    """读取内核上次运行的输出（quick_out.log），用于"代理未就绪"时定位真凶。
 
     内核由 _launch_quick 以行缓冲落盘到此文件：卡死（如联网下载被墙的 GEOIP/MMDB）、
     配置致命解析、端口冲突等真实报错都在里面。wait_for_proxy 超时但端口未被他人占用时，
-    读取它能把模糊的“代理未就绪”变成可定位的具体原因。
+    读取它能把模糊的"代理未就绪"变成可定位的具体原因。
+
+    2026-08-17: 截取量从 1000 增到 3000。此前 1000 字符正好被 10 行
+    'Start initial compatible provider'（端口绑定后的正常日志）占满，把前面的
+    'Initial configuration complete' / 'listening at' / bind error 截掉了，
+    导致误判"卡在 provider 初始化"。同时提取关键行单独标注，一眼看出根因。
     """
     try:
         p = os.path.join(quick_dir, "quick_out.log")
         if os.path.isfile(p):
             with open(p, "r", encoding="utf-8", errors="ignore") as _f:
-                return _f.read()[-n:]
+                full = _f.read()
+            # 提取关键诊断行（不论在文件何处），避免被尾部截取漏掉
+            key_lines = []
+            for kw in ["Initial configuration complete", "listening at",
+                       "address already in use", "Only one usage", "bind:",
+                       "level=fatal", "level=error", "can't download",
+                       "Geodata Loader", "Start initial configuration"]:
+                for line in full.split("\n"):
+                    if kw in line and line not in key_lines:
+                        key_lines.append(line)
+            tail = full[-n:]
+            if key_lines:
+                return "[关键诊断行] " + " | ".join(key_lines) + "\n\n[尾部日志] " + tail
+            return tail
     except Exception:
         pass
     return ""
