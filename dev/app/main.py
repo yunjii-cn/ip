@@ -4930,13 +4930,38 @@ class ServiceWorker(QThread):
 
             if not wait_for_proxy(timeout=25):
                 pid, owner = _port_owner_info(7890)
+                # 关键诊断：进程是否还活着？connect_ex 返回什么？
+                # 内核日志显示 listening at 7890 但 is_proxy_running 返回 False，
+                # 只有两种可能：① 进程被外部杀掉（Defender?）② socket 连不上
+                _alive = False
+                _quick_count = 0
+                _ce = -999
+                try:
+                    _tl = subprocess.run(
+                        ["tasklist", "/fi", "imagename eq quick.exe", "/fo", "csv"],
+                        capture_output=True, text=True, timeout=5,
+                        creationflags=subprocess.CREATE_NO_WINDOW)
+                    _quick_count = max(0, (_tl.stdout or "").count("quick.exe") - 1)
+                    _alive = _quick_count > 0
+                except Exception:
+                    pass
+                try:
+                    _ds = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    _ds.settimeout(1)
+                    _ce = _ds.connect_ex(("127.0.0.1", 7890))
+                    _ds.close()
+                except Exception as _de:
+                    _ce = f"异常:{_de}"
                 if pid and owner and owner.lower() != "quick.exe":
                     log.warning(f"{name} 代理未就绪：端口 7890 被 {owner}(PID {pid}) 占用（非本内核），"
                                 f"请结束该进程或改用其它端口")
                 else:
                     # 端口未被他人占用却绑不上 → 内核大概率卡死/崩溃。读取内核真实输出定位。
                     _klog = _read_kernel_log(quick_dir)
-                    log.warning(f"{name} 代理未就绪，跳过延迟测试；内核最后输出: {_klog}")
+                    log.warning(f"{name} 代理未就绪，跳过延迟测试；"
+                                f"[诊断] 进程存活={_alive}(quick.exe数={_quick_count}), "
+                                f"connect_ex={_ce}, 端口占用者={owner or '无'}; "
+                                f"内核最后输出: {_klog}")
                 results.append((name, -1.0, -1.0, 0, data, False))
                 self.line_tested.emit(name, -1.0, False)
                 # Batch 3: 代理未就绪也算失败
