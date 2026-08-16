@@ -3075,6 +3075,111 @@ def _filter_advanced_sections(advanced_text, present_keys):
     return "\n".join(kept).strip("\n")
 
 
+def _localize_external_providers(quick_dir, text):
+    """将订阅配置里的外部 proxy-providers / rule-providers（type: http + url:）
+    下载到本地 Quick/providers/ 并改写为 type: file + path:，使 mihomo 启动期
+    不再阻塞下载被墙/慢的外链。
+
+    背景（EXE 部署目录内核卡在 "Start initial compatible provider" 的根因）：
+    EXE 全新释放的目录没有 provider 缓存，mihomo 启动会联网下载订阅里指向
+    github 等的外链 provider，国内网络下常卡死、永远到不了
+    "Initial configuration complete" → 7890 不绑 → 界面"未启动"。
+    dev 因运行环境能下成功而表现正常，造成"dev 通 EXE 不通"的假象。
+    本函数复用应用自带的多级回退下载器（download_config）提前把 provider
+    拽到本地，从根上消除内核启动期的外链下载。
+
+    文本级改写，保留整体结构与后续 YUNJI 注入所需的标记；下载失败则保留
+    原样（降级，不阻断启动流程）。返回 str（调用方负责重新编码为 bytes）。
+    """
+    import re as _re
+    if isinstance(text, (bytes, bytearray)):
+        try:
+            text = text.decode("utf-8", errors="ignore")
+        except Exception:
+            return text
+    providers_dir = os.path.join(quick_dir, "providers")
+    # 逐条匹配 provider 条目（必须有缩进，即 proxy-providers/rule-providers 的子项；
+    # 排除顶层段头 proxy-providers: 本身，否则会把整段误当成一个 provider）
+    entry_re = _re.compile(r'^([ \t]+)([\w\-]+):[ \t]*\n((?:[ \t]+[^\n]*\n)*)', _re.MULTILINE)
+
+    def repl(m):
+        indent = m.group(1)
+        name = m.group(2)
+        body = m.group(3)
+        if 'type: http' not in body:
+            return m.group(0)
+        um = _re.search(r'^[ \t]*url:[ \t]*(\S+)\s*$', body, _re.MULTILINE)
+        if not um:
+            return m.group(0)
+        url = um.group(1)
+        # 已是本地文件则跳过
+        if url.startswith(('file://', '/', './', '../')):
+            return m.group(0)
+        local_name = _re.sub(r'[^A-Za-z0-9_.-]', '_', name)
+        rel = "providers/" + local_name + ".yaml"
+        local_abs = os.path.join(quick_dir, rel)
+        # 已本地化过则直接复用，避免每次 save_config 重复下载
+        if os.path.isfile(local_abs) and os.path.getsize(local_abs) > 0:
+            new_body = _rewrite_body(body, rel)
+            log.info(f"复用已本地化 provider {name} -> {rel}")
+            return indent + name + ":\n" + new_body
+        try:
+            os.makedirs(providers_dir, exist_ok=True)
+            content = download_config(url, timeout=30)
+            if not content:
+                log.warning(f"本地化 provider 失败（下载为空，保留外链）{name}: {url}")
+                return m.group(0)
+            data = content if isinstance(content, (bytes, bytearray)) else content.encode("utf-8")
+            with open(local_abs, "wb") as f:
+                f.write(data)
+            new_body = _rewrite_body(body, rel)
+            log.info(f"已本地化外部 provider {name} -> {rel}")
+            return indent + name + ":\n" + new_body
+        except Exception as e:
+            log.warning(f"本地化 provider 失败（保留外链）{name}: {e}")
+            return m.group(0)
+
+    def _rewrite_body(body, rel):
+        """逐行缩进感知重写：type: http->file, url->path, 删 interval,
+        删 health-check 及其更深的子块；保留 behavior: 等其它字段。"""
+        out = []
+        skip_depth = None
+        for ln in body.split("\n"):
+            st = ln.lstrip()
+            cur_ind = len(ln) - len(st)
+            if skip_depth is not None:
+                if cur_ind > skip_depth:
+                    continue
+                skip_depth = None
+            if ln == "":
+                out.append(ln)
+                continue
+            if st.startswith("type:") and "http" in st:
+                prefix = ln[:cur_ind]
+                out.append(prefix + "type: file")
+                continue
+            if st.startswith("url:"):
+                prefix = ln[:cur_ind]
+                out.append(prefix + "path: " + rel)
+                continue
+            if st.startswith("interval:"):
+                continue
+            if st.startswith("health-check:"):
+                skip_depth = cur_ind
+                continue
+            out.append(ln)
+        result = "\n".join(out)
+        if not result.endswith("\n"):
+            result += "\n"
+        return result
+
+    try:
+        return entry_re.sub(repl, text)
+    except Exception as e:
+        log.warning(f"本地化外部 provider 异常（原样）: {e}")
+        return text
+
+
 def save_config(quick_dir, config_data, mixed_port=None, socks_port=None, controller=None,
                 yunji_src=None, inject_advanced=True):
     """写入配置。
@@ -3177,6 +3282,13 @@ def save_config(quick_dir, config_data, mixed_port=None, socks_port=None, contro
             log.info(f"配置预处理: {it}")
     except Exception as e:
         log.warning(f"配置预处理失败（原样写入）: {e}")
+    # 本地化外部 provider（消除内核启动期外链下载卡死；EXE 部署根因修复）
+    try:
+        config_data = _localize_external_providers(quick_dir, config_data)
+        if isinstance(config_data, str):
+            config_data = config_data.encode("utf-8")
+    except Exception as e:
+        log.warning(f"本地化外部 provider 跳过: {e}")
     # 写入新配置
     with open(config_path, 'wb') as f:
         f.write(config_data)
