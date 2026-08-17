@@ -8697,33 +8697,21 @@ class MainWindow(QMainWindow):
         self.worker.line_selected.connect(self._on_line_selected)
         self.worker.progress.connect(lambda t: self.line_progress.setText(t))
         self.worker.finished.connect(self._on_start_finished)
+        # 启动时先将系统代理清零，确保检测期间（内核逐条重启）整机不被路由到未验证线路
+        set_system_proxy(False)
+        self._update_sys_proxy_label()
         self.worker.start()
 
     def _on_start_finished(self, ok, msg):
         self.switch_proxy.setEnabled(True)
         if ok:
-            self.line_progress.setText(msg)
-            # 系统代理、监控等立即执行（不阻塞 UI）
-            if self._needs_system_proxy():
-                set_system_proxy(True)
-                self._update_sys_proxy_label()
-            self.global_restart_hint.setVisible(False)
-            self.custom_restart_hint.setVisible(False)
-            if self.settings.get("realtime_reconnect", False):
-                self._start_realtime_monitor()
-            if self.settings.get("auto_line_switch", False):
-                self._start_auto_line_timer()
+            self.line_progress.setText("代理内核已启动，正在自动检测并选择可用线路...")
             self._update_active_line()
-            # 延迟验证异步执行，避免卡 UI（节点不通时会等 5 秒）
-            import threading
-            def _verify():
-                try:
-                    connected, latency = verify_proxy_connection(timeout=5)
-                    if connected and latency:
-                        QTimer.singleShot(0, lambda: self.svc_latency_label.setText(f"延迟: {latency:.2f}s"))
-                except Exception as e:
-                    log.warning(f"验证代理连接异常: {e}")
-            threading.Thread(target=_verify, daemon=True).start()
+            # 关键修复：启动后【不立即】开启系统代理，避免把整机路由到未验证的死线路 → 断网。
+            # 改为：先自动检测线路，仅在确认存在“可用线路（境外经代理成功）”后，
+            # 才在 _on_test_finished 中开启系统代理（_start_pending_proxy 标记）。
+            self._start_pending_proxy = True
+            self._start_line_test(proxy_enabled_override=True)
         else:
             self.line_progress.setText(msg)
             self._update_active_line()
@@ -9830,15 +9818,17 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self._on_config_updated_then_test)
         self.worker.start()
 
-    def _start_line_test(self):
+    def _start_line_test(self, proxy_enabled_override=None):
         self.btn_test.setEnabled(True)
         self.btn_test.setText("⏹ 取消")
         for name, info in self.line_rows.items():
             info["status"].setText("检测中...")
             info["status"].setStyleSheet(f"color: {COLOR_ORANGE}; font-size: 9pt;")
             info["use_btn"].setEnabled(False)
+        _pe = proxy_enabled_override if proxy_enabled_override is not None \
+            else self.settings.get("proxy_enabled", False)
         self.worker = ServiceWorker("test_lines", quick_dir=self.quick_dir,
-                                    proxy_enabled=self.settings.get("proxy_enabled", False),
+                                    proxy_enabled=_pe,
                                     current_line=self.current_line)
         self.worker.progress.connect(lambda t: self.line_progress.setText(t))
         self.worker.line_tested.connect(self._on_line_tested)
@@ -9893,6 +9883,10 @@ class MainWindow(QMainWindow):
             if not ok:
                 self.line_progress.setText(msg if msg else "检测失败")
                 self.line_progress.setStyleSheet("font-size: 8pt; color: #FF6B80;")
+                if getattr(self, "_start_pending_proxy", False):
+                    self._start_pending_proxy = False
+                    set_system_proxy(False)
+                    self._update_sys_proxy_label()
                 return
 
             # 检测完成后，重新注入所有 Yunji 规则（配置可能已被新数据覆盖）
@@ -9959,6 +9953,27 @@ class MainWindow(QMainWindow):
                 self.worker.progress.connect(lambda t: self.line_progress.setText(t))
                 self.worker.finished.connect(self._on_retry_test_after_update)
                 self.worker.start()
+            # 启动即自动选路：检测完成后，仅在存在“可用线路”时才开启系统代理，
+            # 否则保持系统代理关闭，避免把整机路由到死线路导致断网。
+            if getattr(self, "_start_pending_proxy", False):
+                self._start_pending_proxy = False
+                _any_usable = any(r[5] for r in results)
+                if self._needs_system_proxy():
+                    if _any_usable:
+                        set_system_proxy(True)
+                        self._update_sys_proxy_label()
+                        log.info("启动自动选路：已确认可用线路，开启系统代理")
+                    else:
+                        set_system_proxy(False)
+                        self._update_sys_proxy_label()
+                        self.line_progress.setText("无可用线路：系统代理保持关闭，本地网络不受影响")
+                        self.line_progress.setStyleSheet("font-size: 8pt; color: #FF6B80;")
+                        log.warning("启动自动选路：所有线路不可用，系统代理保持关闭")
+                # 内核已稳定，启动实时重连 / 自动切换线路监控
+                if self.settings.get("realtime_reconnect", False):
+                    self._start_realtime_monitor()
+                if self.settings.get("auto_line_switch", False):
+                    self._start_auto_line_timer()
         except Exception as e:
             import traceback
             log.error(f"检测结果显示异常: {e}\n{traceback.format_exc()}")
