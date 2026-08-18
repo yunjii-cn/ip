@@ -1,6 +1,21 @@
 {
-    "latest": "2026.06.20.0115",
+    "latest": "2026.08.18.0929",
     "versions": [
+        {
+            "version": "2026.08.18.0929",
+            "date": "2026-08-18",
+            "filename": "云集智能网联代理专家-v2026.08.18.0929.exe",
+            "size_mb": 81.0,
+            "changes": [
+                "【里程碑】彻底闭环\"线路检测全红\"根因：Windows 系统自带防火墙(Defender)拦截 quick.exe 出站，关闭防火墙即全通（非代码 bug / 非节点死 / 非第三方杀软）",
+                "修复 EXE 误报\"代理未运行\"：is_proxy_running 改为 socket / 9090 控制器 / netstat 三层兜底检测",
+                "修复退出 EXE 后系统代理设置残留异常：_quit_app + atexit 均补 set_system_proxy(False)",
+                "启动即自动选路：启动后先检测线路，仅确认可用线路后才开系统代理（不再检测前破坏本地网络）",
+                "线路检测仅以真正出境外(abroad_ok)判定可用线路，杜绝误切死线路",
+                "新增内核级线路诊断（9090 控制器 + netstat），全红时写 线路检测诊断_*.log 区分 loopback 被拦/节点死/内核出站被系统防火墙拦",
+                "修复线路检测崩溃：Python3.12 变量作用域陷阱(cannot access local variable 'e') + 临时目录 D:\\Temp 拒写（重定向到 app/temp）"
+            ]
+        },
         {
             "version": "2026.06.20.0115",
             "date": "2026-06-20",
