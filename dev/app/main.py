@@ -2202,6 +2202,153 @@ def is_proxy_running():
     return False
 
 
+def _write_diagnostic_file(quick_dir, report_lines):
+    """把线路检测诊断报告写入 get_app_dir()/temp/log/，供用户直接打开粘贴。"""
+    try:
+        d = os.path.join(get_app_dir(), "temp", "log")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, f"线路检测诊断_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        with open(p, 'w', encoding='utf-8') as f:
+            f.write("\n".join(report_lines) + "\n")
+        log.warning(f"线路检测诊断已写入: {p}")
+    except Exception as e:
+        log.error(f"写诊断文件失败: {e}")
+
+
+def _diagnose_line_failure(quick_dir, line_errors):
+    """线路全不通时，通过内核 external-controller(9090) 获取内核自身视角的拨号结果，
+    区分『防火墙/安全软件拦了内核出站』与『节点本身已死』。"""
+    from urllib.parse import quote
+    report = []
+    report.append("=" * 64)
+    report.append(f"线路检测诊断  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    report.append("=" * 64)
+
+    # 1) app 侧 urllib 异常汇总（经 127.0.0.1:7890 发请求时内核返回/连接错误）
+    report.append("")
+    report.append("【app 侧 urllib 异常（测试请求经 127.0.0.1:7890 时的错误）】")
+    if line_errors:
+        for name, label, etype, emsg in line_errors:
+            report.append(f"  - {name} / {label}: {etype}: {emsg}")
+    else:
+        report.append("  （无记录，可能连接阶段即失败）")
+
+    # 2) 内核侧：用 9090 控制器直接测拨号（内核自身视角，绕过 app 的 socket 能力）
+    report.append("")
+    report.append("【内核侧 external-controller(9090) 拨号测试】")
+    # netstat 探测：确认内核是否真的在监听（绕过 app 自身的 socket 能力）
+    _9090_listen = False
+    _7890_listen = False
+    try:
+        _9090_listen = bool(_port_owner_info(9090)[0])
+        _7890_listen = bool(_port_owner_info(7890)[0])
+    except Exception:
+        pass
+    report.append(f"  netstat: 9090 监听={_9090_listen}, 7890 监听={_7890_listen}")
+    if not is_proxy_running():
+        stop_quick()
+        time.sleep(1)
+        ok, reason = start_quick(quick_dir)
+        if not ok:
+            report.append(f"  内核启动失败，无法做内核侧测试: {reason}")
+            _write_diagnostic_file(quick_dir, report)
+            return
+        wait_for_proxy(timeout=10)
+
+    # 读 secret 与首个代理名
+    cfg = os.path.join(quick_dir, "config.yaml")
+    secret = ""
+    proxy_name = ""
+    try:
+        with open(cfg, 'r', encoding='utf-8') as f:
+            for ln in f:
+                s = ln.strip()
+                if s.startswith("secret:") and not secret:
+                    secret = s.split(":", 1)[1].strip().strip('"').strip("'")
+                elif s.startswith("- name:") and not proxy_name:
+                    proxy_name = s.split(":", 1)[1].strip().strip('"').strip("'")
+    except Exception as e:
+        report.append(f"  读取 config.yaml 失败: {e}")
+
+    def _query_delay(name):
+        try:
+            name_enc = quote(name, safe="")
+            url = (f"http://127.0.0.1:9090/proxies/{name_enc}/delay"
+                   f"?url=https://www.gstatic.com/generate_204&timeout=8000")
+            req = urllib.request.Request(url)
+            if secret:
+                req.add_header("Authorization", f"Bearer {secret}")
+            try:
+                resp = urllib.request.urlopen(req, timeout=12)
+                d = json.loads(resp.read().decode('utf-8'))
+                return True, f"delay={d.get('delay')}ms"
+            except urllib.error.HTTPError as e:
+                return False, f"HTTP {e.code}: {e.read().decode('utf-8', 'ignore')[:200]}"
+            except urllib.error.URLError as e:
+                # 9090 明明在监听(app netstat 确认)，但本进程 socket 连不上 -> loopback 被拦
+                if _9090_listen and "refused" in str(getattr(e, 'reason', e)).lower():
+                    return False, "连接被拒但 netstat 确认 9090 在监听 -> 本进程 loopback socket 被拦(非节点问题)"
+                return False, f"URLError: {e}"
+            except Exception as e:
+                return False, f"{type(e).__name__}: {e}"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    if proxy_name:
+        ok_p, detail_p = _query_delay(proxy_name)
+        report.append(f"  经代理节点 [{proxy_name}]: {'成功' if ok_p else '失败'} -> {detail_p}")
+    else:
+        report.append("  （未找到代理节点名，跳过代理拨号测试）")
+    ok_d, detail_d = _query_delay("DIRECT")
+    report.append(f"  直连 DIRECT: {'成功' if ok_d else '失败'} -> {detail_d}")
+
+    # 额外：测试默认配置(config.default.yaml)里的节点（通常是可用的 mieru），
+    # 若它成功而订阅节点失败 -> 说明应改用默认节点。
+    default_cfg = os.path.join(quick_dir, "config.default.yaml")
+    default_proxy = ""
+    try:
+        with open(default_cfg, 'r', encoding='utf-8') as f:
+            for ln in f:
+                s = ln.strip()
+                if s.startswith("- name:") and not default_proxy:
+                    default_proxy = s.split(":", 1)[1].strip().strip('"').strip("'")
+                    break
+    except Exception:
+        pass
+    if default_proxy and default_proxy != proxy_name:
+        ok_def, detail_def = _query_delay(default_proxy)
+        report.append(f"  默认配置节点 [{default_proxy}]: {'成功' if ok_def else '失败'} -> {detail_def}")
+    else:
+        detail_def = ""
+
+    # 3) 结论推断
+    report.append("")
+    report.append("【结论推断】")
+    _loopback_blocked = ("loopback socket 被拦" in detail_p or
+                         "loopback socket 被拦" in detail_d or
+                         "loopback socket 被拦" in detail_def)
+    if _loopback_blocked:
+        report.append("  ⚠️ netstat 确认内核在监听 9090/7890，但本进程(app)的 Python socket 连不上本地回环")
+        report.append("     -> 防火墙/安全软件按【app 进程路径】拦截了 loopback（非节点问题）。")
+        report.append("     请将以下 exe 加入白名单/允许出入站（含本机回环）：")
+        report.append(f"    {os.path.join(get_app_dir(), ENTRY_EXE_NAME)}")
+        report.append(f"    {os.path.join(quick_dir, 'quick.exe')}")
+    elif ok_d and not ok_p:
+        report.append("  DIRECT 直连成功、但经代理节点失败 -> 内核出站未被拦（防火墙放行），")
+        report.append("  问题在【节点本身不可用/被墙】。请更换节点或订阅源。")
+    elif not ok_d and not ok_p:
+        report.append("  DIRECT 与经代理均失败 -> 内核【出站被防火墙/安全软件拦截】")
+        report.append("  （Windows Defender / 360 / 火绒 / 电脑管家按路径拦截了 quick.exe 出站）。")
+        report.append("  请将以下两个 exe 加入对应软件的白名单/允许出入站：")
+        report.append(f"    {os.path.join(quick_dir, 'quick.exe')}")
+        report.append(f"    {os.path.join(get_app_dir(), ENTRY_EXE_NAME)}")
+    elif ok_p:
+        report.append("  经代理节点成功 -> 内核与节点均正常，问题在 app 侧（请贴此文件进一步排查）。")
+    else:
+        report.append("  无法判定，请贴此文件。")
+    _write_diagnostic_file(quick_dir, report)
+
+
 def wait_for_proxy(timeout=15):
     start = time.time()
     while time.time() - start < timeout:
@@ -4925,6 +5072,7 @@ class ServiceWorker(QThread):
                 original_config = f.read()
 
         results = []
+        line_errors = []  # 收集每条线路的 urllib 异常，供内核级诊断使用
         total = len(downloaded)
 
         for i, (name, data, _src) in enumerate(downloaded):
@@ -5044,6 +5192,7 @@ class ServiceWorker(QThread):
                             log.warning(f"{name} {label} 测试返回非 200/204: {resp.status}")
                     except Exception as e:
                         log.warning(f"{name} {label} 测试失败 (第{attempt+1}次): {type(e).__name__}: {e}")
+                    line_errors.append((name, f"{label}({region})", type(e).__name__, str(e)))
 
             # 线路可用判定：必须至少有一个境外站点经代理成功（Baidu 等境内直连不算）
             usable = abroad_ok
@@ -5078,7 +5227,14 @@ class ServiceWorker(QThread):
                 except Exception as e:
                     log.warning(f"写健康度记录失败 {name}: {e}")
 
-        # 检测完成后自动选路：仅从“真正可用”（境外经代理成功）的线路中选一条
+        # 所有线路均不可用 -> 自动运行内核级诊断（区分防火墙拦出站 vs 节点已死）
+        if not any(ok for _, _, _, _, _, ok in results):
+            try:
+                _diagnose_line_failure(quick_dir, line_errors)
+            except Exception as _de:
+                log.warning(f"内核级诊断异常: {_de}")
+
+        # 检测完成后自动选路：仅从"真正可用"（境外经代理成功）的线路中选一条
         fastest_name, fastest_data = None, None
         if results:
             successful = [(n, d) for n, avg, best, count, d, ok in results if ok]
