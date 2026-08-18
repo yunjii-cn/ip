@@ -2211,8 +2211,8 @@ def _write_diagnostic_file(quick_dir, report_lines):
         with open(p, 'w', encoding='utf-8') as f:
             f.write("\n".join(report_lines) + "\n")
         log.warning(f"线路检测诊断已写入: {p}")
-    except Exception as e:
-        log.error(f"写诊断文件失败: {e}")
+    except Exception as _err:
+        log.error(f"写诊断文件失败: {_err}")
 
 
 def _diagnose_line_failure(quick_dir, line_errors):
@@ -2267,8 +2267,8 @@ def _diagnose_line_failure(quick_dir, line_errors):
                     secret = s.split(":", 1)[1].strip().strip('"').strip("'")
                 elif s.startswith("- name:") and not proxy_name:
                     proxy_name = s.split(":", 1)[1].strip().strip('"').strip("'")
-    except Exception as e:
-        report.append(f"  读取 config.yaml 失败: {e}")
+    except Exception as _err:
+        report.append(f"  读取 config.yaml 失败: {_err}")
 
     def _query_delay(name):
         try:
@@ -2282,17 +2282,17 @@ def _diagnose_line_failure(quick_dir, line_errors):
                 resp = urllib.request.urlopen(req, timeout=12)
                 d = json.loads(resp.read().decode('utf-8'))
                 return True, f"delay={d.get('delay')}ms"
-            except urllib.error.HTTPError as e:
-                return False, f"HTTP {e.code}: {e.read().decode('utf-8', 'ignore')[:200]}"
-            except urllib.error.URLError as e:
+            except urllib.error.HTTPError as _err:
+                return False, f"HTTP {_err.code}: {_err.read().decode('utf-8', 'ignore')[:200]}"
+            except urllib.error.URLError as _err:
                 # 9090 明明在监听(app netstat 确认)，但本进程 socket 连不上 -> loopback 被拦
-                if _9090_listen and "refused" in str(getattr(e, 'reason', e)).lower():
+                if _9090_listen and "refused" in str(getattr(_err, 'reason', _err)).lower():
                     return False, "连接被拒但 netstat 确认 9090 在监听 -> 本进程 loopback socket 被拦(非节点问题)"
-                return False, f"URLError: {e}"
-            except Exception as e:
-                return False, f"{type(e).__name__}: {e}"
-        except Exception as e:
-            return False, f"{type(e).__name__}: {e}"
+                return False, f"URLError: {_err}"
+            except Exception as _err:
+                return False, f"{type(_err).__name__}: {_err}"
+        except Exception as _err:
+            return False, f"{type(_err).__name__}: {_err}"
 
     if proxy_name:
         ok_p, detail_p = _query_delay(proxy_name)
@@ -3890,7 +3890,7 @@ def _select_first_valid_config(downloaded, preferred, quick_dir):
                 fh.write(data)
             # 用空闲端口探测，隔离 7890 占用造成的误判
             fp = _pick_free_port(18000)
-            _ensure_proxy_port(sub, port=fp, socks_port=fp + 1,
+            _ensure_proxy_port(cfg, port=fp, socks_port=fp + 1,
                                controller=f"127.0.0.1:{fp + 2}")
             if _is_config_yaml_valid(sub):
                 valid.append((name, data))
@@ -5111,8 +5111,8 @@ class ServiceWorker(QThread):
                         success=False, avg=-1.0, best=-1.0,
                         count=0, total=len(NODE_TEST_URLS),
                     ))
-                except Exception as e:
-                    log.warning(f"写健康度记录失败 {name}: {e}")
+                except Exception as _err:
+                    log.warning(f"写健康度记录失败 {name}: {_err}")
                 continue
 
             if not wait_for_proxy(timeout=25):
@@ -5158,8 +5158,8 @@ class ServiceWorker(QThread):
                         success=False, avg=-1.0, best=-1.0,
                         count=0, total=len(NODE_TEST_URLS),
                     ))
-                except Exception as e:
-                    log.warning(f"写健康度记录失败 {name}: {e}")
+                except Exception as _err:
+                    log.warning(f"写健康度记录失败 {name}: {_err}")
                 continue
 
             latencies = []          # 所有可达站点（含境内，用于展示/健康度）
@@ -5190,9 +5190,11 @@ class ServiceWorker(QThread):
                             break
                         else:
                             log.warning(f"{name} {label} 测试返回非 200/204: {resp.status}")
-                    except Exception as e:
-                        log.warning(f"{name} {label} 测试失败 (第{attempt+1}次): {type(e).__name__}: {e}")
-                    line_errors.append((name, f"{label}({region})", type(e).__name__, str(e)))
+                    except Exception as _err:
+                        _et = type(_err).__name__
+                        _em = str(_err)
+                        log.warning(f"{name} {label} 测试失败 (第{attempt+1}次): {_et}: {_em}")
+                        line_errors.append((name, f"{label}({region})", _et, _em))
 
             # 线路可用判定：必须至少有一个境外站点经代理成功（Baidu 等境内直连不算）
             usable = abroad_ok
@@ -5210,8 +5212,8 @@ class ServiceWorker(QThread):
                         best=(min(abroad_latencies) if abroad_latencies else -1.0),
                         count=len(abroad_latencies), total=len([u for u in NODE_TEST_URLS if u[2] == "abroad"]),
                     ))
-                except Exception as e:
-                    log.warning(f"写健康度记录失败 {name}: {e}")
+                except Exception as _err:
+                    log.warning(f"写健康度记录失败 {name}: {_err}")
                 if not usable:
                     log.warning(f"{name} 仅境内可达（或境外经代理失败），不视为可用线路")
             else:
@@ -5224,8 +5226,8 @@ class ServiceWorker(QThread):
                         success=False, avg=-1.0, best=-1.0,
                         count=0, total=len([u for u in NODE_TEST_URLS if u[2] == "abroad"]),
                     ))
-                except Exception as e:
-                    log.warning(f"写健康度记录失败 {name}: {e}")
+                except Exception as _err:
+                    log.warning(f"写健康度记录失败 {name}: {_err}")
 
         # 所有线路均不可用 -> 自动运行内核级诊断（区分防火墙拦出站 vs 节点已死）
         if not any(ok for _, _, _, _, _, ok in results):
@@ -13336,6 +13338,25 @@ def main():
             del os.environ[_k]
         except KeyError:
             pass
+
+    # 重定向临时目录到应用私有、可写的 app/temp，避免系统 TMP(如用户机器的 D:\\Temp)
+    # 不可写导致 tempfile.mkdtemp 失败（如配置校验 _cfgv_ 临时目录 Permission denied），
+    # 进而端口配置补全失败、内核被反复停启。
+    try:
+        _app_temp = os.path.join(get_app_dir(), "temp")
+        os.makedirs(_app_temp, exist_ok=True)
+        _probe = os.path.join(_app_temp, ".writable_test")
+        with open(_probe, "w") as _tfh:
+            _tfh.write("ok")
+        os.remove(_probe)
+        import tempfile as _tf
+        _tf.tempdir = _app_temp
+        os.environ["TMP"] = _app_temp
+        os.environ["TEMP"] = _app_temp
+        os.environ["TMPDIR"] = _app_temp
+        log.info(f"临时目录已重定向到: {_app_temp}")
+    except Exception as _terr:
+        log.warning(f"重定向临时目录失败(沿用系统 TMP): {_terr}")
 
     sys.excepthook = _global_exception_handler
 
