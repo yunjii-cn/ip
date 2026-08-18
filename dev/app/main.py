@@ -9920,7 +9920,11 @@ class MainWindow(QMainWindow):
             # Batch 3: 刷新健康度徽章（刚写入了新记录）
             self._refresh_line_health_badges()
 
-            valid = [r for r in results if r[1] >= 0]
+            # 关键修正：可用线路必须以 abroad_ok（r[5]，真正能出境外）为准，
+            # 不能只看 avg>=0。防火墙按路径拦截 quick.exe 出站时，境内走 DIRECT 仍可达
+            # （avg>=0），但境外节点全超时（abroad_ok=False）——这种“境内通境外死”的死线路
+            # 绝不能算可用，否则会自动切换到翻不了墙的线路。
+            valid = [r for r in results if r[5] and r[1] >= 0]
             if valid:
                 fastest = min(valid, key=lambda x: x[1])
                 if fastest[0] in self.line_rows:
@@ -9935,7 +9939,15 @@ class MainWindow(QMainWindow):
                 # 全部失败后，最多再更新配置重测【一次】，避免节点普遍失效时无限循环
                 self._test_retry_count = getattr(self, "_test_retry_count", 0) + 1
                 if self._test_retry_count > 1:
-                    self.line_progress.setText("检测完成 - 无可用线路（已重试 1 次仍失败）")
+                    # 诊断：内核已绑 7890 但所有线路境外都不通 → 高度疑似安全软件/防火墙
+                    # 按路径拦截了 quick.exe 的出站连接（dev 的 quick.exe 在已放行路径，故 dev 能通）。
+                    _fw_hint = ""
+                    try:
+                        if is_proxy_running():
+                            _fw_hint = "｜疑似安全软件按路径拦截 quick.exe 出站：请将 EXE 目录的 Quick\\quick.exe 加入防火墙/杀毒白名单（允许出入站），或把 EXE 放到与开发环境相同的已放行路径"
+                    except Exception:
+                        pass
+                    self.line_progress.setText("检测完成 - 无可用线路（已重试 1 次仍失败）" + _fw_hint)
                     self.line_progress.setStyleSheet("font-size: 8pt; color: #FF6B80;")
                     return
                 self.line_progress.setText("检测完成 - 无可用线路，正在更新配置并重测...")
@@ -9966,7 +9978,13 @@ class MainWindow(QMainWindow):
                     else:
                         set_system_proxy(False)
                         self._update_sys_proxy_label()
-                        self.line_progress.setText("无可用线路：系统代理保持关闭，本地网络不受影响")
+                        _fw_hint2 = ""
+                        try:
+                            if is_proxy_running():
+                                _fw_hint2 = "｜疑似安全软件按路径拦截 quick.exe 出站，请将 EXE 目录 Quick\\quick.exe 加入防火墙/杀毒白名单"
+                        except Exception:
+                            pass
+                        self.line_progress.setText("无可用线路：系统代理保持关闭，本地网络不受影响" + _fw_hint2)
                         self.line_progress.setStyleSheet("font-size: 8pt; color: #FF6B80;")
                         log.warning("启动自动选路：所有线路不可用，系统代理保持关闭")
                 # 内核已稳定，启动实时重连 / 自动切换线路监控
