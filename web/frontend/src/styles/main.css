@@ -20,30 +20,42 @@
 }
 
 html, body {
+  height: 100%;
   min-width: 360px;
   background: var(--bg-primary);
   color: var(--text-primary);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
+  /* 锁定整页不滚动，滚动由 .main-content 内部承担，避免底部 TabBar 被内容层覆盖 */
+  overflow: hidden;
 }
 
 .app-container {
   display: flex;
   flex-direction: column;
+  /* 固定为视口高度，确保 TopBar + 内容区 + 底部 TabBar 三栏稳定排布 */
+  height: 100vh;
   min-height: 100vh;
   min-width: 360px;
+  overflow: hidden;
 }
 
-/* 底部 TabBar 为系统导航栏/手势条预留安全区 */
+/* 底部 TabBar 作为正常的 flex 子项固定在底部，不再使用 fixed 脱离文档流，
+   从而在任何窗口高度下都不会被内容层盖住、点击热区稳定可用 */
 .van-tabbar {
+  position: relative !important;
+  flex-shrink: 0;
   padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
 .main-content {
+  flex: 1 1 auto;
+  /* 关键：允许在 flex 列中收缩，从而内部 overflow 滚动而非撑大整页 */
+  min-height: 0;
   overflow-y: auto;
   padding: 12px;
-  padding-bottom: 60px;
+  padding-bottom: 12px;
 }
 
 .page-title {
@@ -159,7 +171,7 @@ html, body {
   }
   .main-content {
     padding: 8px;
-    padding-bottom: 60px;
+    padding-bottom: 8px;
   }
 }
 
