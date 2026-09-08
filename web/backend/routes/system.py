@@ -75,3 +75,11 @@ def open_browser(data: dict):
 @router.get("/log")
 def get_log():
     return {"log": "日志功能将通过 WebSocket 实时推送"}
+
+
+@router.post("/exit")
+def exit_app():
+    """优雅退出 exe 进程（webbrowser fallback 方案下 exe 常驻，需此接口收尾）。"""
+    import threading
+    threading.Timer(0.3, lambda: os._exit(0)).start()
+    return {"ok": True, "msg": "正在退出程序"}

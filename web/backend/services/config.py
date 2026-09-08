@@ -52,7 +52,17 @@ def _load_project_config():
 _CFG = _load_project_config()
 
 BRAND_NAME = _CFG["brand_name"]
-VERSION = datetime.now().strftime(_CFG["version_format"])
+# 冻结（PyInstaller 单文件 exe）模式下，版本号必须固定，否则每次启动都变。
+# 由 build_web.py 注入 _build_version.txt（含构建时间戳），运行时从 MEIPASS 读取。
+if getattr(sys, 'frozen', False):
+    try:
+        with open(os.path.join(getattr(sys, '_MEIPASS', ''), '_build_version.txt'),
+                  'r', encoding='utf-8') as _bvf:
+            VERSION = (_bvf.read().strip() or datetime.now().strftime(_CFG["version_format"]))
+    except Exception:
+        VERSION = datetime.now().strftime(_CFG["version_format"])
+else:
+    VERSION = datetime.now().strftime(_CFG["version_format"])
 GITHUB_REPO = _CFG["repos"]["github"]
 GITEE_REPO = _CFG["repos"]["gitee"]
 MIHOMO_REPO = _CFG["repos"]["mihomo"]

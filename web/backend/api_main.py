@@ -101,12 +101,17 @@ app.include_router(system.router, prefix="/api/system", tags=["系统信息"])
 # 静态前端托管：优先使用已构建的 web/frontend/dist（最新前端），
 # 回退到本目录 static/（旧内置构建）。两者皆无则不挂载（仅提供 API）。
 backend_dir = os.path.dirname(os.path.abspath(__file__))
+# 冻结模式下由 launcher_web 通过环境变量显式指定内嵌前端目录（MEIPASS/frontend/dist），
+# 避免单文件解压后相对路径（backend_dir/../frontend/dist）指向 MEIPASS 之外而失效。
 _static_candidates = [
+    os.environ.get("YUNJI_FRONTEND_DIR", ""),
     os.path.join(backend_dir, "..", "frontend", "dist"),
     os.path.join(backend_dir, "static"),
 ]
 static_dir = None
 for _c in _static_candidates:
+    if not _c:
+        continue
     _c = os.path.abspath(_c)
     if os.path.isdir(_c) and os.path.isfile(os.path.join(_c, "index.html")):
         static_dir = _c
