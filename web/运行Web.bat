@@ -23,7 +23,7 @@ if not exist "%WEB_DIR%frontend\dist\index.html" (
         set "PATH=%NODE_DIR%;%PATH%"
         cd /d "%WEB_DIR%frontend"
         if not exist "%WEB_DIR%frontend\node_modules" (
-            echo [INFO] Installing frontend deps (first time slow) ...
+            echo [INFO] Installing frontend deps, first time may be slow ...
             call npm install
             if errorlevel 1 (
                 echo [ERROR] npm install failed
