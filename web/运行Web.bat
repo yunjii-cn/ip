@@ -45,6 +45,14 @@ if not exist "%WEB_DIR%frontend\dist\index.html" (
     echo [INFO] 前端已构建，跳过构建
 )
 
+REM ── 启动前强制清理占用 18080 的旧进程与残留内核，避免陈旧后端用旧前端返回"内核缺失" ──
+echo [INFO] 清理可能占用 18080 的旧进程 ...
+for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr /i "LISTENING" ^| findstr /r "[:]18080"') do (
+    taskkill /f /pid %%a >nul 2>&1
+)
+taskkill /f /im "quick.exe" >nul 2>&1
+timeout /t 1 /nobreak >nul
+
 echo [START] API 后端 (0.0.0.0:18080) ...
 cd /d "%BACKEND_DIR%"
 start "YunJi API" cmd /c ""%PYTHON%" api_main.py --lan"
