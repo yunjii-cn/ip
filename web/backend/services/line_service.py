@@ -22,7 +22,7 @@ except ImportError:
 
 from services.config import (
     get_app_dir, settings, load_settings, save_settings,
-    PROXY_HOST, PROXY_PORT, CONFIG_URLS,
+    PROXY_HOST, PROXY_PORT, CONFIG_URLS, BUILTIN_DEFAULT_LINE_NAME,
 )
 from services.proxy_service import (
     is_proxy_running, get_quick_dir, start_quick_raw, stop_quick_raw, wait_for_proxy,
@@ -102,9 +102,15 @@ def test_lines(line_names=None):
                 for url in [primary_url, fallback_url]:
                     try:
                         data = _download_with_fallback(url)
+                        # 校验确为 Clash 配置（防止把 GitHub/GitLab 错误页当配置写入）
                         if data and len(data) > 100:
-                            log.info(f"线路 {name} 配置下载成功 ({url})")
-                            return name, data
+                            _txt = data.decode("utf-8", errors="ignore")
+                            if ("proxies:" in _txt or "proxy-providers:" in _txt
+                                    or "proxy-groups:" in _txt):
+                                log.info(f"线路 {name} 配置下载成功 ({url})")
+                                return name, data
+                            else:
+                                log.warning(f"线路 {name} 下载内容非 Clash 配置，跳过 ({url})")
                     except Exception as e:
                         log.warning(f"线路 {name} 配置下载失败 ({url}): {type(e).__name__}: {e}")
                 log.error(f"线路 {name} 配置所有下载方式均失败")
@@ -129,6 +135,19 @@ def test_lines(line_names=None):
                 _test_status["phase"] = "未找到内核目录"
                 _test_status["testing"] = False
                 return
+
+            # ── Step 1.5: 内置默认节点作为保底竞速线路（参考桌面 config.default.yaml）──
+            # 保证开箱即有一条可用线路，避免订阅源集体失效时"检测线路"整页超时。
+            default_cfg_path = os.path.join(quick_dir, "config.default.yaml")
+            if os.path.isfile(default_cfg_path) and BUILTIN_DEFAULT_LINE_NAME not in configs:
+                try:
+                    with open(default_cfg_path, 'rb') as f:
+                        ddata = f.read()
+                    if ddata and len(ddata) > 100:
+                        configs[BUILTIN_DEFAULT_LINE_NAME] = ddata
+                        log.info(f"已加入内置默认线路 [{BUILTIN_DEFAULT_LINE_NAME}] 参与竞速")
+                except Exception as e:
+                    log.warning(f"读取内置默认配置失败: {e}")
 
             config_path = os.path.join(quick_dir, "config.yaml")
             original_config = None

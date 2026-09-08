@@ -160,16 +160,24 @@ settings = load_settings()
 PROXY_HOST = settings.get("proxy_host", "127.0.0.1")
 PROXY_PORT = settings.get("proxy_port", 7890)
 
+_GITLAB_MIRROR = "https://www.gitlabip.xyz"
+_GITLAB_RAW_TPL = "https://gitlab.com/free9999/ipupdate/-/raw/master/backup/img/1/2/ipp/quick/{n}/config.yaml"
+_GITLAB_MIRROR_TPL = _GITLAB_MIRROR + "/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/{n}/config.yaml"
+
+# 线路配置下载源：与桌面端完全一致，走 GitLab 镜像链路（gitlabip.xyz / gitlab.com），
+# 国内直连可达，规避 GitHub raw 被 GFW 封锁导致"只测到部分线路 / 全失败"。
+# 4 条线路映射到 free9999/ipupdate 的 quick/1..4，内容同源。
 CONFIG_URLS = [
-    ("线路1", "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260622.yml",
-     "https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml"),
-    ("线路2", "https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml",
-     "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash"),
-    ("线路3", "https://raw.githubusercontent.com/ripaojiedian/freenode/main/clash",
-     "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260622.yml"),
-    ("线路4", "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260621.yml",
-     "https://raw.githubusercontent.com/free-nodes/clashfree/main/clash20260622.yml"),
+    ("线路1", _GITLAB_MIRROR_TPL.format(n=1), _GITLAB_RAW_TPL.format(n=1)),
+    ("线路2", _GITLAB_MIRROR_TPL.format(n=2), _GITLAB_RAW_TPL.format(n=2)),
+    ("线路3", _GITLAB_MIRROR_TPL.format(n=3), _GITLAB_RAW_TPL.format(n=3)),
+    ("线路4", _GITLAB_MIRROR_TPL.format(n=4), _GITLAB_RAW_TPL.format(n=4)),
 ]
+
+# 内置存活默认节点（烤进包的 config.default.yaml，anytls2 真实可用节点）。
+# 作为一条保底竞速线路参与检测，保证开箱即有一条可用线路，
+# 避免内置免费源(gitlabip)节点集体失效时"检测线路"整页超时、用户误以为软件坏掉。
+BUILTIN_DEFAULT_LINE_NAME = "默认节点(anytls2)"
 
 
 def _update_proxy_url():
