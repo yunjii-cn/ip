@@ -68,14 +68,13 @@ def _auto_startup():
             log.info("代理内核已在运行，跳过重复启动")
 
         # 2) 自动进行线路检测（与桌面版「启动后自动检测」一致）
-        if proxy_service.is_proxy_running():
-            try:
-                line_service.test_lines()
-                log.info("已自动触发线路检测（后台运行）")
-            except Exception as _e:
-                log.warning(f"自动触发线路检测失败: {_e}")
-        else:
-            log.warning("代理未能就绪，跳过自动线路检测")
+        # 不以 is_proxy_running() 瞬时结果卡门槛：test_lines 内部每条都会拉起内核并 wait_for_proxy，
+        # 即使代理刚启动未就绪也能正确完成检测，避免"启动后不自动检测"的误判。
+        try:
+            line_service.test_lines()
+            log.info("已自动触发线路检测（后台运行）")
+        except Exception as _e:
+            log.warning(f"自动触发线路检测失败: {_e}")
     except Exception as _e:
         log.error(f"启动自动流程异常: {_e}")
 

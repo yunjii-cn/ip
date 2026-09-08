@@ -136,19 +136,6 @@ def test_lines(line_names=None):
                 _test_status["testing"] = False
                 return
 
-            # ── Step 1.5: 内置默认节点作为保底竞速线路（参考桌面 config.default.yaml）──
-            # 保证开箱即有一条可用线路，避免订阅源集体失效时"检测线路"整页超时。
-            default_cfg_path = os.path.join(quick_dir, "config.default.yaml")
-            if os.path.isfile(default_cfg_path) and BUILTIN_DEFAULT_LINE_NAME not in configs:
-                try:
-                    with open(default_cfg_path, 'rb') as f:
-                        ddata = f.read()
-                    if ddata and len(ddata) > 100:
-                        configs[BUILTIN_DEFAULT_LINE_NAME] = ddata
-                        log.info(f"已加入内置默认线路 [{BUILTIN_DEFAULT_LINE_NAME}] 参与竞速")
-                except Exception as e:
-                    log.warning(f"读取内置默认配置失败: {e}")
-
             config_path = os.path.join(quick_dir, "config.yaml")
             original_config = None
             if os.path.isfile(config_path):
@@ -156,14 +143,22 @@ def test_lines(line_names=None):
                     original_config = f.read()
 
             results = {}
-            total = len(configs)
+            total = len(lines)
             _test_status["total"] = total
 
-            for i, name in enumerate(configs.keys()):
-                data = configs[name]
+            for i, (name, _pu, _fu) in enumerate(lines):
+                data = configs.get(name)
                 _test_status["current"] = i + 1
                 _test_status["progress"] = int((i + 1) / total * 100)
                 _test_status["phase"] = f"正在检测线路 {i + 1}/{total}: {name}..."
+
+                if not data:
+                    # 该线路配置下载失败：记为 fail 但计入总数，保证 UI 检测总数与线路列表一致
+                    results[name] = {"latency": None, "status": "fail",
+                                     "config_updated": False, "error": "线路配置下载失败"}
+                    _test_status["results"] = dict(results)
+                    _emit_progress(name, results[name])
+                    continue
 
                 # 写入该线路配置（含本地 geoip 注入/安全修复/端口强制/外链本地化）
                 _save_config_and_inject(quick_dir, data, config_path)
@@ -238,7 +233,8 @@ def test_lines(line_names=None):
                          f"latency={results[name]['latency']}ms, abroad={abroad_ok}")
 
             # ── 自动选路：竞速优先连通 ──
-            # 仅从"真正可用"(境外经代理成功, status=ok)的线路中，按延迟升序选最快者作为竞速胜出者。
+            # 仅从"真正可用"(境外经代理成功, status=ok)的订阅线路中，按延迟升序选最快者。
+            # 胜出者必来自 UI 线路列表（订阅线路），确保前端能正确显示"使用中"。
             successful = [(n, configs[n], results[n]["latency"]) for n in configs
                           if results.get(n, {}).get("status") == "ok" and results[n]["latency"]]
             fastest_name = None
@@ -262,17 +258,8 @@ def test_lines(line_names=None):
                 wait_for_proxy(timeout=8)
                 _test_status["phase"] = f"检测完成，已自动启用竞速胜出线路：{fastest_name}"
             else:
-                # 没有任何线路连通：彻底关闭代理，恢复原始配置但不启动内核，
-                # 避免代理空转影响用户原有正常网络。
-                stop_quick_raw()
-                if original_config:
-                    _save_config_and_inject(quick_dir, original_config, config_path)
-                s = load_settings()
-                s["current_line"] = ""
-                s["proxy_enabled"] = False
-                save_settings(s)
-                log.warning("自动选路：所有线路均不可用，已关闭代理（不影响原网络）")
-                _test_status["phase"] = "检测完成：所有线路均不可用，已关闭代理（不影响原网络）"
+                # 订阅线路全不可用 → 尝试启用内置默认节点兜底；仍失败则关闭代理（不影响原网络）
+                _try_default_fallback(quick_dir, config_path, original_config)
 
             _test_status["testing"] = False
         except Exception as e:
@@ -295,6 +282,46 @@ def test_lines(line_names=None):
     threading.Thread(target=_do_test, daemon=True).start()
     threading.Thread(target=_watchdog, daemon=True).start()
     return True
+
+
+def _try_default_fallback(quick_dir, config_path, original_config):
+    """订阅线路全部不可用时，尝试启用内置默认节点(anytls2)作为保底。
+
+    该节点不计入 UI 线路列表/检测总数（避免"5/5 检测却 4 条结果"的困惑），
+    仅在订阅全挂时静默兜底启用；若连默认节点也不可用，则关闭代理、恢复原始配置，不影响用户原有网络。
+    """
+    default_cfg_path = os.path.join(quick_dir, "config.default.yaml")
+    if os.path.isfile(default_cfg_path):
+        try:
+            with open(default_cfg_path, 'rb') as f:
+                ddata = f.read()
+            if ddata and len(ddata) > 100:
+                _save_config_and_inject(quick_dir, ddata, config_path)
+                s = load_settings()
+                s["current_line"] = BUILTIN_DEFAULT_LINE_NAME
+                s["proxy_enabled"] = True
+                save_settings(s)
+                stop_quick_raw()
+                time.sleep(1)
+                if start_quick_raw(quick_dir) and wait_for_proxy(timeout=15):
+                    log.info(f"保底启用内置默认线路：{BUILTIN_DEFAULT_LINE_NAME}")
+                    _test_status["phase"] = (f"检测完成：订阅线路均不可用，已启用内置保底线路"
+                                             f"：{BUILTIN_DEFAULT_LINE_NAME}")
+                    return
+                else:
+                    log.warning("内置默认节点启动/就绪失败")
+        except Exception as e:
+            log.warning(f"内置默认节点兜底启用失败: {e}")
+    # 兜底失败：彻底关闭代理，恢复原始配置（不影响原网络）
+    stop_quick_raw()
+    if original_config:
+        _save_config_and_inject(quick_dir, original_config, config_path)
+    s = load_settings()
+    s["current_line"] = ""
+    s["proxy_enabled"] = False
+    save_settings(s)
+    log.warning("自动选路：所有线路（含保底）均不可用，已关闭代理")
+    _test_status["phase"] = "检测完成：所有线路均不可用，已关闭代理（不影响原网络）"
 
 
 _DOH_SERVERS = [

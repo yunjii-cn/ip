@@ -259,6 +259,13 @@ onMounted(async () => {
   ])
   editHost.value = proxyStore.host
   editPort.value = proxyStore.port
+  // 若后端已在进行自动检测（启动自动流程触发），启动轮询以在 UI 体现检测进度与结果
+  try {
+    const st = await lineApi.getTestStatus()
+    if (st?.data?.testing) startTestPolling()
+  } catch (e) {
+    // 后端尚未就绪时无需轮询，忽略
+  }
 })
 
 onUnmounted(() => {
