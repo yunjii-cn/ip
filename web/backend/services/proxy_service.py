@@ -274,7 +274,9 @@ def start_proxy():
         start_quick_raw(quick_dir)
         if wait_for_proxy(timeout=15):
             s = load_settings()
-            if mode == "system" and s.get("global_proxy", False):
+            # 系统模式下启用代理即设置系统代理（对齐桌面版：proxy_enabled 为真即路由全系统流量经 7890）。
+            # 不再以 global_proxy 为前置条件——Web 版无"仅浏览器代理"独立通道，开代理就必须让外网可达。
+            if mode == "system":
                 set_system_proxy()
             if s.get("proxy_enabled", False) is False:
                 s["proxy_enabled"] = True
@@ -318,6 +320,11 @@ def set_system_proxy():
         )
         winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
         winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, proxy_str)
+        # 本地/内网地址不走代理，避免把 Web UI(127.0.0.1:18080) 与内核(7890/9090)自身绕进代理导致 UI 卡死或回环
+        winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ,
+                          "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;"
+                          "172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;"
+                          "172.28.*;172.29.*;172.30.*;172.31.*;192.168.*")
         winreg.CloseKey(key)
         _refresh_proxy()
         return True
@@ -333,7 +340,9 @@ def clear_system_proxy():
             r"SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings",
             0, winreg.KEY_SET_VALUE,
         )
+        # 关闭开关的同时清除 ProxyServer 残留值，避免关闭软件后 Windows 仍指向一个不存在的代理而无法上网
         winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
+        winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, "")
         winreg.CloseKey(key)
         _refresh_proxy()
         return True
@@ -350,6 +359,14 @@ def _refresh_proxy():
         internet_set_option = ctypes.windll.wininet.InternetSetOptionW
         internet_set_option(0, internet_option_settings_changed, 0, 0)
         internet_set_option(0, internet_option_refresh, 0, 0)
+        # 广播 WM_SETTINGCHANGE，强制所有已打开的应用（含浏览器）立即重读代理设置，
+        # 否则部分进程会沿用缓存的旧设置，出现"代理已开但外网仍不通"的假象。
+        HWND_BROADCAST = 0xFFFF
+        WM_SETTINGCHANGE = 0x001A
+        ctypes.windll.user32.SendMessageTimeoutW(
+            HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Internet Settings",
+            0x0002, 5000, None,
+        )
     except Exception:
         pass
 

@@ -26,6 +26,7 @@ from services.config import (
 )
 from services.proxy_service import (
     is_proxy_running, get_quick_dir, start_quick_raw, stop_quick_raw, wait_for_proxy,
+    set_system_proxy, clear_system_proxy,
 )
 from services import clash_prep
 
@@ -256,6 +257,9 @@ def test_lines(line_names=None):
                 time.sleep(1)
                 start_quick_raw(quick_dir)
                 wait_for_proxy(timeout=8)
+                # 系统模式下同步把全系统流量指到 7890，确保"启用后外网可达"（对齐桌面版 set_system_proxy）
+                if load_settings().get("proxy_mode", "system") == "system":
+                    set_system_proxy()
                 _test_status["phase"] = f"检测完成，已自动启用竞速胜出线路：{fastest_name}"
             else:
                 # 订阅线路全不可用 → 尝试启用内置默认节点兜底；仍失败则关闭代理（不影响原网络）
@@ -304,6 +308,8 @@ def _try_default_fallback(quick_dir, config_path, original_config):
                 stop_quick_raw()
                 time.sleep(1)
                 if start_quick_raw(quick_dir) and wait_for_proxy(timeout=15):
+                    if load_settings().get("proxy_mode", "system") == "system":
+                        set_system_proxy()
                     log.info(f"保底启用内置默认线路：{BUILTIN_DEFAULT_LINE_NAME}")
                     _test_status["phase"] = (f"检测完成：订阅线路均不可用，已启用内置保底线路"
                                              f"：{BUILTIN_DEFAULT_LINE_NAME}")
@@ -320,6 +326,7 @@ def _try_default_fallback(quick_dir, config_path, original_config):
     s["current_line"] = ""
     s["proxy_enabled"] = False
     save_settings(s)
+    clear_system_proxy()
     log.warning("自动选路：所有线路（含保底）均不可用，已关闭代理")
     _test_status["phase"] = "检测完成：所有线路均不可用，已关闭代理（不影响原网络）"
 
