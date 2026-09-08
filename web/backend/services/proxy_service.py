@@ -160,11 +160,11 @@ def _prep_config_before_launch(quick_dir):
         log.warning(f"启动前本地化 provider 失败（继续）: {e}")
 
 
-def _launch_kernel(quick_dir, _heal=True):
+def _launch_kernel(quick_dir, _heal=True, _attempt=0):
     """拉起一个 mihomo(quick.exe) 实例（不等待端口就绪，仅做 6s 启动期 fatal 探测）。
 
-    返回 subprocess.Popen 对象；若 exe/config 缺失或启动 6s 内 fatal 退出，返回 None
-    （调用方据此判定该实例不可用）。进程退出且配置解析 fatal 时，自动用预处理兜底重试一次。
+    返回 subprocess.Popen 对象；若 exe/config 缺失或启动 6s 内 fatal 退出，尝试自愈/重试，
+    最终仍失败返回 None。端口被占用(Only one usage)时等待后重试，彻底消除自动检测重启内核的竞态。
     """
     exe_path = os.path.join(quick_dir, "quick.exe")
     if not os.path.isfile(exe_path):
@@ -195,9 +195,8 @@ def _launch_kernel(quick_dir, _heal=True):
         log.error(f"启动 quick.exe 异常: {e}")
         return None
 
-    # 轮询 6s：若进程已退出且非 0，则为 fatal（配置解析失败/MMDB 缺失等）
+    # 轮询 6s：若进程已退出且非 0，则为 fatal（配置解析失败/MMDB 缺失/端口占用等）
     for _ in range(12):
-        import time
         time.sleep(0.5)
         if proc.poll() is not None:
             rc = proc.returncode
@@ -210,6 +209,15 @@ def _launch_kernel(quick_dir, _heal=True):
             tail = _txt[-600:]
             if ("address already in use" in _txt) or ("Only one usage" in _txt) or \
                ("bind:" in _txt and ("已被占用" in _txt or "in use" in _txt)):
+                # 端口被占：等待旧内核释放后重试（最多 3 次），避免"线路N 内核启动失败"
+                if _attempt < 3:
+                    log.warning(f"启动端口被占用，重试({_attempt + 1}/3)...")
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    time.sleep(1.5)
+                    return _launch_kernel(quick_dir, _heal=_heal, _attempt=_attempt + 1)
                 log.error("启动失败：端口 7890/9090 被其它进程占用（残留 quick.exe 或其它代理软件）。")
                 return None
             if rc != 0 or "level=fatal" in tail:
@@ -236,24 +244,71 @@ def _launch_kernel(quick_dir, _heal=True):
     return proc
 
 
+def _wait_ports_free(ports, timeout=10):
+    """轮询直到给定端口全部不再被监听（taskkill /F 异步，socket 释放有延迟）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        all_free = True
+        for p in ports:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.4)
+            try:
+                s.connect(("127.0.0.1", p))
+                all_free = False  # 仍能连上 → 端口被占
+            except Exception:
+                pass
+            finally:
+                s.close()
+        if all_free:
+            return True
+        time.sleep(0.3)
+    return False
+
+
 def start_quick_raw(quick_dir):
+    global _proxy_process
     proc = _launch_kernel(quick_dir)
     if proc is None:
         return False
+    _proxy_process = proc
     log.info(f"已启动代理内核: {os.path.join(quick_dir, 'quick.exe')}")
     return True
 
 
 def stop_quick_raw():
+    """停止内核：优先精确结束本模块跟踪的进程，再兜底 taskkill 全部 quick.exe，
+    最后轮询 7890/9090 真正空闲——彻底消除"旧内核未释放端口 → 新内核绑定失败"的竞态。
+    """
+    global _proxy_process
+    killed = False
+    # 1) 精确结束跟踪进程
+    proc = _proxy_process
+    if proc is not None:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+                killed = True
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        _proxy_process = None
+    # 2) 兜底：清掉所有残留 quick.exe（可能来自其它启动入口/上次异常退出）
     try:
         subprocess.run(
             ["taskkill", "/F", "/IM", "quick.exe"],
             capture_output=True, timeout=10,
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
-        log.info("已停止代理内核")
+        killed = True
     except Exception as e:
-        log.error(f"停止代理内核失败: {e}")
+        log.error(f"停止代理内核(taskkill)失败: {e}")
+    # 3) 等待端口真正释放（关键：防止新内核抢不到端口）
+    if killed:
+        _wait_ports_free([PROXY_PORT, 9090], timeout=10)
+    log.info("已停止代理内核")
 
 
 def start_proxy():

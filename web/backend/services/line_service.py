@@ -186,7 +186,15 @@ def test_lines(line_names=None):
                     time.sleep(0.3)
                 time.sleep(0.5)
 
-                ok = start_quick_raw(quick_dir)
+                # 内核启动可能因端口竞态偶发失败，重试整条线路（停→等→启），最多 2 次
+                ok = False
+                for _attempt in range(2):
+                    ok = start_quick_raw(quick_dir)
+                    if ok:
+                        break
+                    log.warning(f"{name} 内核启动失败，重试({_attempt + 1}/2)...")
+                    stop_quick_raw()
+                    time.sleep(1.0)
                 if not ok:
                     log.warning(f"{name} 内核启动失败，跳过检测")
                     results[name] = {"latency": None, "status": "fail",
@@ -308,12 +316,21 @@ def _try_default_fallback(quick_dir, config_path, original_config):
                 stop_quick_raw()
                 time.sleep(1)
                 if start_quick_raw(quick_dir) and wait_for_proxy(timeout=15):
-                    if load_settings().get("proxy_mode", "system") == "system":
-                        set_system_proxy()
-                    log.info(f"保底启用内置默认线路：{BUILTIN_DEFAULT_LINE_NAME}")
-                    _test_status["phase"] = (f"检测完成：订阅线路均不可用，已启用内置保底线路"
-                                             f"：{BUILTIN_DEFAULT_LINE_NAME}")
-                    return
+                    # 兜底前实测境外连通：默认节点若连不上外网，启用也是"死代理"，
+                    # 应如实关闭并恢复系统代理原状，而不是挂个看起来已连、实际不通的节点。
+                    _abroad_ok = any(
+                        _test_single_line_url(u) is not None
+                        for _, u, region in NODE_TEST_URLS if region == "abroad"
+                    )
+                    if _abroad_ok:
+                        if load_settings().get("proxy_mode", "system") == "system":
+                            set_system_proxy()
+                        log.info(f"保底启用内置默认线路：{BUILTIN_DEFAULT_LINE_NAME}")
+                        _test_status["phase"] = (f"检测完成：订阅线路均不可用，已启用内置保底线路"
+                                                 f"：{BUILTIN_DEFAULT_LINE_NAME}")
+                        return
+                    else:
+                        log.warning("内置默认节点启动成功但境外不可达，放弃兜底（避免死代理）")
                 else:
                     log.warning("内置默认节点启动/就绪失败")
         except Exception as e:
