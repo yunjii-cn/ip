@@ -27,17 +27,22 @@ from services.config import (
 from services.proxy_service import (
     is_proxy_running, get_quick_dir, start_quick_raw, stop_quick_raw, wait_for_proxy,
 )
+from services import clash_prep
 
 log = logging.getLogger("yunji.line")
 
 _test_callbacks = []
-_test_status = {"testing": False, "progress": 0, "total": 0, "current": 0, "results": {}}
+_test_status = {"testing": False, "progress": 0, "total": 0, "current": 0,
+                "results": {}, "phase": ""}
 
 NODE_TEST_TIMEOUT = 6
+# 线路检测 URL：境内+境外混合（对齐桌面端）
+# - region "abroad"：必须经由代理隧道才能到达，用于判定线路是否真能翻墙（可用性硬条件）
+# - region "cn"    ：境内直连可达（GEOIP,CN,DIRECT），仅作参考，不计入可用性
 NODE_TEST_URLS = [
-    ("Google", "https://www.gstatic.com/generate_204"),
-    ("Baidu", "https://www.baidu.com/"),
-    ("Cloudflare", "https://cp.cloudflare.com/"),
+    ("Google", "https://www.gstatic.com/generate_204", "abroad"),
+    ("Cloudflare", "https://cp.cloudflare.com/", "abroad"),
+    ("Baidu", "https://www.baidu.com/", "cn"),
 ]
 
 
@@ -58,35 +63,40 @@ def get_line_status():
 
 
 def test_lines(line_names=None):
+    """参照桌面端 _do_test_lines 实现的串行线路检测。
+
+    流程：并行下载所有线路配置 → 逐条（写入配置+本地 geoip 注入/修复/端口强制 →
+    停旧内核 → 等 7890 真正空闲 → 启新内核 → 等就绪 → 经 7890 实测境外/境内延迟 →
+    判定可用）→ 自动选路 → 恢复代理状态。
+    全程通过 _test_status['phase'] 推送阶段文案，使前端不再一直显示"准备中"。
+    另起看门狗线程，防止内核僵尸进程/网络黑洞导致检测卡死、UI 永远转圈。
+    """
     _test_status["testing"] = True
     _test_status["progress"] = 0
+    _test_status["total"] = 0
+    _test_status["current"] = 0
     _test_status["results"] = {}
+    _test_status["phase"] = "正在下载配置文件..."
+
+    def _emit_progress(name, result):
+        for cb in list(_test_callbacks):
+            try:
+                cb(name, result, _test_status.get("progress", 0))
+            except Exception:
+                pass
 
     def _do_test():
         try:
-            lines = CONFIG_URLS
-            if line_names:
-                lines = [l for l in lines if l[0] in line_names]
-
-            _test_status["total"] = len(lines)
-            results = {}
-            _test_status["results"] = {}
-
-            quick_dir = get_quick_dir()
-            if not quick_dir:
-                log.error("线路检测失败：内核目录不存在")
+            lines = [(n, pu, fu) for (n, pu, fu) in CONFIG_URLS
+                     if (not line_names or n in line_names)]
+            if not lines:
+                log.error("线路检测失败：没有可检测的线路")
+                _test_status["phase"] = "没有可检测的线路"
                 _test_status["testing"] = False
                 return
 
-            original_config_path = os.path.join(quick_dir, "config.yaml")
-            original_config_exists = os.path.isfile(original_config_path)
-
-            # ── Step 1: 并行下载所有线路配置 ──
+            # ── Step 1: 并行下载所有线路配置（对齐桌面 download_all_configs）──
             configs = {}
-            url_map = []
-
-            for name, primary_url, fallback_url in lines:
-                url_map.append((name, primary_url, fallback_url))
 
             def _download_one(name, primary_url, fallback_url):
                 for url in [primary_url, fallback_url]:
@@ -97,120 +107,174 @@ def test_lines(line_names=None):
                             return name, data
                     except Exception as e:
                         log.warning(f"线路 {name} 配置下载失败 ({url}): {type(e).__name__}: {e}")
-                        continue
                 log.error(f"线路 {name} 配置所有下载方式均失败")
                 return name, None
 
-            with ThreadPoolExecutor(max_workers=len(url_map)) as pool:
-                futures = {
-                    pool.submit(_download_one, name, pu, fu): name
-                    for name, pu, fu in url_map
-                }
-                for future in as_completed(futures):
-                    name, data = future.result()
+            with ThreadPoolExecutor(max_workers=len(lines)) as pool:
+                futs = {pool.submit(_download_one, n, pu, fu): n for n, pu, fu in lines}
+                for fut in as_completed(futs):
+                    n, data = fut.result()
                     if data:
-                        configs[name] = data
+                        configs[n] = data
 
             if not configs:
                 log.error("所有线路配置下载均失败，无法检测")
+                _test_status["phase"] = "无法下载线路配置，请检查网络或代理"
                 _test_status["testing"] = False
                 return
 
-            # ── Step 2: 备份原始配置 ──
-            original_backup = None
-            if original_config_exists:
-                original_backup = original_config_path + ".line_test_backup"
-                if os.path.isfile(original_backup):
-                    os.remove(original_backup)
-                shutil.copy2(original_config_path, original_backup)
+            quick_dir = get_quick_dir()
+            if not quick_dir:
+                log.error("线路检测失败：内核目录不存在")
+                _test_status["phase"] = "未找到内核目录"
+                _test_status["testing"] = False
+                return
 
-            # ── Step 3: 逐条切换配置、重启内核、测试延迟 ──
-            proxy_was_running = is_proxy_running()
+            config_path = os.path.join(quick_dir, "config.yaml")
+            original_config = None
+            if os.path.isfile(config_path):
+                with open(config_path, 'rb') as f:
+                    original_config = f.read()
 
-            for i, (name, primary_url, fallback_url) in enumerate(lines):
-                if name not in configs:
-                    results[name] = {
-                        "latency": None, "status": "fail", "config_updated": False,
-                    }
-                    _test_status["results"] = dict(results)
-                    _test_status["current"] = i + 1
-                    _test_status["progress"] = int((i + 1) / len(lines) * 100)
-                    for cb in _test_callbacks:
-                        try:
-                            cb(name, results[name], _test_status["progress"])
-                        except Exception:
-                            pass
-                    continue
+            results = {}
+            total = len(configs)
+            _test_status["total"] = total
 
+            for i, name in enumerate(configs.keys()):
+                data = configs[name]
                 _test_status["current"] = i + 1
-                _test_status["progress"] = int((i + 1) / len(lines) * 100)
+                _test_status["progress"] = int((i + 1) / total * 100)
+                _test_status["phase"] = f"正在检测线路 {i + 1}/{total}: {name}..."
 
-                _save_config_and_inject(quick_dir, configs[name], original_config_path)
+                # 写入该线路配置（含本地 geoip 注入/安全修复/端口强制/外链本地化）
+                _save_config_and_inject(quick_dir, data, config_path)
                 s = load_settings()
                 s[f"line_config_date_{name}"] = date.today().isoformat()
                 save_settings(s)
 
+                # 先停旧内核（避免僵尸进程抢占 7890 端口）
                 stop_quick_raw()
-                time.sleep(1)
-                start_quick_raw(quick_dir)
-                proxy_ready = wait_for_proxy(timeout=15)
-
-                latency = None
-                if proxy_ready:
-                    latency = _test_single_line(name)
-                else:
-                    log.warning(f"线路 {name} 代理内核启动超时，跳过延迟测试")
-
-                results[name] = {
-                    "latency": latency,
-                    "status": "ok" if latency and latency < 1000 else ("slow" if latency else "fail"),
-                    "config_updated": True,
-                }
-                _test_status["results"] = dict(results)
-
-                for cb in _test_callbacks:
+                # 等待 7890 真正空闲（对齐桌面 _free_deadline：taskkill /f 异步，socket 释放有延迟）
+                _free_deadline = time.time() + 6
+                while time.time() < _free_deadline:
+                    _s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    _s.settimeout(0.5)
                     try:
-                        cb(name, results[name], _test_status["progress"])
+                        _s.connect(("127.0.0.1", PROXY_PORT))
+                        _busy = True
                     except Exception:
-                        pass
+                        _busy = False
+                    finally:
+                        _s.close()
+                    if not _busy:
+                        break
+                    time.sleep(0.3)
+                time.sleep(0.5)
 
-            # ── Step 4: 自动选择最优线路 ──
-            ok_lines = [(n, r["latency"]) for n, r in results.items() if r["latency"]]
-            best_name = None
-            if ok_lines:
-                ok_lines.sort(key=lambda x: x[1])
-                best_name = ok_lines[0][0]
-                log.info(f"自动选择最优线路: {best_name} ({ok_lines[0][1]}ms)")
+                ok = start_quick_raw(quick_dir)
+                if not ok:
+                    log.warning(f"{name} 内核启动失败，跳过检测")
+                    results[name] = {"latency": None, "status": "fail",
+                                     "config_updated": True, "error": "内核启动失败"}
+                    _test_status["results"] = dict(results)
+                    _emit_progress(name, results[name])
+                    continue
 
-            # ── Step 5: 恢复代理状态 ──
-            if proxy_was_running or best_name:
+                if not wait_for_proxy(timeout=25):
+                    log.warning(f"{name} 代理未就绪，跳过延迟测试")
+                    results[name] = {"latency": None, "status": "fail",
+                                     "config_updated": True, "error": "代理内核未绑端口(未就绪)"}
+                    _test_status["results"] = dict(results)
+                    _emit_progress(name, results[name])
+                    continue
+
+                # 经 127.0.0.1:7890 实测各站点延迟，区域感知
+                latencies = []
+                abroad_ok = False
+                for label, test_url, region in NODE_TEST_URLS:
+                    for attempt in range(2):
+                        lat = _test_single_line_url(test_url)
+                        if lat is not None:
+                            latencies.append(lat)
+                            if region == "abroad":
+                                abroad_ok = True
+                            break
+
+                # 可用性硬条件：至少一个境外站点经代理成功（Baidu 等境内直连不算）
+                usable = abroad_ok
+                if latencies:
+                    best = min(latencies)
+                    results[name] = {
+                        "latency": int(best * 1000),
+                        "status": "ok" if usable else "slow",
+                        "config_updated": True,
+                        "error": "" if usable else "仅境内可达，未翻墙",
+                    }
+                else:
+                    results[name] = {"latency": None, "status": "fail",
+                                     "config_updated": True, "error": "所有测试站点均失败"}
+                _test_status["results"] = dict(results)
+                _emit_progress(name, results[name])
+                log.info(f"线路 {name} 检测完成: status={results[name]['status']}, "
+                         f"latency={results[name]['latency']}ms, abroad={abroad_ok}")
+
+            # ── 自动选路：竞速优先连通 ──
+            # 仅从"真正可用"(境外经代理成功, status=ok)的线路中，按延迟升序选最快者作为竞速胜出者。
+            successful = [(n, configs[n], results[n]["latency"]) for n in configs
+                          if results.get(n, {}).get("status") == "ok" and results[n]["latency"]]
+            fastest_name = None
+            fastest_data = None
+            if successful:
+                successful.sort(key=lambda x: x[2])  # 延迟最低者优先 = 率先连通的竞速胜出
+                fastest_name, fastest_data, _ = successful[0]
+                log.info(f"自动选路(竞速优先连通): 选用 {fastest_name} "
+                         f"({results[fastest_name]['latency']}ms)，共 {len(successful)} 条可用")
+
+            if fastest_name:
+                # 有可用线路：使用该线路并拉起内核，代理保持开启
+                _save_config_and_inject(quick_dir, fastest_data, config_path)
+                s = load_settings()
+                s["current_line"] = fastest_name
+                s["proxy_enabled"] = True
+                save_settings(s)
                 stop_quick_raw()
                 time.sleep(1)
-
-            if best_name:
-                _save_config_and_inject(quick_dir, configs[best_name], original_config_path)
-                s = load_settings()
-                s["current_line"] = best_name
-                save_settings(s)
-
-            if proxy_was_running:
                 start_quick_raw(quick_dir)
-                wait_for_proxy(timeout=15)
-
-            # ── Step 6: 清理备份 ──
-            if original_backup and os.path.isfile(original_backup):
-                try:
-                    os.remove(original_backup)
-                except Exception:
-                    pass
+                wait_for_proxy(timeout=8)
+                _test_status["phase"] = f"检测完成，已自动启用竞速胜出线路：{fastest_name}"
+            else:
+                # 没有任何线路连通：彻底关闭代理，恢复原始配置但不启动内核，
+                # 避免代理空转影响用户原有正常网络。
+                stop_quick_raw()
+                if original_config:
+                    _save_config_and_inject(quick_dir, original_config, config_path)
+                s = load_settings()
+                s["current_line"] = ""
+                s["proxy_enabled"] = False
+                save_settings(s)
+                log.warning("自动选路：所有线路均不可用，已关闭代理（不影响原网络）")
+                _test_status["phase"] = "检测完成：所有线路均不可用，已关闭代理（不影响原网络）"
 
             _test_status["testing"] = False
         except Exception as e:
-            log.error(f"线路检测失败: {e}")
+            log.error(f"线路检测异常: {e}", exc_info=True)
+            _test_status["phase"] = f"检测异常: {e}"
             _test_status["testing"] = False
 
-    t = threading.Thread(target=_do_test, daemon=True)
-    t.start()
+    def _watchdog():
+        # 看门狗：若检测卡死（内核僵尸进程/网络黑洞），强制结束，避免前端永远"准备中"
+        deadline = time.time() + 8 * 60
+        while time.time() < deadline:
+            time.sleep(5)
+            if not _test_status.get("testing"):
+                return
+        if _test_status.get("testing"):
+            log.error("线路检测看门狗触发：强制结束（疑似卡死）")
+            _test_status["phase"] = "检测超时（已强制结束，请检查内核与网络）"
+            _test_status["testing"] = False
+
+    threading.Thread(target=_do_test, daemon=True).start()
+    threading.Thread(target=_watchdog, daemon=True).start()
     return True
 
 
@@ -405,8 +469,28 @@ def _save_config_and_inject(quick_dir, config_data, existing_config_path):
         except Exception as e:
             log.warning(f"提取旧配置的 YUNJI 规则块失败: {e}")
 
+    # ── 下载订阅配置预处理：注入本地 geoip 段 + 安全修复 + 外链 provider 本地化 ──
+    try:
+        config_data, p_issues = clash_prep.preprocess_config_for_quick(config_data)
+        for it in p_issues:
+            log.info(f"线路配置预处理: {it}")
+    except Exception as e:
+        log.warning(f"线路配置预处理失败（原样写入）: {e}")
+
     with open(config_path, 'wb') as f:
         f.write(config_data)
+
+    # 外链 provider 本地化（消除内核启动期外链下载卡死，EXE 部署根因修复）
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            _lc = f.read()
+        _localized = clash_prep.localize_external_providers(quick_dir, _lc)
+        if _localized != _lc:
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write(_localized)
+            log.info("已本地化线路配置中的外部 provider")
+    except Exception as e:
+        log.warning(f"线路配置 provider 本地化失败（继续）: {e}")
 
     if yunji_blocks or advanced_text:
         try:
@@ -438,35 +522,24 @@ def _save_config_and_inject(quick_dir, config_data, existing_config_path):
     # ── 注入自定义规则 + 代理范围 + 高级配置 ──
     _inject_custom_rules()
     _inject_advanced_config()
+    # 强制监听/控制端口（前端 mihomo API 依赖 127.0.0.1:9090）
+    clash_prep.ensure_proxy_port(config_path)
 
 
-def _test_single_line(name):
+def _test_single_line_url(url):
+    """经 127.0.0.1:7890 实测单个站点，返回耗时(秒)；失败返回 None。"""
     try:
-        start = time.time()
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
         proxy_url = f"http://{PROXY_HOST}:{PROXY_PORT}"
-        handler = urllib.request.ProxyHandler({
-            'http': proxy_url, 'https': proxy_url,
-        })
-        https_handler = urllib.request.HTTPSHandler(context=ctx)
-        opener = urllib.request.build_opener(handler, https_handler)
-
-        for label, url in NODE_TEST_URLS:
-            for attempt in range(2):
-                try:
-                    req = urllib.request.Request(url, headers={"User-Agent": "Yunji/1.0"})
-                    with opener.open(req, timeout=NODE_TEST_TIMEOUT) as resp:
-                        if resp.status in (200, 204):
-                            return int((time.time() - start) * 1000)
-                except Exception as e:
-                    log.debug(f"线路{name}测试{label}失败 (第{attempt+1}次): {e}")
-                    continue
+        handler = urllib.request.ProxyHandler({'http': proxy_url, 'https': proxy_url})
+        opener = urllib.request.build_opener(handler)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        start = time.time()
+        resp = opener.open(req, timeout=NODE_TEST_TIMEOUT)
+        if resp.status in (200, 204):
+            return time.time() - start
         return None
     except Exception as e:
-        log.error(f"线路{name}检测异常: {e}")
+        log.debug(f"站点 {url} 测试失败: {type(e).__name__}: {e}")
         return None
 
 

@@ -1,61 +1,66 @@
 @echo off
 chcp 65001 >nul 2>&1
-title YunJi - Web Dev Mode
+title YunJi - Web 版
 
-set PYTHON=%~dp0..\build\venv\Scripts\python.exe
-set WEB_DIR=%~dp0web
-set APP_DIR=%~dp0app
-set NODE_DIR=D:\Programs\nodejs
+set "ROOT=%~dp0.."
+set "PYTHON=%ROOT%\build\venv\Scripts\python.exe"
+set "WEB_DIR=%~dp0"
+set "NODE_DIR=D:\Programs\nodejs"
+set "BACKEND_DIR=%WEB_DIR%backend"
 
 if not exist "%PYTHON%" (
-    echo [ERROR] Python not found: %PYTHON%
+    set "PYTHON=%ROOT%\.venv\Scripts\python.exe"
+)
+if not exist "%PYTHON%" (
+    echo [ERROR] Python 未找到
     pause
     exit /b 1
 )
 
-if not exist "%NODE_DIR%\node.exe" (
-    echo [ERROR] Node.js not found: %NODE_DIR%\node.exe
-    echo Please install Node.js LTS from https://nodejs.org/
-    pause
-    exit /b 1
-)
-
-set PATH=%NODE_DIR%;%NODE_DIR%\npm-global;%PATH%
-
-if not exist "%WEB_DIR%\node_modules" (
-    echo [INFO] Installing frontend dependencies...
-    cd /d "%WEB_DIR%"
-    call npm install
-    if %ERRORLEVEL% NEQ 0 (
-        echo [ERROR] npm install failed
-        pause
-        exit /b 1
+if not exist "%WEB_DIR%frontend\dist\index.html" (
+    if exist "%NODE_DIR%\node.exe" (
+        echo [INFO] 前端未构建，正在 npm run build ...
+        set "PATH=%NODE_DIR%;%PATH%"
+        cd /d "%WEB_DIR%frontend"
+        if not exist "%WEB_DIR%frontend\node_modules" (
+            echo [INFO] 安装前端依赖（首次较慢）...
+            call npm install
+            if errorlevel 1 (
+                echo [ERROR] npm install 失败
+                pause
+                exit /b 1
+            )
+        )
+        call npm run build
+        if errorlevel 1 (
+            echo [ERROR] 前端构建失败
+            pause
+            exit /b 1
+        )
+        echo [DONE] 前端已构建
+    ) else (
+        echo [WARN] 未找到 Node.js 且 frontend\dist 不存在，将以 backend\static 启动
     )
-    echo [DONE] Frontend dependencies installed
-    echo.
+) else (
+    echo [INFO] 前端已构建，跳过构建
 )
 
-echo [START] API backend (0.0.0.0:18080) ...
-start "YunJi API" cmd /c "cd /d "%APP_DIR%" && "%PYTHON%" api_main.py --lan"
+echo [START] API 后端 (0.0.0.0:18080) ...
+cd /d "%BACKEND_DIR%"
+start "YunJi API" cmd /c ""%PYTHON%" api_main.py --lan"
 
 timeout /t 2 /nobreak >nul
 
-echo [START] Vite dev server (localhost:5173) ...
-cd /d "%WEB_DIR%"
-start "YunJi Frontend" cmd /c "npm run dev -- --host"
+echo.
+echo ========================================
+echo   Web 版已启动!
+echo   PC 访问:   http://localhost:18080
+echo   API 文档:  http://127.0.0.1:18080/docs
+echo   手机同 WiFi 访问本机 IP:18080
+echo   关闭 "YunJi API" 窗口即停止服务
+echo ========================================
+echo.
 
-echo.
-echo ========================================
-echo   Web Dev Mode Started!
-echo.
-echo   PC:     http://localhost:5173
-echo   API:    http://127.0.0.1:18080
-echo   Docs:   http://127.0.0.1:18080/docs
-echo.
-echo   Phone:  http://192.168.110.99:5173
-echo   (same WiFi network required)
-echo.
-echo   Close the 2 windows to stop
-echo ========================================
-echo.
+start "" http://localhost:18080
+
 pause

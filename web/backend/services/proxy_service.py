@@ -13,6 +13,7 @@ from services.config import (
     get_app_dir, get_base_dir, settings, load_settings, save_settings,
     PROXY_HOST, PROXY_PORT,
 )
+from services import clash_prep
 
 log = logging.getLogger("yunji.proxy")
 
@@ -37,14 +38,39 @@ def get_proxy_mode():
 
 
 def is_proxy_running():
+    """三层探测，逐级兜底，专门解决"EXE 环境下 Python 本地 socket 连不上已绑端口"
+    导致的误报"代理未运行"（dev 的 python.exe 被防火墙放行、EXE 未放行所致）。
+
+    Tier 1：直接 socket 探测（开发机/正常环境秒回）
+    Tier 2：mihomo external-controller 健康检查（内核原生，最可靠）
+    Tier 3：用 netstat 直接问操作系统端口是否真的在 LISTEN（完全绕过 Python 连接能力）
+    """
+    # Tier 1：依次尝试配置主机与 127.0.0.1（IPv4 兜底，规避 localhost→::1 错配）
+    hosts = [PROXY_HOST]
+    if PROXY_HOST != "127.0.0.1":
+        hosts.append("127.0.0.1")
+    for host in hosts:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.5)
+            result = sock.connect_ex((host, PROXY_PORT))
+            sock.close()
+            if result == 0:
+                return True
+        except Exception:
+            pass
+
+    # Tier 2：mihomo external-controller 健康检查
+    if clash_prep.controller_healthy():
+        return True
+
+    # Tier 3：netstat 端口占用探测
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(0.5)
-        result = sock.connect_ex((PROXY_HOST, PROXY_PORT))
-        sock.close()
-        return result == 0
+        if clash_prep.port_owner_info(PROXY_PORT)[0]:
+            return True
     except Exception:
-        return False
+        pass
+    return False
 
 
 def get_quick_dir():
@@ -94,23 +120,127 @@ def _dedup_top_level_keys(config_path):
         return False
 
 
-def start_quick_raw(quick_dir):
-    exe_path = os.path.join(quick_dir, "quick.exe")
-    if not os.path.isfile(exe_path):
-        return False
+def _prep_config_before_launch(quick_dir):
+    """启动内核前对 config.yaml 做确定性自愈：去重顶层键 + 纯文本安全修复 +
+    rules 段缩进修复 + 强制监听/控制端口 + 预置 GEOIP + 外链 provider 本地化。
+    全部零风险、幂等；不改动合法结构与用户 YUNJI 规则块。
+    """
     config_path = os.path.join(quick_dir, "config.yaml")
     if not os.path.isfile(config_path):
-        return False
+        return
     _dedup_top_level_keys(config_path)
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        fixed, _chg = clash_prep.safe_clash_text_fixes(text)
+        fixed = clash_prep.repair_rules_indentation(fixed)
+        if fixed != text:
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write(fixed)
+            log.info("启动前安全修复 config.yaml（cipher/datageip/rules 缩进）")
+    except Exception as e:
+        log.warning(f"启动前修复 config.yaml 失败（沿用原文件）: {e}")
+    # 强制 mixed-port:7890 + external-controller:127.0.0.1:9090（前端 mihomo API 依赖 9090）
+    clash_prep.ensure_proxy_port(config_path)
+    # 预置 GEOIP/GEOSITE 数据，避免内核卡加载
+    try:
+        clash_prep.ensure_mmdb(quick_dir)
+    except Exception as e:
+        log.warning(f"启动前预置 geoip.metadb 失败(继续尝试启动): {e}")
+    # 外链 provider 本地化（消除内核启动期外链下载卡死）
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            text2 = f.read()
+        localized = clash_prep.localize_external_providers(quick_dir, text2)
+        if localized != text2:
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write(localized)
+            log.info("启动前已本地化外部 provider")
+    except Exception as e:
+        log.warning(f"启动前本地化 provider 失败（继续）: {e}")
+
+
+def _launch_kernel(quick_dir, _heal=True):
+    """拉起一个 mihomo(quick.exe) 实例（不等待端口就绪，仅做 6s 启动期 fatal 探测）。
+
+    返回 subprocess.Popen 对象；若 exe/config 缺失或启动 6s 内 fatal 退出，返回 None
+    （调用方据此判定该实例不可用）。进程退出且配置解析 fatal 时，自动用预处理兜底重试一次。
+    """
+    exe_path = os.path.join(quick_dir, "quick.exe")
+    if not os.path.isfile(exe_path):
+        log.error(f"quick.exe 不存在: {exe_path}")
+        return None
+    config_path = os.path.join(quick_dir, "config.yaml")
+    if not os.path.isfile(config_path):
+        log.error(f"config.yaml 不存在: {config_path}")
+        return None
+
+    _prep_config_before_launch(quick_dir)
+
     log.info(f"配置文件大小: {os.path.getsize(config_path)} bytes")
-    subprocess.Popen(
-        [exe_path, "-d", quick_dir],
-        cwd=quick_dir,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-    )
-    log.info(f"已启动代理内核: {exe_path}")
+    _out_log = os.path.join(quick_dir, "quick_out.log")
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0
+    try:
+        proc = subprocess.Popen(
+            [exe_path, "-d", quick_dir],
+            cwd=quick_dir,
+            stdout=open(_out_log, "w", encoding="utf-8", errors="ignore", buffering=1),
+            stderr=subprocess.STDOUT,
+            startupinfo=si,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+    except Exception as e:
+        log.error(f"启动 quick.exe 异常: {e}")
+        return None
+
+    # 轮询 6s：若进程已退出且非 0，则为 fatal（配置解析失败/MMDB 缺失等）
+    for _ in range(12):
+        import time
+        time.sleep(0.5)
+        if proc.poll() is not None:
+            rc = proc.returncode
+            _txt = ""
+            try:
+                with open(_out_log, "r", encoding="utf-8", errors="ignore") as _lf:
+                    _txt = _lf.read()
+            except Exception:
+                pass
+            tail = _txt[-600:]
+            if ("address already in use" in _txt) or ("Only one usage" in _txt) or \
+               ("bind:" in _txt and ("已被占用" in _txt or "in use" in _txt)):
+                log.error("启动失败：端口 7890/9090 被其它进程占用（残留 quick.exe 或其它代理软件）。")
+                return None
+            if rc != 0 or "level=fatal" in tail:
+                if _heal:
+                    try:
+                        with open(config_path, "rb") as _f:
+                            _raw2 = _f.read()
+                        _t2 = _raw2.decode("utf-8", errors="ignore")
+                        _fb2, _fb_chg2 = clash_prep.preprocess_config_for_quick(_t2)
+                        _fixed2 = _fb2.decode("utf-8") if isinstance(_fb2, (bytes, bytearray)) else _fb2
+                        with open(config_path, "w", encoding="utf-8") as _f:
+                            _f.write(_fixed2)
+                        log.warning(f"内核解析失败，已安全重排配置并自愈重试: {_fb_chg2}")
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        return _launch_kernel(quick_dir, _heal=False)
+                    except Exception as _he:
+                        log.warning(f"自愈重试失败: {_he}")
+                log.error(f"quick.exe 启动即致命退出(rc={rc}): {tail}")
+                return None
+            break
+    return proc
+
+
+def start_quick_raw(quick_dir):
+    proc = _launch_kernel(quick_dir)
+    if proc is None:
+        return False
+    log.info(f"已启动代理内核: {os.path.join(quick_dir, 'quick.exe')}")
     return True
 
 

@@ -460,6 +460,8 @@ function startTestPolling() {
       }
       if (testData.phase) {
         testPhase.value = testData.phase
+      } else if (testData.testing) {
+        testPhase.value = `正在检测线路 ${testData.current || ''}/${testData.total || ''}...`
       }
       if (!testData.testing) {
         if (testPollTimer) clearInterval(testPollTimer)

@@ -25,8 +25,59 @@ async def lifespan(app: FastAPI):
         kill_stale_kernels()
     except Exception:
         pass
+    # 启动后自动开代理 + 自动线路检测（与桌面版一致）：
+    # 后台派生线程，避免阻塞 uvicorn 启动；逻辑全部走既有 start_proxy / test_lines。
+    try:
+        import threading as _th
+        _th.Thread(target=_auto_startup, daemon=True).start()
+    except Exception:
+        pass
     yield
     log.info("API 服务关闭")
+
+
+def _auto_startup():
+    """后端启动后自动流程：参照桌面版 _on_start + 自动线路检测。
+
+    - 受 settings.auto_start（默认 True）开关控制，与前端「自动启动」开关联动。
+    - 代理未运行时自动开启；就绪后对内置线路自动做一次检测（自动选路）。
+    - 全程不阻塞服务启动；失败仅记录日志，不影响 API 正常服务。
+    """
+    import time
+    time.sleep(2)  # 让服务先完成静态挂载与路由注册
+    try:
+        from services.config import load_settings
+        from services import proxy_service, line_service
+
+        s = load_settings()
+        if not s.get("auto_start", True):
+            log.info("auto_start=False，跳过启动自动开代理/线路检测")
+            return
+
+        quick_dir = proxy_service.get_quick_dir()
+        if not quick_dir:
+            log.warning("内核目录不存在，跳过启动自动流程（请先更新代理内核）")
+            return
+
+        # 1) 自动开启代理（若尚未运行）
+        if not proxy_service.is_proxy_running():
+            ok, msg = proxy_service.start_proxy()
+            log.info(f"启动自动开代理: ok={ok} msg={msg}")
+            proxy_service.wait_for_proxy(timeout=15)
+        else:
+            log.info("代理内核已在运行，跳过重复启动")
+
+        # 2) 自动进行线路检测（与桌面版「启动后自动检测」一致）
+        if proxy_service.is_proxy_running():
+            try:
+                line_service.test_lines()
+                log.info("已自动触发线路检测（后台运行）")
+            except Exception as _e:
+                log.warning(f"自动触发线路检测失败: {_e}")
+        else:
+            log.warning("代理未能就绪，跳过自动线路检测")
+    except Exception as _e:
+        log.error(f"启动自动流程异常: {_e}")
 
 
 app = FastAPI(
