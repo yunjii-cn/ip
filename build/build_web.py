@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-云集智能网联代理专家 - Web 版独立 exe 构建脚本
+云集代理 - Web 版独立 exe 构建脚本
 
 将「FastAPI 后端 + Vue 前端」打包为单个 exe（双击即用，自动打开系统浏览器）。
 - 入口：web/backend/launcher_web.py（冻结模式适配已在其中完成）
@@ -51,7 +51,7 @@ def _copytree_skip(src, dst, skips):
 
 def build():
     version = get_version()
-    exe_name = f"云集智能网联代理专家-Web-v{version}"
+    exe_name = f"云集代理-Web-v{version}"
     print(f"=== 构建 Web 版独立 exe v{version} ===")
 
     # 前置校验

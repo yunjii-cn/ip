@@ -54,7 +54,7 @@ def get_local_versions():
         ver = v.get("version", "")
         if not ver:
             continue
-        filename = v.get("filename", f"云集智能网联代理专家-v{ver}.exe")
+        filename = v.get("filename", f"云集代理-v{ver}.exe")
         fpath = None
         for search_dir in [ver_dir, dist_dir]:
             candidate = os.path.join(search_dir, filename)
@@ -212,6 +212,11 @@ def download_version(version, filename):
 
 
 def switch_version(exe_path):
+    # ⚠️ 这里出现的 exe 名是**运行时进程匹配串**，不是品牌显示名。
+    # 它必须与磁盘上实际产物的文件名一致（release/version.json 的 filename），
+    # 故不随「云集智能网联代理专家 → 云集代理」的品牌改名一起改——
+    # 改成 云集代理.exe 会让下面的 tasklist/taskkill 匹配不到现存的 云集智能网联代理专家.exe，
+    # 表现为「切版本时杀不掉旧进程」。改名须与构建产物的改名同批进行。
     base_dir = get_base_dir()
     entry_exe = os.path.join(base_dir, "云集智能网联代理专家.exe")
 

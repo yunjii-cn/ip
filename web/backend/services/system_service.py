@@ -10,7 +10,7 @@ def _load_project_config():
         with open(cfg_path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"brand_name": "云集智能网联代理专家"}
+        return {"brand_name": "云集代理"}
 
 
 async def get_info():

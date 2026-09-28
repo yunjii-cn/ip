@@ -1,4 +1,4 @@
-"""EXE 入口点 - 云集智能网联代理专家
+"""EXE 入口点 - 云集代理
 
 职责：
 1. 冻结模式下抑制 stdout/stderr 避免崩溃
@@ -12,7 +12,7 @@ import os
 import time
 import ctypes
 
-BRAND_NAME = "云集智能网联代理专家"
+BRAND_NAME = "云集代理"
 
 # ── 冻结模式下抑制输出 ──
 if sys.platform == 'win32' and getattr(sys, 'frozen', False):

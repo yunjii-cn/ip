@@ -1,4 +1,4 @@
-# 云集智能网联代理专家 — Capacitor 手机端打包技术规划
+# 云集代理 — Capacitor 手机端打包技术规划
 
 > 版本：v1.0 | 日期：2026-05-23
 
@@ -517,7 +517,7 @@ export const useProxyStore = defineStore('proxy', () => {
 ```bash
 cd dev/web
 npm install @capacitor/core @capacitor/cli
-npx cap init "云集智能网联代理专家" "com.yunjii.proxy"
+npx cap init "云集代理" "com.yunjii.proxy"
 npm install @capacitor/android
 npx cap add android
 ```
@@ -529,7 +529,7 @@ import type { CapacitorConfig } from '@capacitor/cli'
 
 const config: CapacitorConfig = {
   appId: 'com.yunjii.proxy',
-  appName: '云集智能网联代理专家',
+  appName: '云集代理',
   webDir: 'dist',
   server: {
     androidScheme: 'https',

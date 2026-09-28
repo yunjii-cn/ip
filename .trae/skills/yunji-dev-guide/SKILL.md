@@ -1,13 +1,13 @@
 ---
 name: "yunji-dev-guide"
-description: "云集智能网联代理专家项目开发规范。Invoke when working on this project: coding, building EXE, building APK, modifying UI, fixing bugs, or any development task."
+description: "云集代理项目开发规范。Invoke when working on this project: coding, building EXE, building APK, modifying UI, fixing bugs, or any development task."
 ---
 
-# 云集智能网联代理专家 - 开发规范技能
+# 云集代理 - 开发规范技能
 
 ## 项目概述
 
-**项目名称**: 云集智能网联代理专家
+**项目名称**: 云集代理
 **核心功能**:
 - 网络代理服务管理（基于 mihomo 内核）
 - 多线路自动检测与切换
@@ -57,7 +57,7 @@ description: "云集智能网联代理专家项目开发规范。Invoke when wor
 ## 目录结构
 
 ```
-云集智能网联代理专家/
+云集代理/
 │
 │ # ========== 公开仓库（Git管理） ==========
 ├── README.md                   # 项目说明（公开）
@@ -74,14 +74,14 @@ description: "云集智能网联代理专家项目开发规范。Invoke when wor
 │ # ========== 私有（Git不管理，仅本地） ==========
 ├── dev/                        # 应用安装根目录
 │   ├── .yunji.lock             # 路径定位标记
-│   ├── 云集智能网联代理专家.exe  # 统一入口（硬链接 → dist/ 或 ver/）
+│   ├── 云集代理.exe  # 统一入口（硬链接 → dist/ 或 ver/）
 │   ├── 运行.bat                # 开发调试启动脚本
 │   ├── dist/                   # 测试输出目录（构建后EXE先放这里）
 │   │   └── *-vYYYY.MM.DD.HHMM.exe
 │   ├── ver/                    # 稳定版仓库（测试确认后手动移入）
 │   │   └── *-vYYYY.MM.DD.HHMM.exe
 │   ├── apk/                    # 🆕 Android APK 打包目录
-│   │   └── 云集智能网联代理专家_YYYYMMDD_HHMM.apk
+│   │   └── 云集代理_YYYYMMDD_HHMM.apk
 │   └── app/                    # 核心源码（私有，不上传仓库）
 │       ├── main.py             # 主程序
 │       ├── launcher.py         # 入口文件
@@ -123,7 +123,7 @@ description: "云集智能网联代理专家项目开发规范。Invoke when wor
 │   ├── venv/                   # 构建用虚拟环境
 │   └── vYYYY.MM.DD.HHMM/      # 版本构建记录
 │       ├── build.py            # 该版本构建脚本备份
-│       ├── 云集智能网联代理专家-v*.zip  # 整合包（含EXE+内核）
+│       ├── 云集代理-v*.zip  # 整合包（含EXE+内核）
 │       ├── build/              # PyInstaller临时文件
 │       └── dist/               # PyInstaller输出
 ```
@@ -184,12 +184,12 @@ description: "云集智能网联代理专家项目开发规范。Invoke when wor
 ┌─────────────────────────────────────────────────────────┐
 │  2. 打包阶段                                             │
 │     python build/build.py                                │
-│     → EXE输出到 dev/dist/云集智能网联代理专家-v版本号.exe  │
-│     → 创建硬链接 dev/云集智能网联代理专家.exe → dist中EXE │
+│     → EXE输出到 dev/dist/云集代理-v版本号.exe  │
+│     → 创建硬链接 dev/云集代理.exe → dist中EXE │
 │     → 生成整合包ZIP（含EXE+内核+配置）                     │
 │     → project.json 通过 --add-data 打包进 EXE            │
 ──────────────────────┬──────────────────────────────────┘
-                       │ 双击 dev/云集智能网联代理专家.exe 测试
+                       │ 双击 dev/云集代理.exe 测试
                        │ 确认稳定后，手动将EXE从 dist/ 移入 ver/
                        ▼
 ┌─────────────────────────────────────────────────────────┐
@@ -300,11 +300,11 @@ EXE启动
   ├─ 发现 .yunji.lock 或 app/ 目录？
   │   ├─ 是 → 正常运行（已有环境）
   │   └─ 否 → 首次运行，执行自部署：
-  │            1. 在EXE同级目录创建 云集智能网联代理专家/ 文件夹
+  │            1. 在EXE同级目录创建 云集代理/ 文件夹
   │            2. 创建 ver/ 和 app/ 子目录
   │            3. 创建 .yunji.lock 标记文件
   │            4. 将自己复制到 ver/ 并按版本号命名
-  │            5. 创建硬链接入口 云集智能网联代理专家.exe
+  │            5. 创建硬链接入口 云集代理.exe
   │            6. 继续正常启动
   │
   └─ 之后双击入口EXE → 硬链接指向ver/中的EXE → 正常运行
@@ -325,12 +325,12 @@ EXE启动
 
 ```
 dev/
-├── 云集智能网联代理专家.exe          ← 硬链接入口（始终指向当前版本）
+├── 云集代理.exe          ← 硬链接入口（始终指向当前版本）
 ├── dist/                             ← 测试输出（构建后EXE先在这里）
-│   └── 云集智能网联代理专家-v2026.05.21.1030.exe  ← 入口硬链接指向此文件（测试阶段）
+│   └── 云集代理-v2026.05.21.1030.exe  ← 入口硬链接指向此文件（测试阶段）
 └── ver/                              ← 稳定版仓库（测试确认后手动移入）
-    ├── 云集智能网联代理专家-v2026.05.18.1030.exe
-    └── 云集智能网联代理专家-v2026.05.19.0152.exe
+    ├── 云集代理-v2026.05.18.1030.exe
+    └── 云集代理-v2026.05.19.0152.exe
 ```
 
 **dist 与 ver 的关系**：
@@ -350,7 +350,7 @@ dev/
 
 | 运行方式 | sys.executable | 解析结果 |
 |---------|---------------|---------|
-| `dev/云集智能网联代理专家.exe` | `dev/` | 直接找到 `.yunji.lock` → `dev/` |
+| `dev/云集代理.exe` | `dev/` | 直接找到 `.yunji.lock` → `dev/` |
 | `dev/ver/*-v2026.xx.xx.xxxx.exe` | `dev/ver/` | 向上一层 → `dev/` |
 | 任意目录首次运行 | 任意目录 | 触发 `_self_deploy()` → 自动部署 |
 | `python main.py` | - | 从 `__file__` 推算 → `dev/` |
@@ -360,7 +360,7 @@ dev/
 1. 用户点击「切换」按钮
 2. 程序生成 `_switch_version.bat` 批处理脚本
 3. 批处理等待当前进程退出（最多30秒，超时强制终止）
-4. **删除旧入口硬链接** `dev/云集智能网联代理专家.exe`
+4. **删除旧入口硬链接** `dev/云集代理.exe`
 5. **创建新硬链接** 指向 `dev/ver/` 中的目标版本EXE
 6. 启动新入口EXE（硬链接创建失败时直接启动目标版本）
 7. 删除批处理脚本自身
@@ -389,23 +389,23 @@ dev/
 
 ```
 dev/apk/
-├── 云集智能网联代理专家_20260606_0936.apk    # 正式版
-├── 云集智能网联代理专家_20260606_1030.apk    # 测试版
+├── 云集代理_20260606_0936.apk    # 正式版
+├── 云集代理_20260606_1030.apk    # 测试版
 ── ...
 ```
 
 ### 命名规范
 
-**格式**: `云集智能网联代理专家_YYYYMMDD_HHMM.apk`
+**格式**: `云集代理_YYYYMMDD_HHMM.apk`
 
 | 组成部分 | 说明 | 示例 |
 |---------|------|------|
-| 固定前缀 | 应用名称 | `云集智能网联代理专家` |
+| 固定前缀 | 应用名称 | `云集代理` |
 | YYYYMMDD | 日期 | `20260606` |
 | HHMM | 时间（24小时制） | `0936` |
 | 扩展名 | APK文件 | `.apk` |
 
-**完整示例**: `云集智能网联代理专家_20260606_0936.apk`
+**完整示例**: `云集代理_20260606_0936.apk`
 
 ### 打包流程
 
@@ -426,7 +426,7 @@ cd android
 ./gradlew assembleRelease
 
 # 5. 复制 APK 到 dev/apk/
-cp app/build/outputs/apk/release/*.apk ../../apk/云集智能网联代理专家_$(date +%Y%m%d_%H%M).apk
+cp app/build/outputs/apk/release/*.apk ../../apk/云集代理_$(date +%Y%m%d_%H%M).apk
 ```
 
 #### 方法二：Android Studio 打包
@@ -458,7 +458,7 @@ cp app/build/outputs/apk/release/*.apk ../../apk/云集智能网联代理专家_
 **手动上传**:
 1. 访问 https://github.com/yunjii-cn/ip/releases/new
 2. 选择标签（如 `v2026.06.06.0936`）
-3. 上传 `dev/apk/云集智能网联代理专家_YYYYMMDD_HHMM.apk`
+3. 上传 `dev/apk/云集代理_YYYYMMDD_HHMM.apk`
 4. 填写发布说明
 
 **自动上传（未来）**:
@@ -471,9 +471,9 @@ python build/release.py --include-apk
 
 | 版本类型 | 命名示例 | 用途 |
 |---------|---------|------|
-| 正式版 | `云集智能网联代理专家_20260606_0936.apk` | 对外发布，稳定可用 |
-| 测试版 | `云集智能网联代理专家_20260606_1030_test.apk` | 内部测试，可能不稳定 |
-| 调试版 | `云集智能网联代理专家_20260606_1100_debug.apk` | 开发调试，含日志输出 |
+| 正式版 | `云集代理_20260606_0936.apk` | 对外发布，稳定可用 |
+| 测试版 | `云集代理_20260606_1030_test.apk` | 内部测试，可能不稳定 |
+| 调试版 | `云集代理_20260606_1100_debug.apk` | 开发调试，含日志输出 |
 
 > **注意**: 测试版和调试版建议添加后缀标识，避免与正式版混淆
 
@@ -695,7 +695,7 @@ When working on this project, follow these rules:
 ### Android APK 构建规范
 - **源码目录**：`dev/web/android/`（Capacitor + Android 原生项目）
 - **构建命令**：`cd dev/web/android && .\gradlew.bat assembleDebug`
-- **APK 输出**：`dev/web/android/app/build/outputs/apk/production/debug/云集智能网联代理专家_YYYYMMDD_HHMM.apk`
+- **APK 输出**：`dev/web/android/app/build/outputs/apk/production/debug/云集代理_YYYYMMDD_HHMM.apk`
 - **APK 分发目录**：`dev/apk/`（构建后需手动复制 APK 到此目录）
 - **关键源码文件**：
   - `dev/web/android/app/src/main/java/com/yunjii/proxy/MihomoPlugin.java` — 代理管理核心插件

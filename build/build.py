@@ -12,7 +12,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def _load_project_config():
     _cfg_path = os.path.join(PROJECT_ROOT, "project.json")
     _defaults = {
-        "brand_name": "云集智能网联代理专家",
+        "brand_name": "云集代理",
         "version_format": "%Y.%m.%d.%H%M",
         "paths": {"dev": "dev", "app": "app", "ver": "ver", "dist": "dist", "build": "build"}
     }

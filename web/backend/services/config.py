@@ -9,7 +9,7 @@ log = logging.getLogger("yunji")
 
 def _load_project_config():
     _DEFAULTS = {
-        "brand_name": "云集智能网联代理专家",
+        "brand_name": "云集代理",
         "version_format": "%Y.%m.%d.%H%M",
         "repos": {
             "github": "yunjii-cn/ip",

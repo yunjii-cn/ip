@@ -60,7 +60,7 @@ if os.name == 'nt':
 
 def _load_project_config():
     _DEFAULTS = {
-        "brand_name": "云集智能网联代理专家",
+        "brand_name": "云集代理",
         "version_format": "%Y.%m.%d.%H%M",
         "repos": {
             "github": "yunjii-cn/ip",
@@ -13152,10 +13152,10 @@ def _kill_same_name_processes():
     my_pid = _k32.GetCurrentProcessId()
     is_frozen = getattr(sys, 'frozen', False)
     # 关键：用 BRAND_NAME（不含版本号）作前缀，因为 EXE 文件名可能是
-    #   云集智能网联代理专家.exe                    （简化名）
-    #   云集智能网联代理专家-v2026.06.17.2025.exe  （带版本号，-v 不是 " v"）
-    #   云集智能网联代理专家 v2026.06.17.2025.exe  （理论上不会出现）
-    # APP_NAME 形如 "云集智能网联代理专家 v2026.06.17.2025" 永远 startswith 不上。
+    #   云集代理.exe                    （简化名）
+    #   云集代理-v2026.06.17.2025.exe  （带版本号，-v 不是 " v"）
+    #   云集代理 v2026.06.17.2025.exe  （理论上不会出现）
+    # APP_NAME 形如 "云集代理 v2026.06.17.2025" 永远 startswith 不上。
     base_prefix = BRAND_NAME.lower()
     # 本项目 app 目录（dev 模式判定基准）：只有工作目录/命令行指向此目录的
     # python 进程才视为本项目旧实例，避免误杀 ComfyUI、视频创意站等 python 应用
