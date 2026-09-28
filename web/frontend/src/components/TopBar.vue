@@ -41,7 +41,7 @@ import api from '@/api'
 import { platform, systemManager } from '@/platform'
 
 const isMobile = platform === 'mobile'
-const brandName = '云集智能网联代理专家'
+const brandName = '云集代理'
 const version = ref('')
 const iconLoaded = ref(true)
 const showAbout = ref(false)

@@ -1,7 +1,7 @@
 """测试配置文件下载 - 诊断脚本"""
 import urllib.request, ssl, socket, time, sys, os
 
-sys.path.insert(0, r'e:\软件开发\云集智能网联代理专家\dev\app')
+sys.path.insert(0, r'e:\软件开发\云集代理\dev\app')
 
 CONFIG_URLS = [
     ("线路1", "https://www.gitlabip.xyz/Alvin9999/PAC/refs/heads/master/backup/img/1/2/ipp/quick/1/config.yaml",

@@ -1,9 +1,14 @@
 @echo off
 chcp 65001 >nul 2>&1
-title 云集智能网联代理专家 - 全自动发布
+title 云集代理 - 全自动发布
 
-set "VENV_PYTHON=%~dp0build\venv\Scripts\python.exe"
 set "RELEASE_SCRIPT=%~dp0build\release.py"
+
+rem 2026-09-28：与 打包.bat 一致，改用系统解释器 D:\Programs\Python312
+set "VENV_PYTHON=D:\Programs\Python312\python.exe"
+if not exist "%VENV_PYTHON%" (
+    set "VENV_PYTHON=%~dp0build\venv\Scripts\python.exe"
+)
 
 if not exist "%VENV_PYTHON%" (
     echo [错误] 未找到构建环境: %VENV_PYTHON%
@@ -20,7 +25,7 @@ if not exist "%RELEASE_SCRIPT%" (
 )
 
 echo ══════════════════════════════════════════════════════
-echo   云集智能网联代理专家 - 一键发布到 GitHub + Gitee
+echo   云集代理 - 一键发布到 GitHub + Gitee
 echo ══════════════════════════════════════════════════════
 echo.
 echo 此脚本将依次执行:
