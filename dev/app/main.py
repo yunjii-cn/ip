@@ -1933,9 +1933,15 @@ def get_base_dir():
 
 def get_app_dir():
     # 开发态与打包态使用同一套公式：<根目录>/app。
-    # - 开发态：根目录 = dev/         → dev/app/（内核 Quick、配置、日志、设置全在此）
-    # - 打包态：根目录 = EXE 所在目录 → <EXE目录>/app/（与 dev/app 完全镜像，
-    #   相对 EXE 目录、绿色便携，换机器/目录即可运行，彻底消除扁平 exe 目录差异）
+    # - 开发态：根目录 = dev/                    → dev/app/（内核 Quick、配置、日志、设置全在此）
+    # - 打包态：根目录 = <EXE目录>/<BRAND_NAME>/ → <EXE目录>/<BRAND_NAME>/app/
+    #   注意打包态根目录**含品牌层**：_self_deploy 首跑会建品牌文件夹，入口 exe
+    #   就放在里面，_resolve_deploy_dir 逐级向上命中该目录后直接返回它；
+    #   命中不了才回退到「exe 同级 <BRAND_NAME>」。
+    #   层级结构与 dev/app 同构（都是「<根目录>/app」），相对其根目录解析，
+    #   绿色便携，换机器/目录即可运行，彻底消除扁平 exe 目录差异。
+    # ⚠️ build/verify_relative_path.py 曾按「<EXE目录>/app」写断言并长期失败，
+    #   根因就是把上面这个品牌层漏了；口径以该脚本内的说明为准。
     d = os.path.join(get_base_dir(), _CFG["paths"]["app"])
     os.makedirs(d, exist_ok=True)
     # 一次性迁移：旧版扁平 exe_dir/Quick（及 launcher_settings.json）迁移到镜像 dev 的
